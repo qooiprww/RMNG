@@ -6,7 +6,7 @@
 #   apply-monitors.sh <ctid> <username> <monitors-csv "WxH+X+Y[*],...">
 set -euo pipefail
 prog(){ echo "P $1 ${*:2}"; }
-CTID="$1"; USER="${2:-pega}"; MONS="$3"
+CTID="$1"; USER="${2:-rmng}"; MONS="$3"
 # dummy mode specs want just WxH (unique, colon-joined) — strip +X+Y and the * primary mark.
 MODE_SPECS="$(printf '%s' "$MONS" | tr ',' '\n' | sed -E 's/\+.*$//; s/\*$//' | awk 'NF && !seen[$0]++' | paste -sd: -)"
 [ -n "$MODE_SPECS" ] || MODE_SPECS="1920x1080"

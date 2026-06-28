@@ -9,7 +9,7 @@
 #   provision-clone.sh <username> <password>   (clone-daemon pushed to /root/rmng-clone-daemon)
 set -euo pipefail
 say(){ echo "    [ct] $*"; }
-USERNAME="${1:-pega}"; PASSWORD="${2:-pega}"
+USERNAME="${1:-rmng}"; PASSWORD="${2:-rmng}"
 # Monitor layout (CSV "WxH,WxH" from config.monitors via bootstrap.sh) → the clone-daemon
 # RMNG_MONITORS env (one virtual monitor per entry). The headless dummy backend's mode
 # specs must offer each requested size, so derive them (unique sizes, colon-joined).
@@ -32,9 +32,11 @@ rm -rf /var/snap /var/lib/snapd /var/cache/snapd
 printf 'Package: snapd\nPin: release *\nPin-Priority: -1\n' > /etc/apt/preferences.d/nosnap.pref
 aa-teardown 2>/dev/null || true; systemctl disable --now apparmor 2>/dev/null || true
 
-say "locale + ping range"
+say "locale + timezone + ping range"
 apt-get install -y -qq locales >/dev/null 2>&1 || true
 locale-gen en_US.UTF-8 >/dev/null 2>&1 || true; update-locale LANG=en_US.UTF-8
+# Timezone: symlink + /etc/timezone (timedatectl can't set the clock in an unprivileged LXC).
+ln -sf /usr/share/zoneinfo/America/Toronto /etc/localtime; echo America/Toronto > /etc/timezone
 mkdir -p /etc/sysctl.d && echo 'net.ipv4.ping_group_range = 0 65534' > /etc/sysctl.d/99-ping.conf
 
 say "headless GNOME + Mutter + VA-API + PipeWire (NO gdm/g-r-d)"

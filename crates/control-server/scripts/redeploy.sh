@@ -8,7 +8,7 @@
 # by the control-server (from its embedded, gzipped copies).
 set -euo pipefail
 prog(){ echo "P $1 ${*:2}"; }
-CTID="$1"; USER="${2:-pega}"; CD="${3:--}"; AW="${4:--}"
+CTID="$1"; USER="${2:-rmng}"; CD="${3:--}"; AW="${4:--}"
 UID_="$(pct exec "$CTID" -- id -u "$USER")"
 uctl(){ pct exec "$CTID" -- runuser -u "$USER" -- env XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user "$@"; }
 

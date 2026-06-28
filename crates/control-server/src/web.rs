@@ -296,7 +296,7 @@ async fn clone_redeploy(
         .ctid
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{}' has no container to redeploy", req.id)))?;
     let cfg = app.config();
-    crate::orchestrate::redeploy_clone(&cfg, ctid, "pega", req.daemon_only, |step, msg| {
+    crate::orchestrate::redeploy_clone(&cfg, ctid, "rmng", req.daemon_only, |step, msg| {
         tracing::info!("redeploy CT {ctid} {step}: {msg}");
     })
     .await
@@ -314,7 +314,7 @@ async fn monitors_apply(State(app): State<App>) -> Result<Json<serde_json::Value
     let mut applied = Vec::new();
     let mut errors = Vec::new();
     for (id, ctid) in clones {
-        match crate::orchestrate::apply_monitors(&cfg, ctid, "pega", |step, msg| {
+        match crate::orchestrate::apply_monitors(&cfg, ctid, "rmng", |step, msg| {
             tracing::info!("apply-monitors CT {ctid} {step}: {msg}");
         })
         .await

@@ -22,7 +22,7 @@ to a `provision-deploy-ct.sh` CT, just with the toolchain still present.
 
 | CT | Name | IP | GPU | onboot | /srv/rmng-sock | Role |
 |---|---|---|---|---|---|---|
-| **115** | **rmng-template** | 10.0.0.39 | ✓ | no | ✓ | The **golden template**: a full clone image (headless GNOME + `clone-daemon` + `agent-wrapper` + patched gnome-shell + standalone `claude` CLI), built by `POST /api/template/bootstrap`. CoW clones (`POST /api/clone`) snapshot it. Currently also registered as a selectable host (the first real clone). User `pega`/`pega`. |
+| **115** | **rmng-template** | 10.0.0.39 | ✓ | no | ✓ | The **golden template**: a full clone image (headless GNOME + `clone-daemon` + `agent-wrapper` + patched gnome-shell + standalone `claude` CLI), built by `POST /api/template/bootstrap`. CoW clones (`POST /api/clone`) snapshot it. Currently also registered as a selectable host (the first real clone). User `rmng`/`rmng` (passwordless sudo), timezone America/Toronto. |
 
 CoW clones the control-server provisions appear here too — single-NIC on `vmbr0`, GPU
 passthrough, the `/srv/rmng-sock` media-socket bind-mount. Each clone's `clone-daemon` connects

@@ -74,7 +74,7 @@ if [ -n "$SHELL_DEB" ] && [ -f "$SHELL_DEB" ]; then
 fi
 printf '%s' "$PROV_B64" | base64 -d > "/tmp/prov-$NEWID.sh"
 pct push "$NEWID" "/tmp/prov-$NEWID.sh" /root/provision-clone.sh >&2
-pct exec "$NEWID" -- bash /root/provision-clone.sh pega pega "$MONITORS" >&2
+pct exec "$NEWID" -- bash /root/provision-clone.sh rmng rmng "$MONITORS" >&2
 rm -f "/tmp/prov-$NEWID.sh"
 
 prog done "CT $NEWID ready at $IP"
