@@ -95,6 +95,11 @@ install -d -o "$USERNAME" -g "$USERNAME" "$UDIR"
 cat > "$UDIR/gnome-headless.service" <<UNIT
 [Unit]
 Description=Headless GNOME Shell (no GDM/g-r-d)
+# gnome-session normally reaches graphical-session.target; we run gnome-shell directly, so
+# pull it in ourselves — session-bound services (xdg-desktop-portal-gnome, etc.) require it,
+# else they fail with a dependency error and portal calls hang on the gtk fallback.
+Wants=graphical-session.target
+Before=graphical-session.target
 [Service]
 Type=simple
 Environment=XDG_SESSION_TYPE=wayland
@@ -138,6 +143,23 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 UNIT
+
+# Base session env every clone gets (NOT a preset): identifies the desktop so apps,
+# xdg-desktop-portal (it picks the GNOME backend from XDG_CURRENT_DESKTOP), dark-mode/
+# settings portal, and theming behave like a real GNOME session. We launch
+# `gnome-shell --headless` directly — no GDM / gnome-session / pam_systemd — so nothing
+# else sets these. systemd --user reads environment.d → the session + all user units.
+# Per-clone env presets live in 30-rmng-preset.conf (written by clone.sh); higher number wins.
+ENVDIR="/home/$USERNAME/.config/environment.d"; install -d "$ENVDIR"
+cat > "$ENVDIR/10-rmng-session.conf" <<'ENVD'
+XDG_CURRENT_DESKTOP=GNOME
+XDG_SESSION_DESKTOP=gnome
+DESKTOP_SESSION=gnome
+XDG_SESSION_CLASS=user
+XDG_MENU_PREFIX=gnome-
+XDG_SESSION_TYPE=wayland
+ENVD
+
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config"
 uid="$(id -u "$USERNAME")"
 # Enable for auto-start by creating the wants symlinks directly — `systemctl --user
@@ -149,6 +171,7 @@ done
 chown -h "$USERNAME:$USERNAME" "$WANTS"/*.service
 SC="runuser -u $USERNAME -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user"
 $SC daemon-reload 2>/dev/null || true
+$SC daemon-reexec 2>/dev/null || true  # re-read environment.d into the manager env before starting units
 # Start now too — the user manager came up at enable-linger time (before the units
 # were linked), so the wants symlinks alone won't start them until the next boot.
 $SC start gnome-headless.service 2>/dev/null || true
