@@ -22,6 +22,9 @@ fn main() -> Result<()> {
     let out = std::env::var("RMNG_DUMP").unwrap_or_else(|_| "/tmp/desk.png".into());
     let target_mon: u32 = std::env::var("RMNG_MON").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let avc444 = std::env::var_os("RMNG_444").is_some();
+    // `RMNG_COUNT=<secs>` (with RMNG_444): no PNG — decode+unpack every frame and report the
+    // client's reconstruct fps, to verify the full e2e (decode + 4:4:4 unpack) sustains 60.
+    let count_secs: Option<u64> = std::env::var("RMNG_COUNT").ok().and_then(|s| s.parse().ok());
 
     // In AVC444 mode decode to raw NV12 (we reconstruct 4:4:4 ourselves); else straight to PNG.
     let desc = if avc444 {
@@ -37,24 +40,64 @@ fn main() -> Result<()> {
     src.set_caps(Some(
         &gst::Caps::builder("video/x-h264").field("stream-format", "byte-stream").field("alignment", "au").build(),
     ));
-    let outp = out.clone();
-    sink.set_callbacks(
-        gstreamer_app::AppSinkCallbacks::builder()
-            .new_sample(move |s| {
-                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if avc444 {
-                    if let Err(e) = reconstruct_and_write(&sample, &outp) {
-                        eprintln!("reconstruct failed: {e}");
-                        std::process::exit(1);
-                    }
-                } else if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
-                    std::fs::write(&outp, map.as_slice()).ok();
-                    println!("wrote {outp} ({} bytes)", map.size());
+    // Count mode: decode + unpack every frame, report reconstruct fps each second, exit after N.
+    if let Some(secs) = count_secs.filter(|_| avc444) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let count = Arc::new(AtomicU64::new(0));
+        {
+            let count = count.clone();
+            std::thread::spawn(move || {
+                let mut last = 0u64;
+                for i in 1..=secs {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let now = count.load(Ordering::Relaxed);
+                    println!("[{i:2}s] client reconstruct fps: {}", now - last);
+                    last = now;
                 }
+                println!("--- {} frames decoded+unpacked in {secs}s = {:.1} fps avg ---",
+                    count.load(Ordering::Relaxed), count.load(Ordering::Relaxed) as f64 / secs as f64);
                 std::process::exit(0);
-            })
-            .build(),
-    );
+            });
+        }
+        // RMNG_NOUNPACK: count decode+download only (skip the CPU unpack) to isolate the bottleneck.
+        let nounpack = std::env::var_os("RMNG_NOUNPACK").is_some();
+        let count = count.clone();
+        sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    // Full client work: decode (done) → 4:4:4 unpack (discard the RGBA).
+                    if nounpack {
+                        let _ = sample.buffer().and_then(|b| b.map_readable().ok()); // force the download
+                        count.fetch_add(1, Ordering::Relaxed);
+                    } else if reconstruct(&sample).is_ok() {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    } else {
+        let outp = out.clone();
+        sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if avc444 {
+                        if let Err(e) = reconstruct_and_write(&sample, &outp) {
+                            eprintln!("reconstruct failed: {e}");
+                            std::process::exit(1);
+                        }
+                    } else if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
+                        std::fs::write(&outp, map.as_slice()).ok();
+                        println!("wrote {outp} ({} bytes)", map.size());
+                    }
+                    std::process::exit(0);
+                })
+                .build(),
+        );
+    }
     pipeline.set_state(gst::State::Playing)?;
 
     let mut stream = TcpStream::connect(&addr).context("connect")?;
@@ -84,8 +127,8 @@ fn main() -> Result<()> {
     Err(anyhow!("stream ended before a frame decoded"))
 }
 
-/// Reconstruct 4:4:4 RGBA from a decoded stacked `W×2H` NV12 sample and write a PNG.
-fn reconstruct_and_write(sample: &gst::Sample, path: &str) -> Result<()> {
+/// Reconstruct 4:4:4 RGBA from a decoded stacked `W×2H` NV12 sample. Returns `(rgba, w, h)`.
+fn reconstruct(sample: &gst::Sample) -> Result<(Vec<u8>, usize, usize)> {
     let buf = sample.buffer().context("buf")?;
     let info = VideoInfo::from_caps(sample.caps().context("caps")?)?;
     let frame = VideoFrameRef::from_buffer_ref_readable(buf, &info).map_err(|_| anyhow!("map"))?;
@@ -94,6 +137,12 @@ fn reconstruct_and_write(sample: &gst::Sample, path: &str) -> Result<()> {
     let rgba = wire::avc444::unpack_stacked_nv12_to_rgba(
         frame.plane_data(0)?, strides[0] as usize, frame.plane_data(1)?, strides[1] as usize, w, h,
     );
+    Ok((rgba, w, h))
+}
+
+/// Reconstruct 4:4:4 RGBA from a decoded stacked sample and write a PNG.
+fn reconstruct_and_write(sample: &gst::Sample, path: &str) -> Result<()> {
+    let (rgba, w, h) = reconstruct(sample)?;
     write_rgba_png(&rgba, w, h, path)?;
     println!("reconstructed {w}x{h} 4:4:4 → {path}");
     Ok(())

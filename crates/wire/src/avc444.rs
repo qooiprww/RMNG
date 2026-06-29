@@ -125,33 +125,51 @@ pub fn unpack_stacked_nv12_to_rgba(
     h: usize,
 ) -> Vec<u8> {
     assert!(w % 2 == 0 && h % 2 == 0, "AVC444 unpack needs even dimensions");
-    let (cw, ch) = (w / 2, h / 2);
-    let _ = cw;
+    let ch = h / 2;
     let mut out = vec![0u8; w * h * 4];
-    for py in 0..h {
-        for px in 0..w {
-            let yv = luma[py * luma_stride + px]; // main luma (rows 0..h)
-            let (i, j, xc, yc) = (px & 1, py & 1, px >> 1, py >> 1);
-            let cb = match (i, j) {
-                (0, 0) => chroma[yc * chroma_stride + 2 * xc],
-                (1, 0) => luma[(h + yc) * luma_stride + xc],
-                (0, 1) => luma[(h + yc) * luma_stride + (w / 2 + xc)],
-                _ => luma[(h + ch + yc) * luma_stride + xc],
-            };
-            let cr = match (i, j) {
-                (0, 0) => chroma[yc * chroma_stride + 2 * xc + 1],
-                (1, 0) => luma[(h + ch + yc) * luma_stride + (w / 2 + xc)],
-                (0, 1) => chroma[(ch + yc) * chroma_stride + 2 * xc],
-                _ => chroma[(ch + yc) * chroma_stride + 2 * xc + 1],
-            };
-            let (r, g, b) = ycbcr_to_rgb_bt601(yv, cb, cr);
-            let o = (py * w + px) * 4;
-            out[o] = r;
-            out[o + 1] = g;
-            out[o + 2] = b;
-            out[o + 3] = 255;
+
+    // Each output row is independent (it gathers from the shared luma/chroma planes and writes
+    // only its own row), so split the rows across CPU cores. The single-threaded unpack of a
+    // 1440p frame caps a client around ~27fps — too slow to reconstruct a 60fps 4:4:4 stream.
+    // This is the exact inverse gather of `pack_y444_to_stacked_nv12` (byte-identical output, the
+    // round-trip test guards it); `std::thread::scope` keeps it dependency-free.
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, h.max(1));
+    let rows_per = h.div_ceil(threads);
+    std::thread::scope(|s| {
+        let mut y0 = 0usize;
+        for chunk in out.chunks_mut(rows_per * w * 4) {
+            let nrows = chunk.len() / (w * 4);
+            let base = y0;
+            s.spawn(move || {
+                for r in 0..nrows {
+                    let py = base + r;
+                    for px in 0..w {
+                        let yv = luma[py * luma_stride + px]; // main luma (rows 0..h)
+                        let (i, j, xc, yc) = (px & 1, py & 1, px >> 1, py >> 1);
+                        let cb = match (i, j) {
+                            (0, 0) => chroma[yc * chroma_stride + 2 * xc],
+                            (1, 0) => luma[(h + yc) * luma_stride + xc],
+                            (0, 1) => luma[(h + yc) * luma_stride + (w / 2 + xc)],
+                            _ => luma[(h + ch + yc) * luma_stride + xc],
+                        };
+                        let cr = match (i, j) {
+                            (0, 0) => chroma[yc * chroma_stride + 2 * xc + 1],
+                            (1, 0) => luma[(h + ch + yc) * luma_stride + (w / 2 + xc)],
+                            (0, 1) => chroma[(ch + yc) * chroma_stride + 2 * xc],
+                            _ => chroma[(ch + yc) * chroma_stride + 2 * xc + 1],
+                        };
+                        let (rr, gg, bb) = ycbcr_to_rgb_bt601(yv, cb, cr);
+                        let o = (r * w + px) * 4;
+                        chunk[o] = rr;
+                        chunk[o + 1] = gg;
+                        chunk[o + 2] = bb;
+                        chunk[o + 3] = 255;
+                    }
+                }
+            });
+            y0 += nrows;
         }
-    }
+    });
     out
 }
 

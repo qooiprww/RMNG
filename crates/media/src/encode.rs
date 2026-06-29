@@ -34,8 +34,13 @@ fn fourcc_str(fourcc: u32) -> String {
 }
 
 /// `vah264enc → h264parse → appsink` tail, shared by both modes.
+///
+/// `target-usage=1` is deliberate and **counterintuitive**: on this AMD VCN the usage mapping is
+/// effectively inverted — `tu=1` (the "quality" preset) encodes the stacked 2880p Yuv444 frame at
+/// ~71fps while `tu=7` (the "speed" preset) manages only ~41fps (measured via `avc444_e2e bench`).
+/// `tu=1` is what lets the Yuv444 path keep up with the 60Hz capture; Yuv420 has headroom either way.
 const ENC_TAIL: &str = "vah264enc name=enc aud=true b-frames=0 ref-frames=1 key-int-max=30 \
-       rate-control=cqp qpi=23 qpp=25 target-usage=7 ! \
+       rate-control=cqp qpi=23 qpp=25 target-usage=1 ! \
      video/x-h264,profile=constrained-baseline ! \
      h264parse config-interval=-1 ! \
      video/x-h264,stream-format=byte-stream,alignment=au ! \

@@ -7,6 +7,9 @@
 //!
 //! Usage: `avc444_e2e [W H out_dir]` (defaults 2560 1440 /tmp).
 
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -17,6 +20,11 @@ use gstreamer_video::{VideoFrameRef, VideoInfo};
 fn main() -> Result<()> {
     media::init()?;
     let args: Vec<String> = std::env::args().collect();
+    // `avc444_e2e bench [N W H]` — free-running encode-ceiling benchmark (no capture/network/flow
+    // control): measures the pure 444 vs 420 pipeline throughput on this GPU.
+    if args.get(1).map(|s| s == "bench").unwrap_or(false) {
+        return bench_main(&args);
+    }
     // `avc444_e2e <input.png> [out_dir]` — run a real frame (e.g. a captured desktop) through
     // the full zero-copy yuv444 encode→decode→reconstruct path and dump orig/recon PNGs.
     if let Some(p) = args.get(1) {
@@ -85,6 +93,149 @@ fn main() -> Result<()> {
     println!("wrote {out}/avc444_orig.png and {out}/avc444_recon.png");
 
     gl_pack_validate(w, h, &out)?;
+    Ok(())
+}
+
+/// Free-running encode-ceiling benchmark. To remove the source as a bottleneck we capture **one**
+/// VA-exported dmabuf (same fourcc/modifier as the live capture) and **re-push it** through each
+/// encode pipeline as fast as the GPU allows — no clock sync, no capture cost, no daemon flow
+/// control. So the number is the pure encode-path ceiling. Variants isolate where the 444 cost is:
+/// the post-pack `vapostproc` (DMA_DRM→VAMemory) vs encoding straight from the element's dmabuf.
+fn bench_main(args: &[String]) -> Result<()> {
+    media::glpack::register()?;
+    let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(900);
+    let w: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2560);
+    let h: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1440);
+    println!("encode-ceiling bench: re-push 1 frame x{n}, {w}x{h} (free source; no capture/flow-control)\n");
+    let (buf, caps) = capture_one_frame(w, h)?;
+    println!("captured source frame: {caps}\n");
+    let enc = "vah264enc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cqp qpi=23 \
+               qpp=25 target-usage=1 ! video/x-h264,profile=constrained-baseline ! h264parse ! \
+               appsink name=out sync=false max-buffers=16";
+
+    // 444 production path: glupload → pack → vapostproc(DMA_DRM→VAMemory) → enc.
+    run_repush_bench(
+        "444  glupload!pack!vapostproc!enc",
+        &format!("glupload ! rmngavc444pack ! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {enc}"),
+        &buf, &caps, n,
+    )?;
+    // 444 minus the post-pack vapostproc: encode straight from the element's VA dmabuf.
+    run_repush_bench(
+        "444  glupload!pack!enc (no vpp)  ",
+        &format!("glupload ! rmngavc444pack ! {enc}"),
+        &buf, &caps, n,
+    )?;
+    // 420 reference: BGRA → vapostproc → enc (no glupload/pack), 1440p.
+    run_repush_bench(
+        "420  vapostproc!enc        (1440p)",
+        &format!("vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {enc}"),
+        &buf, &caps, n,
+    )?;
+    // Encoder shootout at the stacked 2880p resolution (no glupload/pack) — the 444 ceiling is the
+    // encode; can a faster entrypoint (low-power) or tuning beat the ~41fps of vah264enc tu7?
+    let (buf2, caps2) = capture_one_frame(w, h * 2)?;
+    let tail = "! video/x-h264,profile=constrained-baseline ! h264parse ! appsink name=out sync=false max-buffers=16";
+    let cfgs: [(&str, &str); 5] = [
+        ("vah264enc   tu7 cqp", "vah264enc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cqp qpi=23 qpp=25 target-usage=7"),
+        ("vah264enc   tu1 cqp", "vah264enc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cqp qpi=23 qpp=25 target-usage=1"),
+        ("vah264enc   tu7 sl4", "vah264enc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cqp qpi=23 qpp=25 target-usage=7 num-slices=4"),
+        ("vah264lpenc tu7 cqp", "vah264lpenc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cqp qpi=23 qpp=25 target-usage=7"),
+        ("vah264lpenc tu7 cbr", "vah264lpenc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cbr bitrate=20000 target-usage=7"),
+    ];
+    for (lbl, e) in cfgs {
+        run_repush_bench(
+            &format!("2880p {lbl}"),
+            &format!("vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {e} {tail}"),
+            &buf2, &caps2, n,
+        )?;
+    }
+    Ok(())
+}
+
+/// Capture a single sysmem BGRA frame (trivially negotiates; self-contained so it outlives its
+/// pipeline). The re-push benches feed it through glupload/vapostproc, paying the same sysmem
+/// upload in every variant — so the 444-vs-420 and with/without-vapostproc deltas stay valid.
+fn capture_one_frame(w: usize, h: usize) -> Result<(gst::Buffer, gst::Caps)> {
+    let desc = format!(
+        "videotestsrc num-buffers=8 pattern=ball ! video/x-raw,format=BGRA,width={w},height={h},framerate=30/1 ! \
+         appsink name=out sync=false max-buffers=2"
+    );
+    let pipeline = gst::parse::launch(&desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
+    let sink: AppSink = pipeline.by_name("out").context("out")?.downcast().map_err(|_| anyhow!("appsink"))?;
+    pipeline.set_state(gst::State::Playing)?;
+    let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(15)).context("no source frame")?;
+    let buf = sample.buffer().context("buf")?.to_owned();
+    let caps = sample.caps().context("caps")?.to_owned();
+    pipeline.set_state(gst::State::Null)?;
+    Ok((buf, caps))
+}
+
+/// Re-push one buffer through `mid_desc ! enc`, timestamping each AU, report steady-state fps.
+fn run_repush_bench(label: &str, desc: &str, buf: &gst::Buffer, caps: &gst::Caps, n: usize) -> Result<()> {
+    let full = format!("appsrc name=src is-live=false format=time do-timestamp=true block=true max-buffers=6 ! {desc}");
+    let pipeline = match gst::parse::launch(&full) {
+        Ok(p) => p.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?,
+        Err(e) => {
+            println!("{label}: FAILED to build — {e}");
+            return Ok(());
+        }
+    };
+    let src: AppSrc = pipeline.by_name("src").context("src")?.downcast().map_err(|_| anyhow!("appsrc"))?;
+    let sink: AppSink = pipeline.by_name("out").context("out")?.downcast().map_err(|_| anyhow!("appsink"))?;
+    src.set_caps(Some(caps));
+    let times: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let times = times.clone();
+        sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let _ = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    times.lock().unwrap().push(Instant::now());
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
+    pipeline.set_state(gst::State::Playing)?;
+    // Push from a worker thread so appsrc backpressure (block=true) doesn't deadlock the bus wait.
+    let push = {
+        let src = src.clone();
+        let buf = buf.clone();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                if src.push_buffer(buf.clone()).is_err() {
+                    break;
+                }
+            }
+            let _ = src.end_of_stream();
+        })
+    };
+    let mut err = None;
+    if let Some(bus) = pipeline.bus() {
+        if let Some(msg) =
+            bus.timed_pop_filtered(gst::ClockTime::from_seconds(60), &[gst::MessageType::Eos, gst::MessageType::Error])
+        {
+            if let gst::MessageView::Error(e) = msg.view() {
+                err = Some(anyhow!("{label}: pipeline error: {} ({:?})", e.error(), e.debug()));
+            }
+        }
+    }
+    let _ = push.join();
+    pipeline.set_state(gst::State::Null)?;
+    if let Some(e) = err {
+        println!("{label}: FAILED — {e}");
+        return Ok(());
+    }
+    let t = times.lock().unwrap();
+    let len = t.len();
+    if len < 40 {
+        println!("{label}: only {len} AUs — inconclusive");
+        return Ok(());
+    }
+    let warm = 30; // skip encoder ramp + one-time GL shader build
+    let dt = (t[len - 1] - t[warm]).as_secs_f64();
+    let fps = (len - 1 - warm) as f64 / dt;
+    println!("{label}: {fps:6.1} fps   ({} AUs, {:.2}s steady-state)", len, dt);
     Ok(())
 }
 
