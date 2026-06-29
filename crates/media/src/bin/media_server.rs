@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     // Encoder → frame each AU to the connected viewer.
     let enc = {
         let viewer = viewer.clone();
-        Encoder::new(move |au, _idr| {
+        Encoder::new(wire::ChromaMode::Yuv420, move |au, _idr| {
             // Single-monitor harness: frame as monitor 0 ([u32 mid][u32 len][AnnexB]).
             let mut guard = viewer.lock().unwrap();
             if let Some(sock) = guard.as_mut() {

@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use wire::AppConfig;
+use wire::{AppConfig, ChromaMode};
 
 pub fn config_path() -> PathBuf {
     std::env::var_os("RMNG_CONFIG")
@@ -15,15 +15,23 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> Result<AppConfig> {
     let path = config_path();
-    match std::fs::read_to_string(&path) {
+    let mut cfg = match std::fs::read_to_string(&path) {
         Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("parsing {}", path.display())),
+            .with_context(|| format!("parsing {}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("no {} — using defaults", path.display());
-            Ok(AppConfig::default())
+            AppConfig::default()
         }
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    // `RMNG_CHROMA` overrides the file/default chroma mode at load time.
+    if let Ok(v) = std::env::var("RMNG_CHROMA") {
+        match ChromaMode::from_env_value(&v) {
+            Some(m) => cfg.chroma = m,
+            None => tracing::warn!("ignoring unrecognized RMNG_CHROMA={v:?}"),
+        }
     }
+    Ok(cfg)
 }
 
 #[cfg(test)]

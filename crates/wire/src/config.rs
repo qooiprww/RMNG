@@ -30,6 +30,36 @@ fn default_daemon_mcp() -> u16 {
     9004
 }
 
+/// Chroma subsampling mode for the port-1 viewer video stream.
+///
+/// `Yuv420` is today's hardware path (one `W×H` NV12 H.264 stream per monitor).
+/// `Yuv444` recovers full chroma using the RDP **AVC444** packing carried in a single
+/// double-height `W×2H` stream (main view stacked over an auxiliary chroma view),
+/// reassembled to 4:4:4 on the GPU at the viewer. Server-wide, chosen at launch
+/// (`config.chroma` or the `RMNG_CHROMA` env override); the viewer learns the active
+/// mode from the port-1 connect handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub enum ChromaMode {
+    /// 4:2:0 — today's single-stream hardware path (default).
+    #[default]
+    Yuv420,
+    /// 4:4:4 — AVC444 double-height stream (≤1440p per monitor).
+    Yuv444,
+}
+
+impl ChromaMode {
+    /// Parse the `RMNG_CHROMA` env value (`yuv420`/`420`, `yuv444`/`444`); `None` if unset/unknown.
+    pub fn from_env_value(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yuv420" | "420" | "i420" | "nv12" => Some(Self::Yuv420),
+            "yuv444" | "444" | "avc444" => Some(Self::Yuv444),
+            _ => None,
+        }
+    }
+}
+
 impl Default for ListenConfig {
     fn default() -> Self {
         Self { web: 9000, video: 9001, clone_mcp: 9002, global_mcp: 9003, daemon_mcp: default_daemon_mcp() }
@@ -208,6 +238,10 @@ pub struct AppConfig {
     /// Named environment-variable presets the operator picks from at clone time.
     #[serde(default)]
     pub env_presets: Vec<EnvPreset>,
+    /// Chroma subsampling for the viewer video stream (default 4:2:0). The `RMNG_CHROMA`
+    /// env var overrides this at load time.
+    #[serde(default)]
+    pub chroma: ChromaMode,
 }
 
 impl Default for AppConfig {
@@ -224,6 +258,7 @@ impl Default for AppConfig {
             clone_accounts: Vec::new(),
             template: TemplateConfig::default(),
             env_presets: Vec::new(),
+            chroma: ChromaMode::default(),
         }
     }
 }
@@ -280,6 +315,7 @@ impl AppConfig {
                 .collect(),
             template: self.template.clone(),
             env_presets: self.env_presets.clone(),
+            chroma: self.chroma,
         }
     }
 }
@@ -321,6 +357,7 @@ pub struct AppConfigRedacted {
     pub clone_accounts: Vec<CloneAccountRedacted>,
     pub template: TemplateConfig,
     pub env_presets: Vec<EnvPreset>,
+    pub chroma: ChromaMode,
 }
 
 #[cfg(test)]
@@ -339,6 +376,27 @@ mod tests {
         assert!(mons[0].primary);
         assert_eq!(mons[1].x, 0);
         assert!(!mons[1].primary);
+    }
+
+    #[test]
+    fn chroma_mode_defaults_and_serde() {
+        // Default is 4:2:0 (today's behavior / full capacity).
+        assert_eq!(ChromaMode::default(), ChromaMode::Yuv420);
+        assert_eq!(AppConfig::default().chroma, ChromaMode::Yuv420);
+        // Wire/JSON representation is lowercase, matching RMNG_CHROMA values.
+        assert_eq!(serde_json::to_string(&ChromaMode::Yuv420).unwrap(), "\"yuv420\"");
+        assert_eq!(serde_json::to_string(&ChromaMode::Yuv444).unwrap(), "\"yuv444\"");
+        // Missing field falls back to the default (older config.json stays valid).
+        let c: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.chroma, ChromaMode::Yuv420);
+        // Env parser accepts the documented spellings.
+        assert_eq!(ChromaMode::from_env_value("yuv444"), Some(ChromaMode::Yuv444));
+        assert_eq!(ChromaMode::from_env_value("444"), Some(ChromaMode::Yuv444));
+        assert_eq!(ChromaMode::from_env_value(" YUV420 "), Some(ChromaMode::Yuv420));
+        assert_eq!(ChromaMode::from_env_value("nonsense"), None);
+        // Redaction passes chroma through (non-secret).
+        let r = AppConfig { chroma: ChromaMode::Yuv444, ..Default::default() }.redacted();
+        assert_eq!(r.chroma, ChromaMode::Yuv444);
     }
 
     #[test]

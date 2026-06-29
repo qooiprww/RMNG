@@ -8,9 +8,20 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::config::ChromaMode;
 pub use crate::socket::{
     ClipboardData, ClipboardOffer, ClipboardRequest, CursorMeta, CursorShape,
 };
+
+/// Server → viewer, sent **once at connect before any video frame** (port-1 tag 4):
+/// the active chroma mode for this session. The viewer uses it to choose its decode
+/// path — `Yuv420` decodes the `W×H` stream directly; `Yuv444` inserts the AVC444
+/// reconstruction filter for the double-height `W×2H` stream. Global + fixed at the
+/// server's launch, so it never changes within a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeMsg {
+    pub chroma: ChromaMode,
+}
 
 /// One monitor's geometry in the viewer's layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

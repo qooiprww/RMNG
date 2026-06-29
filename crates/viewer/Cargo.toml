@@ -23,6 +23,7 @@ gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = { version = "0.23", features = ["v1_24"] }
 gstreamer-allocators = "0.23"
+gstreamer-gl = { version = "0.23", features = ["v1_24"] }
 gtk4 = { version = "0.9", package = "gtk4", features = ["v4_14"] }
 serde_json.workspace = true
 # Pointer-lock / relative mouse for games (Minecraft): drive the Wayland

@@ -18,10 +18,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use media::{Conn, Encoder, Listener};
+use wire::ChromaMode;
 use wire::socket::{
     Ack, ClipboardData, ClipboardMsg, ClipboardOffer, ClipboardRequest, CursorMeta, DaemonMsg,
     InputMsg, MonitorPlacement, ServerMsg,
 };
+use wire::viewer::ModeMsg;
 
 use crate::app::App;
 
@@ -110,12 +112,16 @@ pub fn spawn(app: App) {
                     let _ = stream.set_nodelay(true);
                     tracing::info!("viewer connected: {:?}", stream.peer_addr());
                     if let Ok(input_sock) = stream.try_clone() {
+                        let chroma = app.config().chroma;
                         *viewer.lock().unwrap() = Some(stream);
+                        // Mode handshake FIRST — the viewer must know the chroma mode
+                        // before the first AU so it builds the right decode pipeline.
+                        write_mode(&viewer, chroma);
                         force_idr_all(&encoders); // fresh keyframes so the viewer paints at once
                         // Prime the new viewer with the selected clone's last-known state so
                         // it paints immediately even on a static desktop (METADATA capture is
                         // damage-driven → no fresh frame until something changes).
-                        prime_viewer(&handle, &encoders, &viewer, app.store.selected());
+                        prime_viewer(&handle, &encoders, &viewer, app.store.selected(), chroma);
                         // Advertise the current clipboard offer so the new viewer can
                         // expose it to local apps (bytes fetched lazily on paste).
                         if let Some((offer, _)) = handle.clip.lock().unwrap().offer.clone() {
@@ -158,11 +164,19 @@ pub fn spawn(app: App) {
     });
 }
 
-/// Port-1 frame types (1-byte tag prefix). 0 = video, 1 = clipboard, 2 = cursor.
+/// Port-1 frame types (1-byte tag prefix). 0 = video, 1 = clipboard, 2 = cursor,
+/// 3 = layout, 4 = mode (chroma handshake, sent once at connect before any video).
 const T_VIDEO: u8 = 0;
 const T_CLIPBOARD: u8 = 1;
 const T_CURSOR: u8 = 2;
 const T_LAYOUT: u8 = 3;
+const T_MODE: u8 = 4;
+
+/// Announce the active chroma mode: `[4u8][u32be len][JSON ModeMsg]`. Sent first on
+/// connect so the viewer picks its decode path before the first AU arrives.
+fn write_mode(viewer: &Viewer, chroma: ChromaMode) {
+    write_json_frame(viewer, T_MODE, &ModeMsg { chroma });
+}
 
 /// Frame one H.264 AU to the viewer: `[0u8][u32be monitor_id][u32be len][AnnexB]`.
 fn write_frame(viewer: &Viewer, monitor_id: u32, au: &[u8]) {
@@ -283,7 +297,13 @@ fn force_idr_all(encoders: &Encoders) {
 /// re-encode the last captured frame (so a static, damage-driven METADATA desktop
 /// still paints at once) and replay the last cursor shape (otherwise only sent on
 /// change). No-op if nothing is selected / captured yet.
-fn prime_viewer(handle: &MediaHandle, encoders: &Encoders, viewer: &Viewer, selected: Option<String>) {
+fn prime_viewer(
+    handle: &MediaHandle,
+    encoders: &Encoders,
+    viewer: &Viewer,
+    selected: Option<String>,
+    chroma: ChromaMode,
+) {
     let Some(sel) = selected else { return };
     // Video: re-encode each monitor's latest frame for an immediate keyframe, so every
     // monitor of a static, damage-driven METADATA desktop paints at once (not just one).
@@ -301,7 +321,7 @@ fn prime_viewer(handle: &MediaHandle, encoders: &Encoders, viewer: &Viewer, sele
             .unwrap_or_default()
     };
     for (mid, fd, fourcc, modifier, w, h) in frames {
-        if let Some(enc) = encoder_for(encoders, viewer, mid, w, h) {
+        if let Some(enc) = encoder_for(encoders, viewer, mid, w, h, chroma) {
             enc.force_idr();
             if let Err(e) = enc.push(fd, fourcc, modifier, w, h) {
                 tracing::warn!("prime re-encode failed: {e}");
@@ -320,7 +340,14 @@ fn prime_viewer(handle: &MediaHandle, encoders: &Encoders, viewer: &Viewer, sele
 
 /// Get-or-create the encoder for a monitor at `w`×`h`; its AUs are framed with
 /// `monitor_id`. If an encoder exists at a different resolution it is rebuilt fresh.
-fn encoder_for(encoders: &Encoders, viewer: &Viewer, monitor_id: u32, w: u32, h: u32) -> Option<Arc<Encoder>> {
+fn encoder_for(
+    encoders: &Encoders,
+    viewer: &Viewer,
+    monitor_id: u32,
+    w: u32,
+    h: u32,
+    chroma: ChromaMode,
+) -> Option<Arc<Encoder>> {
     let mut map = encoders.lock().unwrap();
     if let Some((e, ew, eh)) = map.get(&monitor_id) {
         if *ew == w && *eh == h {
@@ -329,7 +356,7 @@ fn encoder_for(encoders: &Encoders, viewer: &Viewer, monitor_id: u32, w: u32, h:
         tracing::info!("monitor {monitor_id} resolution {ew}x{eh} → {w}x{h}; rebuilding encoder");
     }
     let viewer = viewer.clone();
-    match Encoder::new(move |au, _idr| write_frame(&viewer, monitor_id, &au)) {
+    match Encoder::new(chroma, move |au, _idr| write_frame(&viewer, monitor_id, &au)) {
         Ok(e) => {
             let e = Arc::new(e);
             map.insert(monitor_id, (e.clone(), w, h));
@@ -352,6 +379,8 @@ fn serve_clone(
 ) {
     let conn = Arc::new(conn);
     let mut clone_id: Option<String> = None;
+    // Chroma mode is global + fixed at launch; snapshot it once for this clone session.
+    let chroma = app.config().chroma;
     loop {
         match conn.recv() {
             Ok((DaemonMsg::Hello(h), _)) => {
@@ -375,11 +404,11 @@ fn serve_clone(
                             *ls = sel.clone();
                             force_idr_all(&encoders);
                             // Repaint from the newly-selected clone's last frame + cursor.
-                            prime_viewer(&handle, &encoders, &viewer, sel.clone());
+                            prime_viewer(&handle, &encoders, &viewer, sel.clone(), chroma);
                         }
                     }
                     if sel.as_deref() == Some(id.as_str()) {
-                        if let Some(enc) = encoder_for(&encoders, &viewer, f.monitor_id, f.width, f.height) {
+                        if let Some(enc) = encoder_for(&encoders, &viewer, f.monitor_id, f.width, f.height, chroma) {
                             if let Err(e) = enc.push(fd, f.fourcc, f.modifier, f.width, f.height) {
                                 tracing::warn!("encode push failed: {e}");
                             }

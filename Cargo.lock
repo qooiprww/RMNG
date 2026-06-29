@@ -1092,6 +1092,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-gl"
+version = "0.23.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c5fe4cfc154d1aef2d5bddaf45c8fcb80af5ae4416795650a01c38e01d6d5bd"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-gl-sys",
+ "gstreamer-video",
+ "libc",
+ "once_cell",
+]
+
+[[package]]
+name = "gstreamer-gl-sys"
+version = "0.23.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a832c21d4522ed5e1b8dfc676a45361969216b144fc03af413a38c471f38bcf7"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
+ "gstreamer-video-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "gstreamer-sys"
 version = "0.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1638,6 +1668,8 @@ dependencies = [
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-app",
+ "gstreamer-base",
+ "gstreamer-gl",
  "gstreamer-video",
  "libc",
  "nix",
@@ -3046,6 +3078,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-app",
+ "gstreamer-gl",
  "gstreamer-video",
  "gtk4",
  "serde_json",

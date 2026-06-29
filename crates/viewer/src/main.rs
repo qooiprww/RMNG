@@ -36,12 +36,16 @@ use pointer_lock::PointerLock;
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app::AppSrc;
+use gstreamer_app::{AppSink, AppSrc};
+use gstreamer_video::prelude::VideoFrameExt;
+use gstreamer_video::{VideoFrameRef, VideoInfo};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
+use wire::ChromaMode;
 use wire::socket::{
     ClipboardData, ClipboardMsg, ClipboardOffer, ClipboardRequest, CursorMeta, CursorShape, MonitorPlacement,
 };
+use wire::viewer::ModeMsg;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -61,6 +65,12 @@ fn main() -> Result<()> {
 type VideoAus = Arc<Mutex<VecDeque<(u32, Vec<u8>)>>>;
 /// Cap so a stalled GTK thread can't grow the queue unboundedly (drops oldest).
 const AU_QUEUE_CAP: usize = 300;
+
+/// Active chroma mode, announced by the server's tag-4 handshake before any AU
+/// (`0` = Yuv420, today's direct decode; `1` = Yuv444, the AVC444 `W×2H` stream needing
+/// reconstruction). Process-global because it's server-wide and fixed per session; the
+/// net thread sets it, `make_decoder` reads it when lazily building each monitor pipeline.
+static VIEWER_CHROMA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// Input/clipboard write half (None while disconnected).
 type Writer = Arc<Mutex<Option<TcpStream>>>;
 /// Inbound clipboard messages, drained on the GUI thread (GTK clipboard ops run there).
@@ -139,8 +149,8 @@ fn run_gui() -> Result<()> {
                         tracing::info!("connected to {addr}");
                         let mut tag = [0u8; 1];
                         while rd.read_exact(&mut tag).is_ok() {
-                            // tags 1 (clipboard), 2 (cursor), 3 (layout) are all [u32 len][json].
-                            if tag[0] == 1 || tag[0] == 2 || tag[0] == 3 {
+                            // tags 1 (clipboard), 2 (cursor), 3 (layout), 4 (mode) are all [u32 len][json].
+                            if matches!(tag[0], 1 | 2 | 3 | 4) {
                                 let mut lb = [0u8; 4];
                                 if rd.read_exact(&mut lb).is_err() {
                                     break;
@@ -149,7 +159,15 @@ fn run_gui() -> Result<()> {
                                 if rd.read_exact(&mut body).is_err() {
                                     break;
                                 }
-                                if tag[0] == 1 {
+                                if tag[0] == 4 {
+                                    // Mode handshake: arrives before the first AU; record it so
+                                    // make_decoder builds the right pipeline per monitor.
+                                    if let Ok(m) = serde_json::from_slice::<ModeMsg>(&body) {
+                                        let v = matches!(m.chroma, ChromaMode::Yuv444) as u8;
+                                        VIEWER_CHROMA.store(v, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::info!("server chroma mode: {:?}", m.chroma);
+                                    }
+                                } else if tag[0] == 1 {
                                     if let Ok(msg) = serde_json::from_slice::<ClipboardMsg>(&body) {
                                         inbox.lock().unwrap().push_back(msg);
                                     }
@@ -465,6 +483,9 @@ fn toggle_fullscreen(window: &gtk4::ApplicationWindow) {
 /// `GdkPaintable`. Zero-copy GL path (works on Intel, where GStreamer can't export a VA
 /// dmabuf): `vah264dec ! glupload` (EGL dmabuf→GL, shares GTK's GL context) → the sink.
 fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
+    if VIEWER_CHROMA.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        return make_decoder_yuv444(monitor_id);
+    }
     let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
          h264parse ! vah264dec ! glupload ! gtk4paintablesink name=sink";
     let pipeline = gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
@@ -494,6 +515,121 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     pipeline.set_state(gst::State::Playing)?;
     std::mem::forget(pipeline);
     Ok((appsrc, paintable))
+}
+
+/// AVC444 (`ChromaMode::Yuv444`) decode: the stream is a double-height `W×2H` NV12 carrying
+/// the main view over an auxiliary chroma view. Two pipelines bridged by a CPU unpack:
+/// **decode** (`appsrc → h264parse → vah264dec → videoconvert → NV12 → appsink`) hands each
+/// `W×2H` NV12 frame to [`wire::avc444::unpack_stacked_nv12_to_rgba`], which reconstructs a
+/// `W×H` RGBA frame pushed into the **display** pipeline (`appsrc → glupload →
+/// gtk4paintablesink`). The returned appsrc/paintable match the 4:2:0 path's interface, so
+/// the rest of the viewer (letterbox, cursor overlay, fps — all keyed on the `W×H` paintable)
+/// is unchanged.
+///
+/// `glupload` is required: `gtk4paintablesink` reliably accepts only `memory:GLMemory`/dmabuf,
+/// and rejects a plain system-memory RGBA caps event (`format=RGBA … not accepted`) — pushing
+/// the unpacked RGBA straight to the sink negotiated-errored on the disp pipeline (silent black
+/// screen, as that pipeline had no bus error handler). `glupload` uploads the sysmem RGBA to a
+/// GL texture (sharing GTK's GL context via downstream context query, exactly like the 4:2:0
+/// path's `vah264dec ! glupload ! gtk4paintablesink`).
+///
+/// (CPU unpack is the correctness baseline; a GL element doing the same on-GPU is the
+/// performance follow-on — at high resolutions this CPU path may not sustain full fps.)
+fn make_decoder_yuv444(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
+    // Display pipeline: reconstructed RGBA → GL upload → paintable.
+    let disp = gst::parse::launch("appsrc name=disp is-live=true format=time ! glupload ! gtk4paintablesink name=sink")?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow!("not a pipeline"))?;
+    if let Some(bus) = disp.bus() {
+        bus.set_sync_handler(move |_, msg| {
+            if let gst::MessageView::Error(e) = msg.view() {
+                tracing::error!("display444[mon{monitor_id}] error: {} ({:?})", e.error(), e.debug());
+            }
+            gst::BusSyncReply::Pass
+        });
+    }
+    let disp_src: AppSrc =
+        disp.by_name("disp").context("disp appsrc")?.downcast().map_err(|_| anyhow!("not appsrc"))?;
+    let paintable = disp.by_name("sink").context("sink")?.property::<gdk::Paintable>("paintable");
+
+    // Decode pipeline: H.264 → W×2H NV12 (sysmem).
+    let dec = gst::parse::launch(
+        "appsrc name=src is-live=true format=time do-timestamp=true ! \
+         h264parse ! vah264dec ! videoconvert ! video/x-raw,format=NV12 ! \
+         appsink name=dec emit-signals=true max-buffers=4 sync=false",
+    )?
+    .downcast::<gst::Pipeline>()
+    .map_err(|_| anyhow!("not a pipeline"))?;
+    if let Some(bus) = dec.bus() {
+        bus.set_sync_handler(move |_, msg| {
+            if let gst::MessageView::Error(e) = msg.view() {
+                tracing::error!("decode444[mon{monitor_id}] error: {} ({:?})", e.error(), e.debug());
+            }
+            gst::BusSyncReply::Pass
+        });
+    }
+    let appsrc: AppSrc =
+        dec.by_name("src").context("appsrc")?.downcast().map_err(|_| anyhow!("not appsrc"))?;
+    appsrc.set_caps(Some(
+        &gst::Caps::builder("video/x-h264").field("stream-format", "byte-stream").field("alignment", "au").build(),
+    ));
+    let dec_sink: AppSink =
+        dec.by_name("dec").context("dec appsink")?.downcast().map_err(|_| anyhow!("not appsink"))?;
+
+    let disp_caps: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
+    dec_sink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |s| {
+                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Err(e) = unpack_and_show(&sample, &disp_src, &disp_caps) {
+                    tracing::warn!("avc444 unpack failed: {e}");
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    disp.set_state(gst::State::Playing)?;
+    dec.set_state(gst::State::Playing)?;
+    std::mem::forget(disp);
+    std::mem::forget(dec);
+    Ok((appsrc, paintable))
+}
+
+/// Reconstruct one `W×2H` NV12 sample to a `W×H` RGBA frame and push it to the display appsrc.
+fn unpack_and_show(
+    sample: &gst::Sample,
+    disp_src: &AppSrc,
+    disp_caps: &std::sync::Mutex<Option<(u32, u32)>>,
+) -> Result<()> {
+    let buf = sample.buffer().context("no buffer")?;
+    let caps = sample.caps().context("no caps")?;
+    let info = VideoInfo::from_caps(caps).context("video info")?;
+    let frame = VideoFrameRef::from_buffer_ref_readable(buf, &info).map_err(|_| anyhow!("map NV12"))?;
+    let (dw, dh) = (info.width() as usize, info.height() as usize); // decoded W × 2H
+    let (w, h) = (dw, dh / 2); // reconstructed image size
+    let strides = frame.plane_stride();
+    let rgba = wire::avc444::unpack_stacked_nv12_to_rgba(
+        frame.plane_data(0)?, strides[0] as usize, // luma plane
+        frame.plane_data(1)?, strides[1] as usize, // interleaved UV plane
+        w, h,
+    );
+    {
+        let mut c = disp_caps.lock().unwrap();
+        if *c != Some((w as u32, h as u32)) {
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", w as i32)
+                .field("height", h as i32)
+                .build();
+            disp_src.set_caps(Some(&caps));
+            *c = Some((w as u32, h as u32));
+        }
+    }
+    let mut out = gst::Buffer::from_mut_slice(rgba);
+    out.get_mut().unwrap().set_pts(buf.pts());
+    disp_src.push_buffer(out).map_err(|e| anyhow!("disp push: {e:?}"))?;
+    Ok(())
 }
 
 /// Source resolution from the sink paintable (0 until the first frame → 1920×1080 default).

@@ -90,9 +90,11 @@ pub fn run() -> Result<()> {
                 tracing::info!("connected; decoding (headless) …");
                 let mut tag = [0u8; 1];
                 while stream.read_exact(&mut tag).is_ok() {
-                    // tags 1 (clipboard) + 2 (cursor) + 3 (layout) are all [u32 len][json] —
-                    // discard in headless. (Missing any desyncs the stream.)
-                    if tag[0] == 1 || tag[0] == 2 || tag[0] == 3 {
+                    // tags 1 (clipboard) + 2 (cursor) + 3 (layout) + 4 (mode) are all
+                    // [u32 len][json] — discard in headless. (Missing any desyncs the stream.)
+                    // NOTE: headless decodes the stream as-is; a Yuv444 W×2H stream would need
+                    // the AVC444 reconstruction (not yet wired) — headless is a Yuv420 fps driver.
+                    if matches!(tag[0], 1 | 2 | 3 | 4) {
                         let mut lb = [0u8; 4];
                         if stream.read_exact(&mut lb).is_err() {
                             break;

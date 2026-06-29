@@ -14,6 +14,7 @@
 //! (see the `export_bindings_*` tests ts-rs generates). Transport types
 //! (socket/viewer/mcp) are serde-only.
 
+pub mod avc444;
 pub mod config;
 pub mod control;
 pub mod mcp;
@@ -21,8 +22,8 @@ pub mod socket;
 pub mod viewer;
 
 pub use config::{
-    AppConfig, AppConfigRedacted, ClaudeConfig, CloneAccount, EnvPreset, EnvVar, ListenConfig,
-    LinearConfig, ProxmoxConfig, TemplateConfig,
+    AppConfig, AppConfigRedacted, ChromaMode, ClaudeConfig, CloneAccount, EnvPreset, EnvVar,
+    ListenConfig, LinearConfig, ProxmoxConfig, TemplateConfig,
 };
 pub use control::{
     AgentReport, Chat, ChatMessage, ChatRole, ClaudeSpend, ClaudeUsage, ClaudeUsageWindow,
