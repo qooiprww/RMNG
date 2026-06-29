@@ -179,15 +179,19 @@ fn write_mode(viewer: &Viewer, chroma: ChromaMode) {
 }
 
 /// Frame one H.264 AU to the viewer: `[0u8][u32be monitor_id][u32be len][AnnexB]`.
+/// The 9-byte header + AU are assembled into one buffer and written in a single `write_all`
+/// (built before the lock): one syscall instead of four, the header rides the same TCP
+/// segment as the AU's first bytes (no tiny header-only packet under `TCP_NODELAY`), and the
+/// viewer mutex is held only for the write — not for header marshalling.
 fn write_frame(viewer: &Viewer, monitor_id: u32, au: &[u8]) {
+    let mut framed = Vec::with_capacity(9 + au.len());
+    framed.push(T_VIDEO);
+    framed.extend_from_slice(&monitor_id.to_be_bytes());
+    framed.extend_from_slice(&(au.len() as u32).to_be_bytes());
+    framed.extend_from_slice(au);
     let mut guard = viewer.lock().unwrap();
     if let Some(sock) = guard.as_mut() {
-        let ok = sock
-            .write_all(&[T_VIDEO])
-            .and_then(|_| sock.write_all(&monitor_id.to_be_bytes()))
-            .and_then(|_| sock.write_all(&(au.len() as u32).to_be_bytes()))
-            .and_then(|_| sock.write_all(au));
-        if ok.is_err() {
+        if sock.write_all(&framed).is_err() {
             *guard = None;
         }
     }

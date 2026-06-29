@@ -37,13 +37,26 @@ pub trait RemoteDesktop {
 pub trait RemoteDesktopSession {
     fn start(&self) -> zbus::Result<()>;
     fn stop(&self) -> zbus::Result<()>;
+    // Input injection: `#[zbus(no_reply)]` sets the NO_REPLY_EXPECTED flag so the call
+    // returns as soon as the message is on the bus, instead of awaiting Mutter's empty
+    // method-return. These run one-at-a-time off the inject channel (main.rs), so awaiting
+    // each reply serialized a burst of motion behind a local D-Bus round-trip apiece;
+    // fire-and-forget lets them pipeline. D-Bus preserves per-connection message order, so
+    // button/motion/key sequencing is unchanged. We never use the returned `()`; the
+    // tradeoff is losing per-call error surfacing, which for input inject is non-actionable.
+    #[zbus(no_reply)]
     fn notify_keyboard_keysym(&self, keysym: u32, state: bool) -> zbus::Result<()>;
     /// Inject a raw evdev keycode (physical-key identity, for games).
+    #[zbus(no_reply)]
     fn notify_keyboard_keycode(&self, keycode: u32, state: bool) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_button(&self, button: i32, state: bool) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_axis_discrete(&self, axis: u32, steps: i32) -> zbus::Result<()>;
     /// Relative (unaccelerated) pointer motion — for pointer-lock / games.
+    #[zbus(no_reply)]
     fn notify_pointer_motion_relative(&self, dx: f64, dy: f64) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_motion_absolute(&self, stream: &str, x: f64, y: f64) -> zbus::Result<()>;
 
     // --- clipboard (rich + lazy; we use it for text) ---

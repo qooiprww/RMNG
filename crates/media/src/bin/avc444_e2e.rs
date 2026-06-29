@@ -7,8 +7,10 @@
 //!
 //! Usage: `avc444_e2e [W H out_dir]` (defaults 2560 1440 /tmp).
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
@@ -24,6 +26,13 @@ fn main() -> Result<()> {
     // control): measures the pure 444 vs 420 pipeline throughput on this GPU.
     if args.get(1).map(|s| s == "bench").unwrap_or(false) {
         return bench_main(&args);
+    }
+    // `avc444_e2e latency [N W H FPS]` — paced push→AU latency per pipeline variant. Pushes at a
+    // fixed rate (default 60 fps, mirroring the capture cap) and FIFO-correlates each AU back to
+    // its push, so it reports the encode stage's real per-frame latency AND reveals queue growth
+    // (bufferbloat) if a variant can't keep up at that rate.
+    if args.get(1).map(|s| s == "latency").unwrap_or(false) {
+        return latency_main(&args);
     }
     // `avc444_e2e <input.png> [out_dir]` — run a real frame (e.g. a captured desktop) through
     // the full zero-copy yuv444 encode→decode→reconstruct path and dump orig/recon PNGs.
@@ -236,6 +245,171 @@ fn run_repush_bench(label: &str, desc: &str, buf: &gst::Buffer, caps: &gst::Caps
     let dt = (t[len - 1] - t[warm]).as_secs_f64();
     let fps = (len - 1 - warm) as f64 / dt;
     println!("{label}: {fps:6.1} fps   ({} AUs, {:.2}s steady-state)", len, dt);
+    Ok(())
+}
+
+/// Paced push→AU latency benchmark: the same variants as `bench_main`, but instead of free-running
+/// for max throughput we push one frame every `1/fps` seconds (mirroring the 60 Hz capture cap) and
+/// measure how long each frame takes from push to encoded AU. This is the encode stage's real
+/// per-frame latency; if a variant can't sustain `fps` the input queue grows and the numbers climb.
+fn latency_main(args: &[String]) -> Result<()> {
+    media::glpack::register()?;
+    let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(600);
+    let w: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2560);
+    let h: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1440);
+    let fps: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(60.0);
+    println!("latency bench: paced {fps:.0} fps push, FIFO-correlated push→AU, {w}x{h} (stacked {w}x{}), n={n}\n", h * 2);
+    let (buf, caps) = capture_one_frame(w, h)?;
+    println!("captured source frame: {caps}\n");
+    // Same encoder tail as the production pipeline (encode::ENC_TAIL) and the throughput bench.
+    let enc = "vah264enc aud=true b-frames=0 ref-frames=1 key-int-max=30 rate-control=cqp qpi=23 \
+               qpp=25 target-usage=1 ! video/x-h264,profile=constrained-baseline ! h264parse ! \
+               appsink name=out sync=false max-buffers=16";
+    let mid444 = "glupload ! rmngavc444pack ! vapostproc ! video/x-raw(memory:VAMemory),format=NV12";
+    // Current production: unbounded appsrc → frames pile up under encode jitter (bufferbloat).
+    run_latency_bench(
+        "444  unbounded appsrc (current)  ",
+        "",
+        &format!("{mid444} ! {enc}"),
+        &buf, &caps, n, fps,
+    )?;
+    // Bounding gradient. block=true keeps the FIFO exactly correlated (no drops), so these are real
+    // measurements of what a bounded encoder input delivers. In production, blocking the appsrc
+    // back-pressures the ack → the daemon's existing leaky-1-deep capture drops the stale frame, so
+    // a bounded encoder input == latest-frame-wins end-to-end. (Leaky-at-appsrc gives the same bound
+    // but can't be PTS-correlated here — this VA encoder strips input PTS.)
+    run_latency_bench(
+        "444  block max=2 (bounded)        ",
+        "block=true max-buffers=2",
+        &format!("{mid444} ! {enc}"),
+        &buf, &caps, n, fps,
+    )?;
+    run_latency_bench(
+        "444  block max=1 (tightest)       ",
+        "block=true max-buffers=1",
+        &format!("{mid444} ! {enc}"),
+        &buf, &caps, n, fps,
+    )?;
+    // 420 reference (half the pixels) — the encode floor for comparison.
+    run_latency_bench(
+        "420  unbounded appsrc      (1440p)",
+        "",
+        &format!("vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {enc}"),
+        &buf, &caps, n, fps,
+    )?;
+
+    // Tail-source isolation: the 444 tail (p99/max) is ~4× the 420 tail, but the median is only 2×
+    // (the extra pixels). Where's the excess jitter — the GL pack path or the double-height encode?
+    // Feed a pre-stacked 2880p frame straight to vapostproc→enc (NO glupload/pack): a pure encode of
+    // the same pixel count. If its tail is tight, the GL pack (EGL churn / blocking thread_add) is
+    // the jitter source; if it's fat too, the double-height encode itself is.
+    println!("\n-- tail-source isolation (2880p, no GL pack) --");
+    let (buf2, caps2) = capture_one_frame(w, h * 2)?;
+    run_latency_bench(
+        "2880p encode-only (no GL pack)    ",
+        "",
+        &format!("vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {enc}"),
+        &buf2, &caps2, n, fps,
+    )?;
+    Ok(())
+}
+
+/// Push one buffer through `appsrc <props> ! desc ! enc` at a fixed `fps` cadence and report
+/// push→AU latency percentiles + how many pushed frames were dropped before producing an AU.
+///
+/// This VA encoder doesn't preserve input PTS to its output AUs (most come out PTS=`None`), so
+/// latency is correlated by an **Instant FIFO**: each push enqueues `Instant::now()`, each AU pops
+/// the front. Valid only for **no-drop** configs (unbounded, or `block=true`) where AU order ==
+/// push order (b-frames=0); a leaky/dropping appsrc would desync it. The peak FIFO depth is the
+/// bufferbloat signal: how many frames stacked up at the encoder input.
+fn run_latency_bench(label: &str, props: &str, desc: &str, buf: &gst::Buffer, caps: &gst::Caps, n: usize, fps: f64) -> Result<()> {
+    let full = format!("appsrc name=src is-live=true format=time do-timestamp=true {props} ! {desc}");
+    let pipeline = match gst::parse::launch(&full) {
+        Ok(p) => p.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?,
+        Err(e) => {
+            println!("{label}: FAILED to build — {e}");
+            return Ok(());
+        }
+    };
+    let src: AppSrc = pipeline.by_name("src").context("src")?.downcast().map_err(|_| anyhow!("appsrc"))?;
+    let sink: AppSink = pipeline.by_name("out").context("out")?.downcast().map_err(|_| anyhow!("appsink"))?;
+    src.set_caps(Some(caps));
+
+    let fifo: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let lat: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (fifo, lat) = (fifo.clone(), lat.clone());
+        sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let _ = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if let Some(t0) = fifo.lock().unwrap().pop_front() {
+                        lat.lock().unwrap().push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
+    pipeline.set_state(gst::State::Playing)?;
+    // Paced push from a worker thread so the bus wait below stays responsive.
+    let peak_depth = Arc::new(AtomicUsize::new(0));
+    let push = {
+        let (src, buf, fifo, peak_depth) = (src.clone(), buf.clone(), fifo.clone(), peak_depth.clone());
+        std::thread::spawn(move || {
+            let interval = Duration::from_secs_f64(1.0 / fps);
+            let mut next = Instant::now();
+            for _ in 0..n {
+                {
+                    let mut q = fifo.lock().unwrap();
+                    q.push_back(Instant::now());
+                    peak_depth.fetch_max(q.len(), Ordering::Relaxed);
+                }
+                if src.push_buffer(buf.clone()).is_err() {
+                    break;
+                }
+                next += interval;
+                let now = Instant::now();
+                if next > now {
+                    std::thread::sleep(next - now);
+                } else {
+                    next = now; // fell behind; don't bank slack and burst
+                }
+            }
+            let _ = src.end_of_stream();
+        })
+    };
+    let mut err = None;
+    if let Some(bus) = pipeline.bus() {
+        if let Some(msg) =
+            bus.timed_pop_filtered(gst::ClockTime::from_seconds(120), &[gst::MessageType::Eos, gst::MessageType::Error])
+        {
+            if let gst::MessageView::Error(e) = msg.view() {
+                err = Some(anyhow!("{label}: pipeline error: {} ({:?})", e.error(), e.debug()));
+            }
+        }
+    }
+    let _ = push.join();
+    pipeline.set_state(gst::State::Null)?;
+    if let Some(e) = err {
+        println!("{label}: FAILED — {e}");
+        return Ok(());
+    }
+    let mut t = lat.lock().unwrap().clone();
+    let warm = 30; // skip encoder ramp + one-time GL shader build
+    if t.len() <= warm + 10 {
+        println!("{label}: only {} AUs — inconclusive", t.len());
+        return Ok(());
+    }
+    t.drain(0..warm);
+    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let m = t.len();
+    let pct = |p: f64| t[(((m - 1) as f64 * p).round() as usize).min(m - 1)];
+    let mean = t.iter().sum::<f64>() / m as f64;
+    println!(
+        "{label}: p50={:5.1}ms  p99={:5.1}ms  max={:5.1}ms  mean={:5.1}ms   (peak queue {} frames, {m} AUs)",
+        pct(0.50), pct(0.99), t[m - 1], mean, peak_depth.load(Ordering::Relaxed),
+    );
     Ok(())
 }
 

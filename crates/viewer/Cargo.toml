@@ -21,6 +21,8 @@ tracing-subscriber.workspace = true
 # the headless test mode needs no display.
 gstreamer = "0.23"
 gstreamer-app = "0.23"
+# BaseTransform/GLFilter subclassing for the zero-copy AVC444 GL unpacker (src/glunpack.rs).
+gstreamer-base = "0.23"
 gstreamer-video = { version = "0.23", features = ["v1_24"] }
 gstreamer-allocators = "0.23"
 gstreamer-gl = { version = "0.23", features = ["v1_24"] }

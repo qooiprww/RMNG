@@ -11,8 +11,10 @@
 //!   with [`wire::avc444`]); only the compressed AU leaves the GPU. The viewer reassembles
 //!   4:4:4. Requires the headless-GL env set in [`crate::init`].
 
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
@@ -26,12 +28,28 @@ pub struct Encoder {
     /// The whole encode pipeline (where `vah264enc` lives, so `force_idr` targets it).
     pipeline: gst::Pipeline,
     cur: Mutex<Option<(u32, u64, u32, u32)>>, // fourcc, modifier, w, h — input caps gate
+    /// `Some` only when `RMNG_ENC_LATENCY` is set: shared FIFO of push timestamps the appsink pops
+    /// to measure per-frame push→AU latency. (This VA encoder doesn't preserve input PTS to its
+    /// output AUs, so latency is correlated by push order — valid while frames aren't dropped.)
+    lat: Option<Arc<Mutex<VecDeque<Instant>>>>,
 }
 
 /// DRM fourcc (e.g. 0x34325241) → "AR24".
 fn fourcc_str(fourcc: u32) -> String {
     String::from_utf8_lossy(&fourcc.to_le_bytes()).trim_end_matches('\0').to_string()
 }
+
+/// Input-queue bound for the appsrc, shared by both modes. Without it the appsrc queue is
+/// unbounded: under any encode slowdown frames pile up and per-frame latency grows without recovery
+/// (bufferbloat). Measured on the W6800 at a paced 60 fps push, the unbounded 4:4:4 path reached
+/// p99 ≈ 115 ms / a 7–8 frame backlog while the median stayed ≈ 13 ms; under sustained overload it
+/// runs to seconds. `leaky-type=downstream` drops the OLDEST queued frame when full, so the encoder
+/// always pulls the freshest capture (latest-frame-wins — the right policy for a live desktop; a
+/// dropped *raw* frame just skips a visual state, unlike a dropped encoded AU which would corrupt
+/// the H.264 reference chain, so the appsink stays lossless). `max-buffers=2` keeps a little
+/// pack/encode pipelining slack while bounding the input to ~2 frames. Tighter (`=1`) trims the
+/// tail a few ms more but removes that slack. `do-timestamp` is unaffected.
+const APPSRC_BOUND: &str = "max-buffers=2 leaky-type=downstream";
 
 /// `vah264enc → h264parse → appsink` tail, shared by both modes.
 ///
@@ -60,14 +78,15 @@ impl Encoder {
 
     fn new_yuv420<F: FnMut(Vec<u8>, bool) + Send + 'static>(on_au: F) -> Result<Self> {
         let desc = format!(
-            "appsrc name=src is-live=true format=time do-timestamp=true ! \
+            "appsrc name=src is-live=true format=time do-timestamp=true {APPSRC_BOUND} ! \
              vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {ENC_TAIL}"
         );
         let pipeline = launch_pipeline(&desc)?;
         let appsrc = by_name_appsrc(&pipeline, "src")?;
-        attach_au_sink(&pipeline, on_au)?;
+        let lat = lat_fifo();
+        attach_au_sink(&pipeline, on_au, lat.clone())?;
         pipeline.set_state(gst::State::Playing).context("encoder PLAYING")?;
-        Ok(Self { appsrc, pipeline, cur: Mutex::new(None) })
+        Ok(Self { appsrc, pipeline, cur: Mutex::new(None), lat })
     }
 
     fn new_yuv444<F: FnMut(Vec<u8>, bool) + Send + 'static>(on_au: F) -> Result<Self> {
@@ -81,15 +100,16 @@ impl Encoder {
         // No per-frame host transfers. (push() attaches a VideoMeta so glupload can EGL-import the
         // bare compositor dmabuf zero-copy — without it glupload derives 0 planes and CPU-mmaps.)
         let desc = format!(
-            "appsrc name=src is-live=true format=time do-timestamp=true ! \
+            "appsrc name=src is-live=true format=time do-timestamp=true {APPSRC_BOUND} ! \
              glupload ! rmngavc444pack ! \
              vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! {ENC_TAIL}"
         );
         let pipeline = launch_pipeline(&desc)?;
         let appsrc = by_name_appsrc(&pipeline, "src")?;
-        attach_au_sink(&pipeline, on_au)?;
+        let lat = lat_fifo();
+        attach_au_sink(&pipeline, on_au, lat.clone())?;
         pipeline.set_state(gst::State::Playing).context("encoder PLAYING")?;
-        Ok(Self { appsrc, pipeline, cur: Mutex::new(None) })
+        Ok(Self { appsrc, pipeline, cur: Mutex::new(None), lat })
     }
 
     /// Force the next encoded frame to be an IDR (keyframe). The event reaches `vah264enc`
@@ -148,9 +168,20 @@ impl Encoder {
                 &[(w * 4) as i32],
             );
         }
+        // For latency measurement, record the push instant just before handing the frame off; the
+        // appsink pops it per AU. Enqueue only on a successful push so the FIFO stays aligned.
+        let t0 = self.lat.as_ref().map(|_| Instant::now());
         self.appsrc.push_buffer(buffer).map_err(|e| anyhow!("push_buffer: {e:?}"))?;
+        if let (Some(fifo), Some(t0)) = (&self.lat, t0) {
+            fifo.lock().unwrap().push_back(t0);
+        }
         Ok(())
     }
+}
+
+/// `Some(empty FIFO)` when `RMNG_ENC_LATENCY` is set, else `None` (zero overhead in production).
+fn lat_fifo() -> Option<Arc<Mutex<VecDeque<Instant>>>> {
+    std::env::var_os("RMNG_ENC_LATENCY").map(|_| Arc::new(Mutex::new(VecDeque::new())))
 }
 
 fn launch_pipeline(desc: &str) -> Result<gst::Pipeline> {
@@ -162,15 +193,33 @@ fn by_name_appsrc(p: &gst::Pipeline, name: &str) -> Result<AppSrc> {
 }
 
 /// Wire the `out` appsink to call `on_au(annexb, is_idr)` per access unit.
-fn attach_au_sink<F: FnMut(Vec<u8>, bool) + Send + 'static>(p: &gst::Pipeline, mut on_au: F) -> Result<()> {
+///
+/// When `lat` is `Some` (`RMNG_ENC_LATENCY` set), also measures per-frame **push→AU latency** (the
+/// encode stage's own contribution, queueing included — so it exposes bufferbloat) by popping the
+/// push instant `push()` enqueued for this frame, and logs p50/p99/max every 120 AUs. Purely
+/// additive: no pipeline element or property changes.
+fn attach_au_sink<F: FnMut(Vec<u8>, bool) + Send + 'static>(
+    p: &gst::Pipeline,
+    mut on_au: F,
+    lat: Option<Arc<Mutex<VecDeque<Instant>>>>,
+) -> Result<()> {
     let appsink: AppSink =
         p.by_name("out").context("appsink out")?.downcast().map_err(|_| anyhow!("not appsink"))?;
+    let mut samples: Vec<f64> = Vec::new();
     appsink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |s| {
                 let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 if let Some(buf) = sample.buffer() {
                     let idr = !buf.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                    if let Some(fifo) = &lat {
+                        if let Some(t0) = fifo.lock().unwrap().pop_front() {
+                            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+                            if samples.len() >= 120 {
+                                report_latency("enc push→AU", &mut samples);
+                            }
+                        }
+                    }
                     if let Ok(map) = buf.map_readable() {
                         on_au(map.as_slice().to_vec(), idr);
                     }
@@ -180,4 +229,23 @@ fn attach_au_sink<F: FnMut(Vec<u8>, bool) + Send + 'static>(p: &gst::Pipeline, m
             .build(),
     );
     Ok(())
+}
+
+/// Log p50/p99/max/mean of the collected latency samples (ms) and clear them.
+fn report_latency(tag: &str, samples: &mut Vec<f64>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = samples.len();
+    let pct = |p: f64| samples[(((n - 1) as f64 * p).round() as usize).min(n - 1)];
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    tracing::info!(
+        "[{tag}] n={n} p50={:.1}ms p99={:.1}ms max={:.1}ms mean={:.1}ms",
+        pct(0.50),
+        pct(0.99),
+        samples[n - 1],
+        mean
+    );
+    samples.clear();
 }

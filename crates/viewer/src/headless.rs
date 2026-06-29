@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,19 +13,34 @@ use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
+use wire::ChromaMode;
+use wire::viewer::ModeMsg;
 
 type Counters = Arc<Mutex<HashMap<u32, Arc<AtomicU64>>>>;
 
-/// Build a decode pipeline for one monitor; returns its appsrc. The appsink
-/// counts frames (and, in dump mode, writes the first one to PNG + exits).
+/// Server chroma mode from the tag-4 handshake (0 = Yuv420 direct decode, 1 = Yuv444 AVC444
+/// `W×2H` stream needing the GL reconstruction). Set before the first AU; read by `make_decoder`.
+static CHROMA: AtomicU8 = AtomicU8::new(0);
+
+/// Build a decode pipeline for one monitor; returns its appsrc. The appsink counts frames (and, in
+/// dump mode, writes the first one to PNG + exits). In Yuv444 the decoded stream is a stacked
+/// `W×2H` NV12 carrying full 4:4:4 — reconstruct it on the GPU via `glupload ! rmngavc444unpack`
+/// (the same zero-copy element the GUI uses); `gldownload` is only added to land sysmem for the
+/// PNG dump.
 fn make_decoder(monitor_id: u32, counter: Arc<AtomicU64>, dump: Option<String>) -> Result<AppSrc> {
-    let desc = if dump.is_some() {
-        "appsrc name=src is-live=true format=time do-timestamp=true ! \
-         h264parse ! vah264dec ! videoconvert ! pngenc ! \
-         appsink name=out emit-signals=true max-buffers=2 sync=false"
-    } else {
-        "appsrc name=src is-live=true format=time do-timestamp=true ! \
-         h264parse ! vah264dec ! appsink name=out emit-signals=true max-buffers=4 sync=false"
+    let yuv444 = CHROMA.load(Ordering::Relaxed) == 1;
+    let desc = match (yuv444, dump.is_some()) {
+        (true, true) => "appsrc name=src is-live=true format=time do-timestamp=true ! \
+             h264parse ! vah264dec ! glupload ! rmngavc444unpack ! gldownload ! \
+             videoconvert ! pngenc ! appsink name=out emit-signals=true max-buffers=2 sync=false",
+        (true, false) => "appsrc name=src is-live=true format=time do-timestamp=true ! \
+             h264parse ! vah264dec ! glupload ! rmngavc444unpack ! \
+             appsink name=out emit-signals=true max-buffers=4 sync=false",
+        (false, true) => "appsrc name=src is-live=true format=time do-timestamp=true ! \
+             h264parse ! vah264dec ! videoconvert ! pngenc ! \
+             appsink name=out emit-signals=true max-buffers=2 sync=false",
+        (false, false) => "appsrc name=src is-live=true format=time do-timestamp=true ! \
+             h264parse ! vah264dec ! appsink name=out emit-signals=true max-buffers=4 sync=false",
     };
     let pipeline = gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
     let appsrc = pipeline.by_name("src").context("appsrc")?.downcast::<AppSrc>().map_err(|_| anyhow!("not appsrc"))?;
@@ -90,18 +105,23 @@ pub fn run() -> Result<()> {
                 tracing::info!("connected; decoding (headless) …");
                 let mut tag = [0u8; 1];
                 while stream.read_exact(&mut tag).is_ok() {
-                    // tags 1 (clipboard) + 2 (cursor) + 3 (layout) + 4 (mode) are all
-                    // [u32 len][json] — discard in headless. (Missing any desyncs the stream.)
-                    // NOTE: headless decodes the stream as-is; a Yuv444 W×2H stream would need
-                    // the AVC444 reconstruction (not yet wired) — headless is a Yuv420 fps driver.
+                    // tags 1 (clipboard) + 2 (cursor) + 3 (layout) + 4 (mode) are all [u32 len][json].
+                    // Tag 4 (chroma mode) arrives before the first AU — record it so make_decoder
+                    // builds the right pipeline; the rest are discarded. (Missing any desyncs.)
                     if matches!(tag[0], 1 | 2 | 3 | 4) {
                         let mut lb = [0u8; 4];
                         if stream.read_exact(&mut lb).is_err() {
                             break;
                         }
-                        let mut skip = vec![0u8; u32::from_be_bytes(lb) as usize];
-                        if stream.read_exact(&mut skip).is_err() {
+                        let mut body = vec![0u8; u32::from_be_bytes(lb) as usize];
+                        if stream.read_exact(&mut body).is_err() {
                             break;
+                        }
+                        if tag[0] == 4 {
+                            if let Ok(m) = serde_json::from_slice::<ModeMsg>(&body) {
+                                CHROMA.store(matches!(m.chroma, ChromaMode::Yuv444) as u8, Ordering::Relaxed);
+                                tracing::info!("server chroma mode: {:?}", m.chroma);
+                            }
                         }
                         continue;
                     }

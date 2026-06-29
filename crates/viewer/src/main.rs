@@ -19,6 +19,7 @@
 //! `gtk4paintablesink`'s paintable is a GTK object (`!Send`), so all pipelines, paintables
 //! and widgets live on the GTK main thread; the net thread only ships AU bytes over a queue.
 
+mod glunpack;
 mod headless;
 mod pointer_lock;
 
@@ -36,9 +37,7 @@ use pointer_lock::PointerLock;
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app::{AppSink, AppSrc};
-use gstreamer_video::prelude::VideoFrameExt;
-use gstreamer_video::{VideoFrameRef, VideoInfo};
+use gstreamer_app::AppSrc;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 use wire::ChromaMode;
@@ -48,6 +47,17 @@ use wire::socket::{
 use wire::viewer::ModeMsg;
 
 fn main() -> Result<()> {
+    // GTK's default GL renderer (`ngl`) and `vulkan` cache GdkTextures by identity and keep serving
+    // a stale copy when gtk4paintablesink hands them the *same* GdkTexture for a recycled buffer
+    // slot whose pixels changed — so an old frame from a few back reappears (worse when the window
+    // downscales, since they cache a scaled intermediate; clean at ~1:1). The legacy `gl` renderer
+    // doesn't cache that way: it re-samples the live texture every draw, so it's clean AND fast.
+    // Empirically confirmed on this Intel/Mesa box: cairo=clean(slow), ngl/vulkan=stale, gl=clean.
+    // Pin `gl` unless the user overrides. Must be set before GTK realizes its first surface; we're
+    // still single-threaded here so set_var is sound.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        unsafe { std::env::set_var("GSK_RENDERER", "gl") };
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -55,16 +65,33 @@ fn main() -> Result<()> {
         )
         .init();
     gst::init()?;
-    if std::env::args().any(|a| a == "--headless") {
+    glunpack::register()?;
+    // `--glunpack-validate [W H]`: offline GPU-unpack vs CPU-oracle pixel check (no server needed).
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--glunpack-validate") {
+        let w = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(256);
+        let h = args.get(pos + 2).and_then(|s| s.parse().ok()).unwrap_or(144);
+        return glunpack::validate(w, h);
+    }
+    if args.iter().any(|a| a == "--headless") {
         return headless::run();
     }
     run_gui()
 }
 
-/// Inbound video AUs `(monitor_id, AnnexB)` shipped net-thread → GTK main thread.
+/// Inbound video AUs `(monitor_id, AnnexB)` shipped net-thread → GTK main thread. Only a
+/// monitor's *first* AU(s) ride this queue (until its window exists); steady-state AUs go
+/// straight to the appsrc from the net thread via [`VideoSrcs`].
 type VideoAus = Arc<Mutex<VecDeque<(u32, Vec<u8>)>>>;
-/// Cap so a stalled GTK thread can't grow the queue unboundedly (drops oldest).
+/// Cap on the bootstrap queue so a stalled GTK thread can't grow it unboundedly (drops
+/// oldest). Steady-state AUs bypass this queue entirely (see [`VideoSrcs`]).
 const AU_QUEUE_CAP: usize = 300;
+/// `monitor_id → appsrc` for every built decode pipeline, shared net-thread ⇄ GTK main.
+/// Lets the net thread push an AU straight into the decoder the instant it's read — no GTK
+/// tick hop (which cost up to one 8 ms tick of latency per frame). `AppSrc` is a thread-safe
+/// `GstElement` (`Send`+`Sync`); only the `!Send` sink paintable forces the main thread, and
+/// it never crosses here. Populated by the tick when it lazily builds each monitor's window.
+type VideoSrcs = Arc<Mutex<HashMap<u32, AppSrc>>>;
 
 /// Active chroma mode, announced by the server's tag-4 handshake before any AU
 /// (`0` = Yuv420, today's direct decode; `1` = Yuv444, the AVC444 `W×2H` stream needing
@@ -133,20 +160,25 @@ fn run_gui() -> Result<()> {
     let cursors: Cursors = Arc::new(Mutex::new(HashMap::new()));
     let reported: ReportedLayout = Arc::new(Mutex::new(Vec::new()));
     let warp: WarpSuppress = Arc::new(Mutex::new(None));
+    let srcs: VideoSrcs = Arc::new(Mutex::new(HashMap::new()));
 
     // Net thread: reconnect loop; read [u8 tag][…] → video queue / clipboard / cursor / layout.
     {
-        let (aus, writer, inbox, cursors, reported, warp, addr) =
-            (aus.clone(), writer.clone(), inbox.clone(), cursors.clone(), reported.clone(), warp.clone(), addr.clone());
+        let (aus, srcs, writer, inbox, cursors, reported, warp, addr) =
+            (aus.clone(), srcs.clone(), writer.clone(), inbox.clone(), cursors.clone(), reported.clone(), warp.clone(), addr.clone());
         std::thread::spawn(move || {
             loop {
                 match TcpStream::connect(&addr) {
-                    Ok(mut rd) => {
+                    Ok(rd) => {
                         rd.set_nodelay(true).ok();
                         if let Ok(w) = rd.try_clone() {
                             *writer.lock().unwrap() = Some(w);
                         }
                         tracing::info!("connected to {addr}");
+                        // Buffer the read half: one recv fills the buffer so the per-frame
+                        // tag/header/AU `read_exact`s are served from memory instead of one
+                        // syscall each (the write half is the independent `try_clone` above).
+                        let mut rd = std::io::BufReader::new(rd);
                         let mut tag = [0u8; 1];
                         while rd.read_exact(&mut tag).is_ok() {
                             // tags 1 (clipboard), 2 (cursor), 3 (layout), 4 (mode) are all [u32 len][json].
@@ -207,11 +239,23 @@ fn run_gui() -> Result<()> {
                             if rd.read_exact(&mut au).is_err() {
                                 break;
                             }
-                            let mut q = aus.lock().unwrap();
-                            if q.len() >= AU_QUEUE_CAP {
-                                q.pop_front();
+                            // Fast path: once a monitor's window (hence appsrc) exists, push the
+                            // AU straight to its decoder from here — skipping the GTK tick, which
+                            // otherwise cost up to one 8 ms tick of latency per frame. A monitor's
+                            // first AU(s) still go via the queue for the tick to build the window on
+                            // the main thread. Hold `srcs` across this dispatch (and the tick holds
+                            // it across create+drain) so the hand-off stays strictly ordered — an
+                            // out-of-order AU would corrupt H.264 decode.
+                            let g = srcs.lock().unwrap();
+                            if let Some(src) = g.get(&mid) {
+                                let _ = src.push_buffer(gst::Buffer::from_mut_slice(au));
+                            } else {
+                                let mut q = aus.lock().unwrap();
+                                if q.len() >= AU_QUEUE_CAP {
+                                    q.pop_front();
+                                }
+                                q.push_back((mid, au));
                             }
-                            q.push_back((mid, au));
                         }
                         *writer.lock().unwrap() = None;
                         tracing::info!("disconnected; retrying (server force-IDRs on reconnect)");
@@ -224,7 +268,7 @@ fn run_gui() -> Result<()> {
     }
 
     let app = gtk4::Application::builder().application_id("dev.kasm.rmng-viewer").build();
-    app.connect_activate(move |app| build_ui(app, &aus, &writer, &inbox, &cursors, &reported, &warp));
+    app.connect_activate(move |app| build_ui(app, &aus, &srcs, &writer, &inbox, &cursors, &reported, &warp));
     let empty: [&str; 0] = [];
     app.run_with_args(&empty);
     Ok(())
@@ -261,6 +305,7 @@ type Windows = Rc<RefCell<HashMap<u32, MonitorWindow>>>;
 fn build_ui(
     app: &gtk4::Application,
     aus: &VideoAus,
+    srcs: &VideoSrcs,
     writer: &Writer,
     inbox: &ClipInbox,
     cursors: &Cursors,
@@ -286,8 +331,9 @@ fn build_ui(
     let layout: SharedLayout = Rc::new(RefCell::new(Vec::new()));
 
     {
-        let (aus, writer, cursors, windows, layout, app, reported, warp, pointer_lock) = (
+        let (aus, srcs, writer, cursors, windows, layout, app, reported, warp, pointer_lock) = (
             aus.clone(),
+            srcs.clone(),
             writer.clone(),
             cursors.clone(),
             windows.clone(),
@@ -300,13 +346,23 @@ fn build_ui(
         // ~8 ms tick: drain AUs → window per monitor (created lazily here, on the main
         // thread); refresh the layout; update client cursors.
         glib::timeout_add_local(Duration::from_millis(8), move || {
-            let batch: Vec<(u32, Vec<u8>)> = aus.lock().unwrap().drain(..).collect();
-            for (mid, au) in batch {
-                let mut w = windows.borrow_mut();
-                let win = w
-                    .entry(mid)
-                    .or_insert_with(|| make_monitor_window(&app, mid, &layout, &writer, &pointer_lock, &warp));
-                let _ = win.appsrc.push_buffer(gst::Buffer::from_mut_slice(au));
+            // Bootstrap-only video path: the net thread pushes AUs for already-built monitors
+            // straight to their appsrc; here we drain the first AU(s) of a not-yet-built monitor,
+            // create its window on the main thread, and register its appsrc in `srcs` so the net
+            // thread takes over. Hold `srcs` across the whole drain+create so the hand-off stays
+            // ordered with the net thread (see its matching comment).
+            {
+                let mut srcs = srcs.lock().unwrap();
+                let batch: Vec<(u32, Vec<u8>)> = aus.lock().unwrap().drain(..).collect();
+                for (mid, au) in batch {
+                    let mut w = windows.borrow_mut();
+                    let win = w.entry(mid).or_insert_with(|| {
+                        let win = make_monitor_window(&app, mid, &layout, &writer, &pointer_lock, &warp);
+                        srcs.insert(mid, win.appsrc.clone());
+                        win
+                    });
+                    let _ = win.appsrc.push_buffer(gst::Buffer::from_mut_slice(au));
+                }
             }
             // Prefer the server's reported layout (the clone's real monitor positions);
             // until it arrives, fall back to a computed left-to-right packing.
@@ -423,16 +479,15 @@ fn make_monitor_window(
     cursor.set_can_target(false); // input-transparent
     cursor.set_visible(false);
 
-    let overlay = gtk4::Overlay::new();
-    overlay.set_child(Some(&video));
-    overlay.add_overlay(&cursor);
-
     let window = gtk4::ApplicationWindow::builder()
         .application(app)
         .title(format!("RMNG viewer — monitor {mid}"))
         .default_width(1280)
         .default_height(720)
         .build();
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&video));
+    overlay.add_overlay(&cursor);
     window.set_child(Some(&overlay));
 
     // Header bar: FPS readout (left) + a fullscreen toggle (F11 also toggles).
@@ -486,8 +541,12 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     if VIEWER_CHROMA.load(std::sync::atomic::Ordering::Relaxed) == 1 {
         return make_decoder_yuv444(monitor_id);
     }
+    // `sync=false`: present each frame on arrival rather than holding it to its clock PTS —
+    // lowest latency for a live, latest-wins paintable (no audio to sync to). It also makes
+    // the sink immune to any reorder/DPB latency the decoder declares in a LATENCY query, so
+    // the only display delay left is the next vsync. Matches the 444 path (make_decoder_yuv444).
     let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
-         h264parse ! vah264dec ! glupload ! gtk4paintablesink name=sink";
+         h264parse ! vah264dec ! glupload ! gtk4paintablesink name=sink sync=false";
     let pipeline = gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
     if let Some(bus) = pipeline.bus() {
         bus.set_sync_handler(move |_, msg| {
@@ -517,119 +576,57 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     Ok((appsrc, paintable))
 }
 
-/// AVC444 (`ChromaMode::Yuv444`) decode: the stream is a double-height `W×2H` NV12 carrying
-/// the main view over an auxiliary chroma view. Two pipelines bridged by a CPU unpack:
-/// **decode** (`appsrc → h264parse → vah264dec → videoconvert → NV12 → appsink`) hands each
-/// `W×2H` NV12 frame to [`wire::avc444::unpack_stacked_nv12_to_rgba`], which reconstructs a
-/// `W×H` RGBA frame pushed into the **display** pipeline (`appsrc → glupload →
-/// gtk4paintablesink`). The returned appsrc/paintable match the 4:2:0 path's interface, so
-/// the rest of the viewer (letterbox, cursor overlay, fps — all keyed on the `W×H` paintable)
-/// is unchanged.
+/// AVC444 (`ChromaMode::Yuv444`) decode: the stream is a double-height `W×2H` NV12 carrying the
+/// main view over an auxiliary chroma view. **All-GL zero-copy** path — the whole reconstruction
+/// stays in VRAM (no host copies), mirroring the 4:2:0 path's structure:
 ///
-/// `glupload` is required: `gtk4paintablesink` reliably accepts only `memory:GLMemory`/dmabuf,
-/// and rejects a plain system-memory RGBA caps event (`format=RGBA … not accepted`) — pushing
-/// the unpacked RGBA straight to the sink negotiated-errored on the disp pipeline (silent black
-/// screen, as that pipeline had no bus error handler). `glupload` uploads the sysmem RGBA to a
-/// GL texture (sharing GTK's GL context via downstream context query, exactly like the 4:2:0
-/// path's `vah264dec ! glupload ! gtk4paintablesink`).
+/// `appsrc(h264) ! h264parse ! vah264dec ! glupload ! rmngavc444unpack ! gtk4paintablesink`
 ///
-/// (CPU unpack is the correctness baseline; a GL element doing the same on-GPU is the
-/// performance follow-on — at high resolutions this CPU path may not sustain full fps.)
+/// `vah264dec ! glupload` gives the decoded `W×2H` NV12 as GLMemory (2 textures: Y R8, UV RG8);
+/// our [`glunpack`] element gathers the polyphase chroma quadrants back into `W×H` 4:4:4 and does
+/// the BT.601-limited YCbCr→RGB in a single FBO render (the GPU twin of
+/// [`wire::avc444::unpack_stacked_nv12_to_rgba`]); `gtk4paintablesink` shows the `W×H` RGBA
+/// texture zero-copy. The returned appsrc/paintable match the 4:2:0 path's interface (intrinsic
+/// size `W×H`), so the rest of the viewer (letterbox, cursor overlay, fps) is unchanged.
+///
+/// Do **not** put a `glcolorconvert`/`videoconvert` between `glupload` and `rmngavc444unpack`:
+/// that would 4:2:0-upsample the packed chroma and destroy the auxiliary view. The element reads
+/// the raw Y/UV textures.
 fn make_decoder_yuv444(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
-    // Display pipeline: reconstructed RGBA → GL upload → paintable.
-    let disp = gst::parse::launch("appsrc name=disp is-live=true format=time ! glupload ! gtk4paintablesink name=sink")?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| anyhow!("not a pipeline"))?;
-    if let Some(bus) = disp.bus() {
+    glunpack::register()?;
+    // Plain `gtk4paintablesink sync=false` (present on arrival, no audio to clock-sync to) — same as
+    // the 4:2:0 path. The "old frame from a few back when downscaling" bug was NOT a sink backlog
+    // (the sink is latest-wins); it was GTK's `ngl`/`vulkan` GSK renderer caching a recycled
+    // GdkTexture — fixed by pinning `GSK_RENDERER=gl` in main().
+    let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
+         h264parse ! vah264dec ! glupload ! rmngavc444unpack ! gtk4paintablesink name=sink sync=false";
+    let pipeline = gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
+    if let Some(bus) = pipeline.bus() {
         bus.set_sync_handler(move |_, msg| {
-            if let gst::MessageView::Error(e) = msg.view() {
-                tracing::error!("display444[mon{monitor_id}] error: {} ({:?})", e.error(), e.debug());
-            }
-            gst::BusSyncReply::Pass
-        });
-    }
-    let disp_src: AppSrc =
-        disp.by_name("disp").context("disp appsrc")?.downcast().map_err(|_| anyhow!("not appsrc"))?;
-    let paintable = disp.by_name("sink").context("sink")?.property::<gdk::Paintable>("paintable");
-
-    // Decode pipeline: H.264 → W×2H NV12 (sysmem).
-    let dec = gst::parse::launch(
-        "appsrc name=src is-live=true format=time do-timestamp=true ! \
-         h264parse ! vah264dec ! videoconvert ! video/x-raw,format=NV12 ! \
-         appsink name=dec emit-signals=true max-buffers=4 sync=false",
-    )?
-    .downcast::<gst::Pipeline>()
-    .map_err(|_| anyhow!("not a pipeline"))?;
-    if let Some(bus) = dec.bus() {
-        bus.set_sync_handler(move |_, msg| {
-            if let gst::MessageView::Error(e) = msg.view() {
-                tracing::error!("decode444[mon{monitor_id}] error: {} ({:?})", e.error(), e.debug());
+            match msg.view() {
+                gst::MessageView::Error(e) => tracing::error!(
+                    "decode444[mon{monitor_id}] error from {:?}: {} (debug: {:?})",
+                    e.src().map(|s| s.name()),
+                    e.error(),
+                    e.debug()
+                ),
+                gst::MessageView::Warning(w) => {
+                    tracing::warn!("decode444[mon{monitor_id}] warning: {} (debug: {:?})", w.error(), w.debug())
+                }
+                _ => {}
             }
             gst::BusSyncReply::Pass
         });
     }
     let appsrc: AppSrc =
-        dec.by_name("src").context("appsrc")?.downcast().map_err(|_| anyhow!("not appsrc"))?;
+        pipeline.by_name("src").context("appsrc")?.downcast().map_err(|_| anyhow!("not appsrc"))?;
     appsrc.set_caps(Some(
         &gst::Caps::builder("video/x-h264").field("stream-format", "byte-stream").field("alignment", "au").build(),
     ));
-    let dec_sink: AppSink =
-        dec.by_name("dec").context("dec appsink")?.downcast().map_err(|_| anyhow!("not appsink"))?;
-
-    let disp_caps: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
-    dec_sink.set_callbacks(
-        gstreamer_app::AppSinkCallbacks::builder()
-            .new_sample(move |s| {
-                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if let Err(e) = unpack_and_show(&sample, &disp_src, &disp_caps) {
-                    tracing::warn!("avc444 unpack failed: {e}");
-                }
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
-
-    disp.set_state(gst::State::Playing)?;
-    dec.set_state(gst::State::Playing)?;
-    std::mem::forget(disp);
-    std::mem::forget(dec);
+    let paintable = pipeline.by_name("sink").context("sink")?.property::<gdk::Paintable>("paintable");
+    pipeline.set_state(gst::State::Playing)?;
+    std::mem::forget(pipeline);
     Ok((appsrc, paintable))
-}
-
-/// Reconstruct one `W×2H` NV12 sample to a `W×H` RGBA frame and push it to the display appsrc.
-fn unpack_and_show(
-    sample: &gst::Sample,
-    disp_src: &AppSrc,
-    disp_caps: &std::sync::Mutex<Option<(u32, u32)>>,
-) -> Result<()> {
-    let buf = sample.buffer().context("no buffer")?;
-    let caps = sample.caps().context("no caps")?;
-    let info = VideoInfo::from_caps(caps).context("video info")?;
-    let frame = VideoFrameRef::from_buffer_ref_readable(buf, &info).map_err(|_| anyhow!("map NV12"))?;
-    let (dw, dh) = (info.width() as usize, info.height() as usize); // decoded W × 2H
-    let (w, h) = (dw, dh / 2); // reconstructed image size
-    let strides = frame.plane_stride();
-    let rgba = wire::avc444::unpack_stacked_nv12_to_rgba(
-        frame.plane_data(0)?, strides[0] as usize, // luma plane
-        frame.plane_data(1)?, strides[1] as usize, // interleaved UV plane
-        w, h,
-    );
-    {
-        let mut c = disp_caps.lock().unwrap();
-        if *c != Some((w as u32, h as u32)) {
-            let caps = gst::Caps::builder("video/x-raw")
-                .field("format", "RGBA")
-                .field("width", w as i32)
-                .field("height", h as i32)
-                .build();
-            disp_src.set_caps(Some(&caps));
-            *c = Some((w as u32, h as u32));
-        }
-    }
-    let mut out = gst::Buffer::from_mut_slice(rgba);
-    out.get_mut().unwrap().set_pts(buf.pts());
-    disp_src.push_buffer(out).map_err(|e| anyhow!("disp push: {e:?}"))?;
-    Ok(())
 }
 
 /// Source resolution from the sink paintable (0 until the first frame → 1920×1080 default).
@@ -1057,11 +1054,15 @@ fn serve_request(clipboard: &gdk::Clipboard, writer: &Writer, r: ClipboardReques
 /// viewer → server framing: `[u8 tag][u32be len][json]`. tag 0 = input, 1 = clipboard.
 fn send_tagged(writer: &Writer, tag: u8, json: String) {
     if let Some(g) = writer.lock().unwrap().as_mut() {
-        let hdr = (json.len() as u32).to_be_bytes();
-        let _ = g
-            .write_all(&[tag])
-            .and_then(|_| g.write_all(&hdr))
-            .and_then(|_| g.write_all(json.as_bytes()));
+        // One contiguous `[tag][u32be len][json]` write: with TCP_NODELAY, three separate
+        // write_all calls can emit three tiny segments per input event, adding round-trip
+        // jitter on a real link. Coalescing → one syscall, one segment.
+        let body = json.as_bytes();
+        let mut frame = Vec::with_capacity(1 + 4 + body.len());
+        frame.push(tag);
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        let _ = g.write_all(&frame);
     }
 }
 
