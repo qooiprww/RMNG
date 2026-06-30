@@ -14,11 +14,17 @@
 //! (video), tag 1 = `[u32be len][JSON ClipboardMsg]`, tag 2 = `[u32be len][JSON CursorMeta]`.
 //! viewer→server: `[u8 tag][u32be len][json]` (0 input, 1 clipboard). Auto-reconnects.
 //!
-//!   RMNG_VIDEO=host:port viewer [--headless]
+//! The server address (`host:port`) is read from `~/.config/rmng-viewer/config.json`
+//! and editable at runtime via the main window's title-bar Settings button (see
+//! [`config`]); `RMNG_VIDEO` only seeds the default on first run, before any config
+//! file exists. Headless mode (`--headless`) still reads `RMNG_VIDEO` directly.
+//!
+//!   viewer [--headless]
 //!
 //! `gtk4paintablesink`'s paintable is a GTK object (`!Send`), so all pipelines, paintables
 //! and widgets live on the GTK main thread; the net thread only ships AU bytes over a queue.
 
+mod config;
 mod glunpack;
 mod headless;
 mod pointer_lock;
@@ -100,6 +106,9 @@ type VideoSrcs = Arc<Mutex<HashMap<u32, AppSrc>>>;
 static VIEWER_CHROMA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// Input/clipboard write half (None while disconnected).
 type Writer = Arc<Mutex<Option<TcpStream>>>;
+/// The server `host:port`, shared GTK main thread (Settings dialog writes) → net
+/// thread (reads on each reconnect). Editable at runtime; persisted via [`config`].
+type ServerAddr = Arc<Mutex<String>>;
 /// Inbound clipboard messages, drained on the GUI thread (GTK clipboard ops run there).
 type ClipInbox = Arc<Mutex<VecDeque<ClipboardMsg>>>;
 fn is_text_mime(m: &str) -> bool {
@@ -153,7 +162,9 @@ type SharedLayout = Rc<RefCell<Vec<Screen>>>;
 type ReportedLayout = Arc<Mutex<Vec<MonitorPlacement>>>;
 
 fn run_gui() -> Result<()> {
-    let addr = std::env::var("RMNG_VIDEO").unwrap_or_else(|_| "127.0.0.1:9001".into());
+    // Server address: persisted config is the source of truth (the Settings dialog
+    // edits it live); `RMNG_VIDEO` only seeds the default on first run.
+    let addr: ServerAddr = Arc::new(Mutex::new(config::load().server_addr));
     let aus: VideoAus = Arc::new(Mutex::new(VecDeque::new()));
     let writer: Writer = Arc::new(Mutex::new(None));
     let inbox: ClipInbox = Arc::new(Mutex::new(VecDeque::new()));
@@ -168,13 +179,23 @@ fn run_gui() -> Result<()> {
             (aus.clone(), srcs.clone(), writer.clone(), inbox.clone(), cursors.clone(), reported.clone(), warp.clone(), addr.clone());
         std::thread::spawn(move || {
             loop {
-                match TcpStream::connect(&addr) {
+                // Re-read the (possibly just-changed) address each reconnect, so the
+                // Settings dialog can repoint us live: it updates `addr` and shuts the
+                // current connection, the read below errors, and we land back here.
+                let cur = addr.lock().unwrap().clone();
+                match TcpStream::connect(&cur) {
                     Ok(rd) => {
                         rd.set_nodelay(true).ok();
+                        // Detect a *silently* dead link (Wi-Fi/route/NAT change, suspend→resume,
+                        // or just an idle desktop sending no frames) within ~20 s — otherwise the
+                        // blocking read_exact below parks forever and we never reconnect.
+                        if let Err(e) = wire::net::set_keepalive(&rd) {
+                            tracing::warn!("keepalive setup failed: {e}");
+                        }
                         if let Ok(w) = rd.try_clone() {
                             *writer.lock().unwrap() = Some(w);
                         }
-                        tracing::info!("connected to {addr}");
+                        tracing::info!("connected to {cur}");
                         // Buffer the read half: one recv fills the buffer so the per-frame
                         // tag/header/AU `read_exact`s are served from memory instead of one
                         // syscall each (the write half is the independent `try_clone` above).
@@ -260,7 +281,7 @@ fn run_gui() -> Result<()> {
                         *writer.lock().unwrap() = None;
                         tracing::info!("disconnected; retrying (server force-IDRs on reconnect)");
                     }
-                    Err(e) => tracing::warn!("connect {addr} failed: {e}"),
+                    Err(e) => tracing::warn!("connect {cur} failed: {e}"),
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -268,7 +289,7 @@ fn run_gui() -> Result<()> {
     }
 
     let app = gtk4::Application::builder().application_id("dev.kasm.rmng-viewer").build();
-    app.connect_activate(move |app| build_ui(app, &aus, &srcs, &writer, &inbox, &cursors, &reported, &warp));
+    app.connect_activate(move |app| build_ui(app, &aus, &srcs, &writer, &inbox, &cursors, &reported, &warp, &addr));
     let empty: [&str; 0] = [];
     app.run_with_args(&empty);
     Ok(())
@@ -302,6 +323,7 @@ struct MonitorWindow {
 
 type Windows = Rc<RefCell<HashMap<u32, MonitorWindow>>>;
 
+#[allow(clippy::too_many_arguments)]
 fn build_ui(
     app: &gtk4::Application,
     aus: &VideoAus,
@@ -311,15 +333,53 @@ fn build_ui(
     cursors: &Cursors,
     reported: &ReportedLayout,
     warp: &WarpSuppress,
+    addr: &ServerAddr,
 ) {
-    // Keep the app alive even before the first monitor's window exists.
-    std::mem::forget(app.hold());
+    // Hold the app alive until the first monitor's window exists — windows are
+    // built lazily (on each monitor's first AU), so with zero windows GTK would
+    // quit the moment `activate` returns. The hold is dropped once the first
+    // window is built (see the tick below); from then on GTK's own window
+    // tracking owns the app's lifetime, so closing the last window stops the
+    // program. (This previously used `mem::forget`, leaking the hold forever, so
+    // closing every window never quit the process.)
+    let hold = Rc::new(RefCell::new(Some(app.hold())));
 
     // Black background behind every letterboxed video (applies to all windows).
     // Pointer-lock (games): one instance per display, shared across monitor windows;
     // None on X11 / when the compositor lacks the protocols / RMNG_NO_POINTER_LOCK.
     let css = gtk4::CssProvider::new();
-    css.load_from_string("window { background: black; }");
+    // Title-bar styling copied from the gtk-kasmvnc-client header bar.
+    css.load_from_string(
+        r#"
+        /* Black background behind the letterboxed video. Scoped to the monitor
+           windows (.video-window) so it does NOT paint dialogs (e.g. the Settings
+           dialog, a plain window) black, which hid their text/buttons. */
+        window.video-window { background: black; }
+        /* The video grabs keyboard focus on hover/click; don't draw a focus ring on it. */
+        picture:focus, picture:focus-visible { outline: none; }
+        /* FPS readout in the title bar: tabular figures so the width does not
+           jitter as the number changes, and dimmed so it stays unobtrusive. */
+        .fps-readout {
+            font-feature-settings: "tnum";
+            opacity: 0.6;
+        }
+        /* The theme draws a rounded-square hover background on the
+           minimize/maximize/close *buttons*, on top of the circular
+           background it keeps on the icon. Suppress the square and put the
+           hover feedback on the circle instead. */
+        windowcontrols > button:hover,
+        windowcontrols > button:active {
+            background: none;
+            box-shadow: none;
+        }
+        windowcontrols > button:hover > image {
+            background-color: alpha(currentColor, 0.14);
+        }
+        windowcontrols > button:active > image {
+            background-color: alpha(currentColor, 0.22);
+        }
+        "#,
+    );
     let mut pointer_lock: Option<Rc<PointerLock>> = None;
     if let Some(display) = gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(&display, &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -331,7 +391,7 @@ fn build_ui(
     let layout: SharedLayout = Rc::new(RefCell::new(Vec::new()));
 
     {
-        let (aus, srcs, writer, cursors, windows, layout, app, reported, warp, pointer_lock) = (
+        let (aus, srcs, writer, cursors, windows, layout, app, reported, warp, pointer_lock, hold, addr) = (
             aus.clone(),
             srcs.clone(),
             writer.clone(),
@@ -342,6 +402,8 @@ fn build_ui(
             reported.clone(),
             warp.clone(),
             pointer_lock.clone(),
+            hold.clone(),
+            addr.clone(),
         );
         // ~8 ms tick: drain AUs → window per monitor (created lazily here, on the main
         // thread); refresh the layout; update client cursors.
@@ -356,9 +418,26 @@ fn build_ui(
                 let batch: Vec<(u32, Vec<u8>)> = aus.lock().unwrap().drain(..).collect();
                 for (mid, au) in batch {
                     let mut w = windows.borrow_mut();
+                    // The "main" window (close button + Settings; closing it quits the whole
+                    // viewer) is the primary monitor from the frontend's monitor layout — a
+                    // stable choice that doesn't depend on which monitor streams first. The
+                    // layout (tag 3) is replayed before the first video AU, so `reported` is
+                    // already populated here; only if it somehow isn't do we fall back to the
+                    // first window built.
+                    let primary = {
+                        let rep = reported.lock().unwrap();
+                        if rep.is_empty() {
+                            w.is_empty()
+                        } else {
+                            rep.iter().any(|m| m.id == mid && m.primary)
+                        }
+                    };
                     let win = w.entry(mid).or_insert_with(|| {
-                        let win = make_monitor_window(&app, mid, &layout, &writer, &pointer_lock, &warp);
+                        let win = make_monitor_window(&app, mid, &layout, &writer, &addr, &pointer_lock, &warp, primary);
                         srcs.insert(mid, win.appsrc.clone());
+                        // First window exists: hand the app's lifetime to GTK's window
+                        // tracking, so closing the last window quits the program.
+                        hold.borrow_mut().take();
                         win
                     });
                     let _ = win.appsrc.push_buffer(gst::Buffer::from_mut_slice(au));
@@ -449,13 +528,16 @@ fn build_ui(
 }
 
 /// Build one monitor's window: decode pipeline + video/cursor overlay + input controllers.
+#[allow(clippy::too_many_arguments)]
 fn make_monitor_window(
     app: &gtk4::Application,
     mid: u32,
     layout: &SharedLayout,
     writer: &Writer,
+    addr: &ServerAddr,
     pointer_lock: &Option<Rc<PointerLock>>,
     warp: &WarpSuppress,
+    primary: bool,
 ) -> MonitorWindow {
     let (appsrc, paintable) = make_decoder(mid).expect("build decoder");
 
@@ -467,6 +549,11 @@ fn make_monitor_window(
     video.set_halign(gtk4::Align::Fill);
     video.set_valign(gtk4::Align::Fill);
     video.set_size_request(480, 270);
+    // Make the video able to hold keyboard focus, and grab it on hover/click (see
+    // install_pointer). Otherwise focus stays on a title-bar button (Settings/fullscreen),
+    // and pressing Enter activates that button instead of reaching the remote — the
+    // window-level key controller only sees keys that bubble past the focused widget.
+    video.set_focusable(true);
     // Native OS cursor is shown over the video by default; the synthetic overlay below is
     // drawn only while the remote agent drives the pointer. Pointer-lock hides the native
     // cursor at its engage site (relative-motion / game mode).
@@ -484,23 +571,41 @@ fn make_monitor_window(
         .title(format!("RMNG viewer — monitor {mid}"))
         .default_width(1280)
         .default_height(720)
+        // Only the main window gets a close button; secondary monitor windows
+        // can't be closed individually (their layout mirrors the remote desktop).
+        .deletable(primary)
         .build();
+    // Tag this as a monitor window so the `window.video-window { background: black }`
+    // rule paints its letterbox bars black, without affecting dialogs (Settings).
+    window.add_css_class("video-window");
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&video));
     overlay.add_overlay(&cursor);
     window.set_child(Some(&overlay));
 
     // Header bar: FPS readout (left) + a fullscreen toggle (F11 also toggles).
+    // Styling matches the gtk-kasmvnc-client title bar (see the CSS in build_ui).
     let header = gtk4::HeaderBar::new();
-    let fps_label = gtk4::Label::new(Some("— fps"));
-    fps_label.add_css_class("dim-label");
+    // FPS readout at the top-left of the title bar.
+    let fps_label = gtk4::Label::new(Some("0 FPS"));
+    fps_label.add_css_class("fps-readout");
     header.pack_start(&fps_label);
     let fs_btn = gtk4::Button::from_icon_name("view-fullscreen-symbolic");
+    fs_btn.set_tooltip_text(Some("Toggle fullscreen (F11)"));
     {
         let win = window.clone();
         fs_btn.connect_clicked(move |_| toggle_fullscreen(&win));
     }
     header.pack_end(&fs_btn);
+    // Settings (server address) lives only on the main window's title bar, like the
+    // gtk-kasmvnc-client header. pack_end after the fullscreen button puts it to its left.
+    if primary {
+        let settings = gtk4::Button::from_icon_name("network-server-symbolic");
+        settings.set_tooltip_text(Some("Server address"));
+        let (win, addr, writer) = (window.clone(), addr.clone(), writer.clone());
+        settings.connect_clicked(move |_| show_server_addr_dialog(&win, &addr, &writer));
+        header.pack_end(&settings);
+    }
     window.set_titlebar(Some(&header));
 
     // FPS: count presented frames off the paintable, report once a second.
@@ -512,8 +617,24 @@ fn make_monitor_window(
     {
         let (c, label) = (present_count.clone(), fps_label.clone());
         glib::timeout_add_seconds_local(1, move || {
-            label.set_text(&format!("{} fps", c.replace(0)));
+            label.set_text(&format!("{} FPS", c.replace(0)));
             glib::ControlFlow::Continue
+        });
+    }
+
+    // Close logic copied from gtk-kasmvnc-client: only the main window is closable,
+    // and closing it quits the whole viewer (every monitor window). Secondary windows
+    // have no close button (deletable=false above); block any close request that still
+    // reaches them (e.g. a window-manager-initiated close).
+    {
+        let app = app.clone();
+        window.connect_close_request(move |_| {
+            if primary {
+                app.quit();
+                glib::Propagation::Proceed
+            } else {
+                glib::Propagation::Stop
+            }
         });
     }
 
@@ -523,6 +644,84 @@ fn make_monitor_window(
     window.present();
 
     MonitorWindow { video, cursor, appsrc, paintable, last_version: 0, native_cursor: None, cursor_hidden: false }
+}
+
+/// Settings dialog (main window only): edit the server `host:port` and persist it to
+/// the config file. On save, the net thread's current connection is dropped so it
+/// reconnects to the new address. Mirrors gtk-kasmvnc-client's control-server dialog.
+fn show_server_addr_dialog(parent: &gtk4::ApplicationWindow, addr: &ServerAddr, writer: &Writer) {
+    let dialog = gtk4::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Server address")
+        .default_width(420)
+        .build();
+
+    let entry = gtk4::Entry::new();
+    entry.set_text(&addr.lock().unwrap().clone());
+    entry.set_hexpand(true);
+
+    let save = gtk4::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    let cancel = gtk4::Button::with_label("Cancel");
+
+    let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk4::Align::End);
+    buttons.append(&cancel);
+    buttons.append(&save);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.append(&gtk4::Label::new(Some("Server address (host:port):")));
+    content.append(&entry);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+    // Save: validate, persist, repoint the net thread, close. Shared by the Save
+    // button and pressing Enter in the entry.
+    let apply = {
+        let (dialog, addr, writer, entry) = (dialog.clone(), addr.clone(), writer.clone(), entry.clone());
+        move || {
+            let text = entry.text().trim().to_string();
+            if !valid_addr(&text) {
+                entry.add_css_class("error");
+                return;
+            }
+            entry.remove_css_class("error");
+            *addr.lock().unwrap() = text.clone();
+            if let Err(e) = config::save(&config::Config { server_addr: text }) {
+                tracing::warn!("config save failed: {e}");
+            }
+            // Drop the current connection so the net thread's blocking read returns; it
+            // then loops, re-reads the shared address, and connects to the new server.
+            if let Some(s) = writer.lock().unwrap().as_ref() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            dialog.close();
+        }
+    };
+    {
+        let apply = apply.clone();
+        save.connect_clicked(move |_| apply());
+    }
+    entry.connect_activate(move |_| apply());
+
+    dialog.present();
+}
+
+/// Light `host:port` validation: a non-empty host and a port that parses as `u16`.
+fn valid_addr(s: &str) -> bool {
+    match s.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok(),
+        None => false,
+    }
 }
 
 /// Toggle a window between fullscreen and normal (F11 / header button).
@@ -711,10 +910,13 @@ fn install_pointer(
 ) {
     let motion = gtk4::EventControllerMotion::new();
     {
-        let (state, window2) = (state.clone(), window.clone());
+        let (state, window2, video2) = (state.clone(), window.clone(), video.clone());
         motion.connect_enter(move |_c, _x, _y| {
             state.inside.set(true);
             grab_keys(&window2);
+            // Pull keyboard focus onto the video while the pointer is over it (mirrors
+            // grab_keys), so keys reach the remote rather than a focused title-bar button.
+            video2.grab_focus();
         });
     }
     {
@@ -768,8 +970,12 @@ fn install_pointer(
     let click = gtk4::GestureClick::new();
     click.set_button(0);
     {
-        let (w, state) = (writer.clone(), state.clone());
+        let (w, state, video2) = (writer.clone(), state.clone(), video.clone());
         click.connect_pressed(move |g, _n, _x, _y| {
+            // Take focus off any title-bar button so Enter/Space reach the remote (covers
+            // the case where the pointer was already over the video when the window
+            // activated, so no `enter` fired).
+            video2.grab_focus();
             let b = evdev_button(g.current_button());
             state.buttons.borrow_mut().insert(b);
             send(&w, format!(r#"{{"kind":"button","button":{b},"pressed":true}}"#));
@@ -1053,7 +1259,10 @@ fn serve_request(clipboard: &gdk::Clipboard, writer: &Writer, r: ClipboardReques
 
 /// viewer → server framing: `[u8 tag][u32be len][json]`. tag 0 = input, 1 = clipboard.
 fn send_tagged(writer: &Writer, tag: u8, json: String) {
-    if let Some(g) = writer.lock().unwrap().as_mut() {
+    // Hold one guard for the whole op: a second `writer.lock()` on the error path
+    // below would self-deadlock (the guard from this `if let` is still alive).
+    let mut guard = writer.lock().unwrap();
+    if let Some(g) = guard.as_mut() {
         // One contiguous `[tag][u32be len][json]` write: with TCP_NODELAY, three separate
         // write_all calls can emit three tiny segments per input event, adding round-trip
         // jitter on a real link. Coalescing → one syscall, one segment.
@@ -1062,7 +1271,16 @@ fn send_tagged(writer: &Writer, tag: u8, json: String) {
         frame.push(tag);
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         frame.extend_from_slice(body);
-        let _ = g.write_all(&frame);
+        if g.write_all(&frame).is_err() {
+            // Dead link surfaced on the write side (TCP_USER_TIMEOUT bounds this to
+            // ~20 s). Shut the shared socket down so the net thread's parked read_exact
+            // returns now and the reconnect loop starts immediately, instead of waiting
+            // out the read-side keepalive window; then drop the write half. (The reader
+            // owns a `try_clone` of the same kernel socket, so this unblocks it too —
+            // the same mechanism the Settings dialog uses to repoint live.)
+            let _ = g.shutdown(std::net::Shutdown::Both);
+            *guard = None;
+        }
     }
 }
 

@@ -156,33 +156,14 @@ pub struct ClaudeConfig {
     /// Account email pinned to the top of the usage list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_email: Option<String>,
-    /// Host id whose mounted home holds claude-swap's data dir (the template).
-    #[serde(default = "default_template_host_id")]
-    pub template_host_id: String,
-    /// claude-swap data dir relative to the host's home.
-    #[serde(default = "default_swap_subpath")]
-    pub swap_data_subpath: String,
     /// Hot-swap a clone to another account when its usage is exhausted.
     #[serde(default)]
     pub auto_swap_on_exhaustion: bool,
 }
 
-fn default_template_host_id() -> String {
-    "pega-dev-template".into()
-}
-fn default_swap_subpath() -> String {
-    ".local/share/claude-swap".into()
-}
-
 impl Default for ClaudeConfig {
     fn default() -> Self {
-        Self {
-            poll_secs: 600,
-            pinned_email: None,
-            template_host_id: default_template_host_id(),
-            swap_data_subpath: default_swap_subpath(),
-            auto_swap_on_exhaustion: false,
-        }
+        Self { poll_secs: 600, pinned_email: None, auto_swap_on_exhaustion: false }
     }
 }
 

@@ -35,7 +35,8 @@ JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}` with
 | GET | `/api/config` | Current config, secrets redacted | 200 `AppConfigRedacted` |
 | PUT | `/api/config` | Merge a partial config update (persists 0600) | 200 `AppConfigRedacted` |
 | POST | `/api/config/test` | Test a setting (currently Proxmox SSH) | 200 `{ok,message}` |
-| POST | `/api/claude/import` | Import accounts from the template's claude-swap dir | 200 `{ok,imported}` |
+| POST | `/api/claude/import/check` | Check a clone is signed in via claude.ai | 200 `{ok,email,orgName,subscriptionType}` |
+| POST | `/api/claude/import` | Import a Claude account from a signed-in clone | 200 `{ok,email,cleared}` |
 | POST | `/api/claude/refresh` | Force one usage poll now | 200 `{ok,rateLimited}` |
 | GET | `/api/claude/recommended` | Recommended account for a new clone | 200 `{email}` |
 | POST | `/api/claude/swap` | Hot-swap a clone's Claude account | 200 `{ok,account}` |
@@ -181,7 +182,8 @@ Synchronously test a setting. Currently only `"proxmox"` (runs `ssh -o BatchMode
 
 | Endpoint | Body | Returns | Does |
 |---|---|---|---|
-| `POST /api/claude/import` | — | `{ok, imported}` | Scan the template host's mounted `~/.local/share/claude-swap` and import accounts |
+| `POST /api/claude/import/check` | `{host}` | `{ok, email, orgName, subscriptionType}` | Run `claude auth status` in the clone; require a claude.ai login and return its identity |
+| `POST /api/claude/import` | `{host, token}` | `{ok, email, cleared}` | Store the operator's long-lived `token` + the clone's short-lived OAuth pair (read off its disk), then delete the clone's credentials file |
 | `POST /api/claude/refresh` | — | `{ok, rateLimited}` | Force one usage poll; `rateLimited` if any account hit 429 |
 | `GET /api/claude/recommended` | — | `{email}` | Pinned account, else lowest-usage; `null` if none |
 | `POST /api/claude/swap` | `{host, account}` | `{ok, account}` | Resolve `account` (email/`auto`) and write the clone's `~/.claude/.credentials.json` to hot-swap a running clone (`502` if unreachable) |

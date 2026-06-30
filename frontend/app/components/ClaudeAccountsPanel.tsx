@@ -142,25 +142,35 @@ export function ClaudeAccountsPanel({
           Usage{accounts.length ? ` (${accounts.length})` : ""}
         </h2>
         {accounts.length > 0 ? (
-          <button
-            type="button"
-            onClick={wrap(onRefresh)}
-            disabled={busy}
-            className="rounded px-1 text-[10px] text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50"
-          >
-            {busy ? "…" : "↻"}
-          </button>
+          <div className="flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => onImport()}
+              disabled={busy}
+              title="Import a Claude token from a clone"
+              className="rounded px-1 text-[12px] leading-none text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50"
+            >
+              +
+            </button>
+            <button
+              type="button"
+              onClick={wrap(onRefresh)}
+              disabled={busy}
+              className="rounded px-1 text-[10px] text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50"
+            >
+              {busy ? "…" : "↻"}
+            </button>
+          </div>
         ) : null}
       </div>
 
       {accounts.length === 0 ? (
         <button
           type="button"
-          onClick={wrap(onImport)}
-          disabled={busy}
-          className="mt-0.5 w-full rounded border border-dashed border-slate-300 px-2 py-1 text-[10px] text-slate-400 hover:bg-white disabled:opacity-50"
+          onClick={() => onImport()}
+          className="mt-0.5 w-full rounded border border-dashed border-slate-300 px-2 py-1 text-[10px] text-slate-400 hover:bg-white"
         >
-          {busy ? "Importing…" : "Import from template"}
+          Import Claude token
         </button>
       ) : (
         <div className="mt-0.5 divide-y divide-slate-200/70">

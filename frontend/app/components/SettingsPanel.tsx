@@ -151,8 +151,6 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [claude, setClaude] = useState({
     pollSecs: 600,
     pinnedEmail: "",
-    templateHostId: "",
-    swapDataSubpath: "",
     autoSwapOnExhaustion: false,
   });
   const [listen, setListen] = useState({ web: 9000, video: 9001, cloneMcp: 9002, globalMcp: 9003, daemonMcp: 9004 });
@@ -169,7 +167,11 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     );
     setTemplate({ ...c.template });
     setHostnamePrefix(c.proxmoxHostnamePrefix);
-    setClaude({ ...c.claude, pinnedEmail: c.claude.pinnedEmail ?? "" });
+    setClaude({
+      ...c.claude,
+      pollSecs: Number(c.claude.pollSecs),
+      pinnedEmail: c.claude.pinnedEmail ?? "",
+    });
     setListen({ ...c.listen });
     setAgentPort(c.agentPort);
     setDataDir(c.dataDir);
@@ -586,20 +588,6 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                   <input
                     value={claude.pinnedEmail}
                     onChange={(e) => setClaude({ ...claude, pinnedEmail: e.target.value })}
-                    className={input}
-                  />
-                </Field>
-                <Field label="Template host id">
-                  <input
-                    value={claude.templateHostId}
-                    onChange={(e) => setClaude({ ...claude, templateHostId: e.target.value })}
-                    className={input}
-                  />
-                </Field>
-                <Field label="claude-swap data subpath">
-                  <input
-                    value={claude.swapDataSubpath}
-                    onChange={(e) => setClaude({ ...claude, swapDataSubpath: e.target.value })}
                     className={input}
                   />
                 </Field>

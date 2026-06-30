@@ -17,6 +17,7 @@ over SSH at runtime). Plus the gnome-patch build.
 | `crates/control-server/scripts/delete.sh` | node (SSH) | `orchestrate::delete_ct` | Destroy a CT + its snapshot |
 | `crates/control-server/scripts/apply-monitors.sh` | node (SSH) | `orchestrate::apply_monitors` | Re-apply a monitor layout to a running clone |
 | `crates/control-server/scripts/apply-credentials.sh` | inside running clone (SSH) | `claude::apply_clone_token` | Install/hot-swap a Claude token |
+| `crates/control-server/scripts/claude-import.sh` | clone via node (`pct exec`) | `claude::{check_clone_auth,import_clone_token}` | Read `claude auth status` / the credentials file, or clear it, when importing an account |
 | `gnome-patch/build-shell-deb.sh` | inside build CT | cs-build-ct.sh | Build the patched gnome-shell `.deb` |
 
 The orchestration scripts are baked into the control-server binary at compile time

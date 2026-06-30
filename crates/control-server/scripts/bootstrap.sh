@@ -32,7 +32,7 @@ NEWID=$(pvesh get /cluster/nextid 2>/dev/null || echo "")
 prog config "pct create $NEWID ($HOSTNAME)"
 pct create "$NEWID" "$TEMPLATE" \
   --hostname "$HOSTNAME" --unprivileged 1 --features nesting=1,keyctl=1,fuse=1 \
-  --cores 8 --memory 16384 --swap 4096 --rootfs "$STORAGE:48" \
+  --memory 32768 --swap 8192 --cpulimit 16 --rootfs "$STORAGE:48" \
   --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" --onboot 0 >&2
 # render node passthrough (mode 0666) + apparmor opt-out (headless Mutter path) +
 # the shared control-server media socket dir bind-mounted at the SAME path (NOT under

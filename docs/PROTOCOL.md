@@ -140,8 +140,7 @@ returns `AppConfigRedacted` (secrets → `*_set: bool`). Source: [config.rs](../
   with the template's; config-only, not in the Settings UI), `hostname_prefix` (`"pega-"`,
   editable in Settings → prepended to derived clone hostnames).
 - **`LinearConfig`**: `we`/`dev`/`hh`/`per` optional API keys.
-- **`ClaudeConfig`**: `poll_secs` (`600`, floored 15), `pinned_email?`, `template_host_id`
-  (`"pega-dev-template"`), `swap_data_subpath` (`".local/share/claude-swap"`),
+- **`ClaudeConfig`**: `poll_secs` (`600`, floored 15), `pinned_email?`,
   `auto_swap_on_exhaustion` (bool).
 - <a id="cloneaccount"></a>**`CloneAccount`**: `email`, `long_lived_token` (installed into the
   clone's `~/.claude/.credentials.json` as the token that *runs* Claude Code — **secret**),

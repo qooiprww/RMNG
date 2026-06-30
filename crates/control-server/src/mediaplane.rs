@@ -110,6 +110,14 @@ pub fn spawn(app: App) {
                 tracing::info!("port 1 (video) listening on 0.0.0.0:{video_port}");
                 for stream in l.incoming().flatten() {
                     let _ = stream.set_nodelay(true);
+                    // Keepalive so a *silently* dead viewer (Wi-Fi/route change, suspend,
+                    // a killed client) is torn down in ~20 s. Without it the per-viewer
+                    // `read_viewer_input` thread below blocks on its read forever, leaking
+                    // one thread per dropped viewer; the keepalive surfaces the death as a
+                    // read error so the thread exits.
+                    if let Err(e) = wire::net::set_keepalive(&stream) {
+                        tracing::warn!("viewer keepalive setup failed: {e}");
+                    }
                     tracing::info!("viewer connected: {:?}", stream.peer_addr());
                     if let Ok(input_sock) = stream.try_clone() {
                         let chroma = app.config().chroma;

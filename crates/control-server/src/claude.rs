@@ -1,5 +1,4 @@
-//! Claude accounts — usage tracking + clone assignment/swap. Ports
-//! `claude-accounts.server.ts` + `clone-accounts.server.ts`.
+//! Claude accounts — usage tracking + clone assignment/swap.
 //!
 //! Two-token model (per the rmng design): the **refresh** token (+ a cached
 //! short-lived access token, in the 0600 secret store `claude-accounts.json`) is
@@ -8,6 +7,15 @@
 //! clone's `~/.claude/.credentials.json` (see [`apply_clone_token`]). The poller
 //! publishes a token-free `ClaudeUsage` view onto `ControlState.claudeAccounts`,
 //! and (when enabled) auto-swaps a clone whose account is exhausted.
+//!
+//! **Importing an account** ([`check_clone_auth`] / [`import_clone_token`]) harvests
+//! both tokens from a clone that's already signed in to Claude Code via `claude.ai`:
+//! we read `claude auth status` to confirm the login + identity, take the operator's
+//! pasted long-lived token (minted by them with `claude setup-token`), read the
+//! short-lived OAuth pair straight off the clone's `~/.claude/.credentials.json`, then
+//! **delete that file from the clone** so its Claude Code can never rotate (and thus
+//! invalidate) the refresh token we now poll usage with. All clone commands run via
+//! the Proxmox node (`pct exec`), like the rest of orchestration.
 //! (Codex accounts are out of scope here — TODO if needed.)
 
 use std::collections::HashMap;
@@ -34,6 +42,9 @@ const STAGGER: Duration = Duration::from_millis(400);
 const SESSION_HEADROOM_PCT: f64 = 40.0;
 const SEVEN_DAY_CAP_PCT: f64 = 95.0;
 const APPLY_CREDENTIALS_SCRIPT: &str = include_str!("../scripts/apply-credentials.sh");
+const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
+/// The user every clone runs Claude Code (and everything else) as.
+const CLONE_USER: &str = "rmng";
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -43,7 +54,6 @@ fn now_ms() -> i64 {
 #[serde(rename_all = "camelCase")]
 pub struct StoredClaudeAccount {
     pub id: String,
-    pub num: u32,
     pub email: String,
     #[serde(default)]
     pub org_uuid: String,
@@ -112,52 +122,30 @@ impl ClaudeStore {
     }
 }
 
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut table = [255u8; 256];
-    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
-        table[*c as usize] = i as u8;
-    }
-    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=' && !b.is_ascii_whitespace()).collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let mut n = 0u32;
-        let mut bits = 0;
-        for &c in chunk {
-            let v = table[c as usize];
-            if v == 255 {
-                return None;
-            }
-            n = (n << 6) | v as u32;
-            bits += 6;
-        }
-        n <<= 24 - bits;
-        for i in 0..(bits / 8) {
-            out.push((n >> (16 - i * 8)) as u8);
-        }
-    }
-    Some(out)
+// --- import from a signed-in clone ----------------------------------------
+
+/// Parsed `claude auth status` output. Clean JSON when Claude Code is signed in;
+/// `loggedIn` is false (or the parse fails) otherwise.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatus {
+    #[serde(default)]
+    pub logged_in: bool,
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub org_name: Option<String>,
+    #[serde(default)]
+    pub subscription_type: Option<String>,
 }
 
-// --- import from claude-swap ----------------------------------------------
-
+/// The on-disk `~/.claude/.credentials.json` shape (Claude Code's OAuth store).
 #[derive(Deserialize)]
-struct SwapSeqAccount {
-    email: String,
-    #[serde(default)]
-    organization_uuid: Option<String>,
-    #[serde(default)]
-    organization_name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SwapSequence {
-    #[serde(default)]
-    active_account_number: Option<u32>,
-    #[serde(default)]
-    accounts: HashMap<String, SwapSeqAccount>,
-}
-
-#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ClaudeCreds {
     #[serde(default)]
     claude_ai_oauth: Option<ClaudeOauth>,
@@ -176,81 +164,169 @@ struct ClaudeOauth {
     scopes: Option<Vec<String>>,
 }
 
-fn find_cred_file(cred_dir: &Path, num: u32) -> Option<PathBuf> {
-    let prefix = format!(".creds-{num}-");
-    std::fs::read_dir(cred_dir).ok()?.flatten().find_map(|e| {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        (name.starts_with(&prefix) && name.ends_with(".enc")).then(|| e.path())
-    })
+/// What [`import_clone_token`] returns to the caller / UI.
+pub struct ImportResult {
+    pub email: String,
+    /// Whether the clone's credentials file was successfully removed.
+    pub cleared: bool,
 }
 
-/// Import accounts (incl. OAuth tokens) from claude-swap's data dir. Upserts by id.
-pub fn import_from_swap(app: &App) -> Result<usize> {
-    let cfg = app.config();
-    let base = Path::new(&cfg.data_dir)
-        .join("hosts")
-        .join(&cfg.claude.template_host_id)
-        .join(&cfg.claude.swap_data_subpath);
-    let seq: SwapSequence = serde_json::from_str(
-        &std::fs::read_to_string(base.join("sequence.json"))
-            .with_context(|| format!("reading {}", base.join("sequence.json").display()))?,
-    )?;
-    let cred_dir = base.join("credentials");
+/// POSIX single-quote escaping (args reach the node's shell verbatim).
+fn sq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
 
-    let mut imported = Vec::new();
-    for (num_str, meta) in &seq.accounts {
-        let Ok(num) = num_str.parse::<u32>() else { continue };
-        let Some(cred_path) = find_cred_file(&cred_dir, num) else {
-            tracing::warn!("claude import: no creds file for {} (#{num})", meta.email);
-            continue;
-        };
-        let Some(creds) = std::fs::read_to_string(&cred_path)
-            .ok()
-            .and_then(|b64| b64_decode(b64.trim()))
-            .and_then(|raw| serde_json::from_slice::<ClaudeCreds>(&raw).ok())
-            .and_then(|c| c.claude_ai_oauth)
-        else {
-            tracing::warn!("claude import: bad creds for {} (#{num})", meta.email);
-            continue;
-        };
-        let (Some(access), Some(refresh)) = (creds.access_token, creds.refresh_token) else {
-            tracing::warn!("claude import: missing tokens for {} (#{num})", meta.email);
-            continue;
-        };
-        let org_uuid = meta.organization_uuid.clone().unwrap_or_default();
-        imported.push(StoredClaudeAccount {
-            id: format!("{}|{}", meta.email, org_uuid),
-            num,
-            email: meta.email.clone(),
-            org_uuid,
-            org_name: meta.organization_name.clone().unwrap_or_default(),
-            active: seq.active_account_number == Some(num),
-            access_token: access,
+/// The `{…}` substring of `s` (login-shell noise can wrap the JSON), else trimmed `s`.
+fn extract_json(s: &str) -> &str {
+    match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if b >= a => &s[a..=b],
+        _ => s.trim(),
+    }
+}
+
+/// Run one [`claude-import.sh`] op (`status`|`read`|`clear`) inside clone `ctid` via
+/// the Proxmox node, returning its raw stdout. `status` never fails (stderr merged in);
+/// `read`/`clear` surface a non-zero exit as an error.
+async fn run_clone_op(ssh_target: &str, ctid: u32, op: &str) -> Result<String> {
+    if ssh_target.is_empty() {
+        bail!("proxmox.ssh is not set; cannot reach the node to run a clone command");
+    }
+    let remote = format!("bash -s -- {} {} {}", ctid, sq(CLONE_USER), sq(op));
+    let mut child = tokio::process::Command::new("ssh")
+        .args([
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=15",
+            ssh_target, &remote,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    use tokio::io::AsyncWriteExt;
+    child.stdin.take().unwrap().write_all(IMPORT_SCRIPT.as_bytes()).await?;
+    let out = child.wait_with_output().await?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let tail = String::from_utf8_lossy(&out.stderr);
+        bail!("clone op '{op}' failed (exit {:?}): {}", out.status.code(), tail.trim());
+    }
+}
+
+/// Confirm clone `host` is signed in to Claude Code via **claude.ai** (not an API
+/// key) and return its account identity. Used both to validate up front (so the UI
+/// can show the account before the operator mints a token) and inside import.
+pub async fn check_clone_auth(app: &App, host: &Host) -> Result<AuthStatus> {
+    let ctid = host
+        .ctid
+        .with_context(|| format!("host '{}' has no container; only clones can be imported", host.id))?;
+    let raw = run_clone_op(&app.config().proxmox.ssh, ctid, "status").await?;
+    let status: AuthStatus = serde_json::from_str(extract_json(&raw)).map_err(|_| {
+        anyhow::anyhow!(
+            "couldn't read `claude auth status` on '{}' — is Claude Code installed and the clone running? (got: {})",
+            host.id,
+            extract_json(&raw).chars().take(140).collect::<String>()
+        )
+    })?;
+    if !status.logged_in {
+        bail!("'{}' is not signed in to Claude Code", host.id);
+    }
+    match status.auth_method.as_deref() {
+        Some("claude.ai") => Ok(status),
+        other => bail!(
+            "'{}' is signed in via '{}', but import needs a claude.ai subscription login (not an API key)",
+            host.id,
+            other.unwrap_or("unknown"),
+        ),
+    }
+}
+
+/// Import a Claude account from a signed-in clone. The operator supplies the
+/// long-lived token (minted by them via `claude setup-token`); we read the
+/// short-lived OAuth pair from the clone's credentials file, store both, then
+/// **delete that file from the clone** so it can't rotate/invalidate the refresh
+/// token we now poll usage with. Upserts the usage account (by id) and the clone
+/// account (config, by email).
+pub async fn import_clone_token(app: &App, host: &Host, long_lived_token: &str) -> Result<ImportResult> {
+    let token = long_lived_token.trim();
+    if !token.starts_with("sk-ant-") {
+        bail!("that doesn't look like a Claude token — paste the sk-ant-… token printed by `claude setup-token`");
+    }
+    let ctid = host
+        .ctid
+        .with_context(|| format!("host '{}' has no container; only clones can be imported", host.id))?;
+    let ssh = app.config().proxmox.ssh;
+
+    // 1. Confirm the login + learn the account identity (email / org).
+    let status = check_clone_auth(app, host).await?;
+    let email = status.email.clone().context("`claude auth status` returned no email")?;
+    let org_uuid = status.org_id.clone().unwrap_or_default();
+
+    // 2. Read the short-lived OAuth pair straight off the clone's disk.
+    let raw = run_clone_op(&ssh, ctid, "read")
+        .await
+        .with_context(|| format!("reading '{}' Claude credentials", host.id))?;
+    let oauth = serde_json::from_str::<ClaudeCreds>(extract_json(&raw))
+        .ok()
+        .and_then(|c| c.claude_ai_oauth)
+        .context("the clone's credentials file has no claudeAiOauth block")?;
+    let (Some(access), Some(refresh)) = (oauth.access_token, oauth.refresh_token) else {
+        bail!("the clone's credentials file is missing its access/refresh tokens");
+    };
+
+    // 3a. Usage account (short-lived pair) → the 0600 secret store, upsert by id.
+    let id = format!("{email}|{org_uuid}");
+    let stored = StoredClaudeAccount {
+        id: id.clone(),
+        email: email.clone(),
+        org_uuid,
+        org_name: status.org_name.clone().unwrap_or_default(),
+        active: false,
+        access_token: access,
+        refresh_token: refresh.clone(),
+        expires_at: oauth.expires_at.unwrap_or(0),
+        scopes: oauth.scopes.unwrap_or_default(),
+    };
+    {
+        let mut accts = app.claude.accounts.lock().unwrap();
+        let mut by_id: HashMap<String, StoredClaudeAccount> =
+            accts.drain(..).map(|a| (a.id.clone(), a)).collect();
+        by_id.insert(stored.id.clone(), stored);
+        let mut next: Vec<_> = by_id.into_values().collect();
+        next.sort_by(|a, b| a.email.cmp(&b.email));
+        app.claude.save(&next)?;
+        *accts = next;
+    }
+
+    // 3b. Clone account (long-lived token) → config, upsert by email; persist 0600.
+    {
+        let mut cfg = app.config();
+        let acct = CloneAccount {
+            email: email.clone(),
+            long_lived_token: token.to_string(),
             refresh_token: refresh,
-            expires_at: creds.expires_at.unwrap_or(0),
-            scopes: creds.scopes.unwrap_or_default(),
-        });
+        };
+        match cfg.clone_accounts.iter_mut().find(|a| a.email == email) {
+            Some(existing) => *existing = acct,
+            None => cfg.clone_accounts.push(acct),
+        }
+        crate::config::save(&cfg)?;
+        *app.cfg.write().unwrap() = cfg;
     }
 
-    let n = imported.len();
-    let mut accts = app.claude.accounts.lock().unwrap();
-    let mut by_id: HashMap<String, StoredClaudeAccount> =
-        accts.drain(..).map(|a| (a.id.clone(), a)).collect();
-    let active_id = imported.iter().find(|a| a.active).map(|a| a.id.clone());
-    for a in imported {
-        by_id.insert(a.id.clone(), a);
-    }
-    let mut next: Vec<_> = by_id.into_values().collect();
-    if let Some(active) = &active_id {
-        for a in &mut next {
-            a.active = &a.id == active;
+    // 4. Clear the clone's credentials so its Claude Code can't rotate the refresh
+    //    token we just took ownership of. Best-effort: the account is already stored.
+    let cleared = match run_clone_op(&ssh, ctid, "clear").await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("import: clearing '{}' credentials failed: {e}", host.id);
+            false
         }
-    }
-    next.sort_by(|a, b| a.email.cmp(&b.email));
-    app.claude.save(&next)?;
-    *accts = next;
-    Ok(n)
+    };
+
+    tracing::info!("imported Claude account {email} from '{}' (cleared={cleared})", host.id);
+    Ok(ImportResult { email, cleared })
 }
 
 // --- token refresh + usage fetch ------------------------------------------
@@ -308,10 +384,13 @@ fn snippet(s: &str) -> String {
     if s.is_empty() { String::new() } else { format!(": {}", &s[..s.len().min(120)]) }
 }
 
+// The usage API returns explicit `null` for numeric fields that don't apply (e.g.
+// an account with extra-usage disabled). `#[serde(default)]` only covers a *missing*
+// key, not a present `null`, so every nullable number is `Option<_>` here.
 #[derive(Deserialize)]
 struct RawWindow {
     #[serde(default)]
-    utilization: f64,
+    utilization: Option<f64>,
     #[serde(default)]
     resets_at: Option<String>,
 }
@@ -320,11 +399,11 @@ struct RawExtra {
     #[serde(default)]
     is_enabled: bool,
     #[serde(default)]
-    used_credits: i64,
+    used_credits: Option<i64>,
     #[serde(default)]
     monthly_limit: Option<i64>,
     #[serde(default)]
-    utilization: f64,
+    utilization: Option<f64>,
     #[serde(default)]
     currency: Option<String>,
     #[serde(default)]
@@ -358,14 +437,14 @@ async fn fetch_usage(http: &reqwest::Client, token: &str) -> Result<RawUsage> {
 }
 
 fn to_window(w: Option<RawWindow>) -> Option<ClaudeUsageWindow> {
-    w.map(|w| ClaudeUsageWindow { pct: w.utilization.round(), resets_at: w.resets_at })
+    w.map(|w| ClaudeUsageWindow { pct: w.utilization.unwrap_or(0.0).round(), resets_at: w.resets_at })
 }
 
 fn to_usage(acct: &StoredClaudeAccount, raw: RawUsage) -> ClaudeUsage {
     let spend = raw.extra_usage.filter(|e| e.is_enabled).map(|e| ClaudeSpend {
-        used_cents: e.used_credits,
+        used_cents: e.used_credits.unwrap_or(0),
         limit_cents: e.monthly_limit,
-        pct: e.utilization.round(),
+        pct: e.utilization.unwrap_or(0.0).round(),
         currency: e.currency.unwrap_or_else(|| "USD".into()),
         resets_at: e.resets_at,
     });
@@ -670,5 +749,72 @@ pub async fn run_poller(app: App) {
             tracing::warn!("claude usage rate-limited (429); next poll in {}s", delay.as_secs());
         }
         tokio::time::sleep(delay).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The exact shapes Claude Code v2 emits — `claude auth status` (camelCase JSON)
+    // and `~/.claude/.credentials.json` (camelCase, nested under `claudeAiOauth`).
+    const AUTH_STATUS: &str = r#"{
+        "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty",
+        "email": "a@b.com", "orgId": "org-uuid", "orgName": "A's Org",
+        "subscriptionType": "max"
+    }"#;
+    const CREDS: &str = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-AAA",
+        "refreshToken":"sk-ant-ort01-BBB","expiresAt":1782865752191,
+        "scopes":["user:inference","user:profile"],"subscriptionType":"max"}}"#;
+
+    #[test]
+    fn parses_auth_status() {
+        let s: AuthStatus = serde_json::from_str(extract_json(AUTH_STATUS)).unwrap();
+        assert!(s.logged_in);
+        assert_eq!(s.auth_method.as_deref(), Some("claude.ai"));
+        assert_eq!(s.email.as_deref(), Some("a@b.com"));
+        assert_eq!(s.org_id.as_deref(), Some("org-uuid"));
+    }
+
+    #[test]
+    fn parses_credentials_camelcase() {
+        // Regression: `claudeAiOauth` (camelCase) must map onto `claude_ai_oauth`.
+        let oauth = serde_json::from_str::<ClaudeCreds>(CREDS).unwrap().claude_ai_oauth.unwrap();
+        assert_eq!(oauth.access_token.as_deref(), Some("sk-ant-oat01-AAA"));
+        assert_eq!(oauth.refresh_token.as_deref(), Some("sk-ant-ort01-BBB"));
+        assert_eq!(oauth.expires_at, Some(1782865752191));
+        assert_eq!(oauth.scopes.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parses_usage_with_null_extra_fields() {
+        // The real /oauth/usage response: windows carry numbers, but `extra_usage`
+        // (disabled here) comes back with explicit null numerics. Must still decode.
+        let body = r#"{
+            "five_hour": {"utilization": 7.0, "resets_at": "2026-06-30T19:10:00Z"},
+            "seven_day": {"utilization": 2.0, "resets_at": "2026-07-05T10:00:00Z"},
+            "extra_usage": {"is_enabled": false, "monthly_limit": null,
+                            "used_credits": null, "utilization": null}
+        }"#;
+        let raw: RawUsage = serde_json::from_str(body).unwrap();
+        let acct = StoredClaudeAccount {
+            id: "a@b|o".into(), email: "a@b".into(), org_uuid: "o".into(),
+            org_name: String::new(), active: false, access_token: String::new(),
+            refresh_token: String::new(), expires_at: 0, scopes: vec![],
+        };
+        let u = to_usage(&acct, raw);
+        assert_eq!(u.five_hour.unwrap().pct, 7.0);
+        assert_eq!(u.seven_day.unwrap().pct, 2.0);
+        assert!(u.spend.is_none()); // extra usage disabled → no spend line
+    }
+
+    #[test]
+    fn extract_json_strips_login_shell_noise() {
+        // A login shell may wrap the JSON in MOTD/profile chatter on either side.
+        let noisy = format!("Welcome to Ubuntu\n{AUTH_STATUS}\nLast login: today");
+        let s: AuthStatus = serde_json::from_str(extract_json(&noisy)).unwrap();
+        assert!(s.logged_in);
+        // No JSON at all → falls back to the trimmed input (which then fails to parse).
+        assert_eq!(extract_json("  claude: command not found  "), "claude: command not found");
     }
 }

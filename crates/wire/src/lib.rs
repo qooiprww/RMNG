@@ -9,6 +9,7 @@
 //! - [`viewer`] — the native viewer ⇄ control-server protocol (port 1).
 //! - [`mcp`] — desktop-tool DTOs shared by the per-clone (port 3) and global
 //!   (port 4) MCP servers.
+//! - [`net`] — the one IO helper: keepalive tuning both ends of port 1 apply.
 //!
 //! Control-plane + config types derive `ts-rs::TS` and export TypeScript bindings
 //! (see the `export_bindings_*` tests ts-rs generates). Transport types
@@ -18,6 +19,7 @@ pub mod avc444;
 pub mod config;
 pub mod control;
 pub mod mcp;
+pub mod net;
 pub mod socket;
 pub mod viewer;
 

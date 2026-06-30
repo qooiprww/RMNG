@@ -47,8 +47,17 @@ export const redeployClone = (id: string, daemonOnly = false) =>
 
 /** Force an immediate Claude usage poll (refresh tokens + fetch 5h/7d). */
 export const refreshClaudeUsage = () => postJson("/api/claude/refresh", {});
-/** (Re)import the Claude account pool from claude-swap on the template host. */
-export const importClaudeAccounts = () => postJson("/api/claude/import", {});
+/** Confirm a clone is signed in to Claude Code via claude.ai; returns its identity. */
+export const checkClaudeImport = (host: string) =>
+  postJson("/api/claude/import/check", { host }) as Promise<{
+    email: string;
+    orgName: string | null;
+    subscriptionType: string | null;
+  }>;
+/** Import a Claude account from a signed-in clone: stores the pasted long-lived token
+ *  + the clone's short-lived OAuth pair, then clears the clone's credentials file. */
+export const importClaudeToken = (host: string, token: string) =>
+  postJson("/api/claude/import", { host, token }) as Promise<{ email: string; cleared: boolean }>;
 /** The account the clone dialog should pre-select (scored by usage + load). */
 export const recommendedClaudeAccount = () =>
   getJson("/api/claude/recommended") as Promise<{ email: string | null }>;

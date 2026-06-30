@@ -66,6 +66,7 @@ pub fn router(app: App) -> Router {
         .route("/api/config", get(config_get).put(config_put))
         .route("/api/config/test", post(config_test))
         .route("/api/template/bootstrap", post(template_bootstrap))
+        .route("/api/claude/import/check", post(claude_import_check))
         .route("/api/claude/import", post(claude_import))
         .route("/api/claude/refresh", post(claude_refresh))
         .route("/api/claude/recommended", get(claude_recommended))
@@ -489,13 +490,52 @@ async fn test_ssh(target: &str) -> (bool, String) {
 
 // --- Claude accounts -------------------------------------------------------
 
-/// `POST /api/claude/import` — import accounts from the claude-swap mount.
-async fn claude_import(State(app): State<App>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let n = tokio::task::spawn_blocking(move || crate::claude::import_from_swap(&app))
+/// An error body the frontend's `postJson` reads as `{ error }` (vs. a bare string).
+fn err_json(code: StatusCode, msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
+    (code, Json(json!({ "error": msg.to_string() })))
+}
+
+type JsonResult = Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>;
+
+#[derive(Deserialize)]
+struct ImportCheckReq {
+    host: String,
+}
+
+/// `POST /api/claude/import/check` — confirm a clone is signed in to Claude Code via
+/// claude.ai and report the account identity (so the UI can show it before the
+/// operator mints + pastes a long-lived token).
+async fn claude_import_check(State(app): State<App>, Json(req): Json<ImportCheckReq>) -> JsonResult {
+    let host = host_by_id(&app, &req.host)
+        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let st = crate::claude::check_clone_auth(&app, &host)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok(Json(json!({ "ok": true, "imported": n })))
+        .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(json!({
+        "ok": true,
+        "email": st.email,
+        "orgName": st.org_name,
+        "subscriptionType": st.subscription_type,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    host: String,
+    token: String,
+}
+
+/// `POST /api/claude/import` — import a Claude account from a signed-in clone: store
+/// the operator's long-lived token + the clone's short-lived OAuth pair, then clear
+/// the clone's credentials file. Kicks an immediate usage poll so it shows at once.
+async fn claude_import(State(app): State<App>, Json(req): Json<ImportReq>) -> JsonResult {
+    let host = host_by_id(&app, &req.host)
+        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let res = crate::claude::import_clone_token(&app, &host, &req.token)
+        .await
+        .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
+    let _ = crate::claude::poll_once(&app).await;
+    Ok(Json(json!({ "ok": true, "email": res.email, "cleared": res.cleared })))
 }
 
 /// `POST /api/claude/refresh` — force one usage poll now.

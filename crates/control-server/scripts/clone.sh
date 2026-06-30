@@ -30,12 +30,11 @@ NEWLV="vm-${NEWID}-disk-0"
 [ -e "/etc/pve/lxc/${NEWID}.conf" ] && die "config for ${NEWID} already exists"
 lvs "${VG}/${NEWLV}" >/dev/null 2>&1 && die "LV ${VG}/${NEWLV} already exists"
 
-SRC_WAS_RUNNING=0
-pct status "$SRC_CTID" 2>/dev/null | grep -q 'status: running' && SRC_WAS_RUNNING=1
+SRC_RUNNING=0
+pct status "$SRC_CTID" 2>/dev/null | grep -q 'status: running' && SRC_RUNNING=1
 MNT=""
 cleanup(){
   rc=$?; [ $rc -eq 0 ] && exit 0
-  if [ "$SRC_WAS_RUNNING" = 1 ]; then pct status "$SRC_CTID" 2>/dev/null | grep -q running || pct start "$SRC_CTID" 2>/dev/null || true; fi
   [ -n "$MNT" ] && mountpoint -q "$MNT" 2>/dev/null && umount "$MNT" 2>/dev/null || true
   [ -n "$MNT" ] && rmdir "$MNT" 2>/dev/null || true
   rm -f "/etc/pve/lxc/${NEWID}.conf"
@@ -43,19 +42,17 @@ cleanup(){
 }
 trap cleanup EXIT
 
-if [ "$SRC_WAS_RUNNING" = 1 ]; then
-  prog shutdown-source "shutting down source CT ${SRC_CTID} for a clean snapshot"
-  pct shutdown "$SRC_CTID" --timeout 120 --forceStop 1
+# Live snapshot: flush the source FS instead of stopping the CT. `sync` pushes dirty
+# page-cache to the LV so the CoW snapshot is near-consistent; ext4 journal recovery
+# (on the mount below + first clone boot) covers the rest — same path as a power loss.
+if [ "$SRC_RUNNING" = 1 ]; then
+  prog sync "flushing source CT ${SRC_CTID} filesystem for a live snapshot"
+  pct exec "$SRC_CTID" -- sync
 fi
 
 prog snapshot "CoW snapshot ${OLDLV} -> ${NEWLV}"
 lvcreate -s --setactivationskip n -n "$NEWLV" "${VG}/${OLDLV}" >/dev/null
 lvchange -ay "${VG}/${NEWLV}" >/dev/null
-
-if [ "$SRC_WAS_RUNNING" = 1 ]; then
-  prog start-source "starting source CT ${SRC_CTID} back up"
-  pct start "$SRC_CTID"
-fi
 
 prog identity "resetting machine-id + hostname on the clone"
 MNT="$(mktemp -d)"
@@ -85,6 +82,13 @@ sed -i "s#^hostname: .*#hostname: ${NEWHOST}#"                "/etc/pve/lxc/${NE
 for nid in $(grep -oE '^net[0-9]+' "/etc/pve/lxc/${NEWID}.conf" || true); do
   sed -i "s#\(^${nid}:.*hwaddr=\)[0-9A-Fa-f:]\{17\}#\1$(genmac)#" "/etc/pve/lxc/${NEWID}.conf"
 done
+
+# Clone resource limits (override whatever we copied from the template config): 32 GiB RAM,
+# 8 GiB swap, CPU throttled to 16 cores' worth of time, and NO `cores` cap — the clone sees
+# every host core (unlimited parallelism) while cpulimit bounds total CPU usage to 16.
+sed -i '/^memory:/d; /^swap:/d; /^cores:/d; /^cpulimit:/d' "/etc/pve/lxc/${NEWID}.conf"
+printf 'memory: 32768\nswap: 8192\ncpulimit: 16\n' >> "/etc/pve/lxc/${NEWID}.conf"
+prog config "clone limits: 32G mem / 8G swap / cpulimit 16 / cores unlimited"
 
 prog start-clone "starting clone CT ${NEWID}"
 pct start "$NEWID"

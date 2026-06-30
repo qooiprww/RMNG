@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Runs on the Proxmox node (shipped via `ssh node bash -s -- <ctid> <user> <op>`).
+# Executes a Claude credential op INSIDE the target clone CT as its user, printing
+# the raw result to stdout. Used by the control-server's token-import flow.
+#
+#   claude-import.sh <ctid> <user> status|read|clear
+#     status — `claude auth status` JSON (stderr merged so a missing/logged-out
+#              clone still produces a parseable message; never fails the script)
+#     read   — contents of the clone's ~/.claude/.credentials.json (fails if absent)
+#     clear  — delete that credentials file, then print CLEARED
+set -euo pipefail
+CTID="$1"; USER="${2:-rmng}"; OP="$3"
+# Force bash with an explicit PATH rather than the user's login shell: clones default
+# to fish, which isn't where `claude` (in ~/.local/bin) is on PATH and which prints
+# tty/parse noise. `-l` still gives a login env (HOME=/home/$USER); `-s /bin/bash`
+# overrides only which shell interprets the command.
+inct() { pct exec "$CTID" -- runuser -l "$USER" -s /bin/bash -c "export PATH=\$HOME/.local/bin:\$PATH; $1"; }
+case "$OP" in
+  status) inct 'claude auth status' 2>&1 || true ;;
+  read)   inct 'cat "$HOME/.claude/.credentials.json"' ;;
+  clear)  inct 'rm -f "$HOME/.claude/.credentials.json"'; echo CLEARED ;;
+  *)      echo "unknown op: $OP" >&2; exit 2 ;;
+esac

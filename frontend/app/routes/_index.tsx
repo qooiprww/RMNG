@@ -17,6 +17,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 
 import { ClaudeAccountsPanel } from "~/components/ClaudeAccountsPanel";
 import { CloneModal } from "~/components/CloneModal";
+import { ImportTokenModal } from "~/components/ImportTokenModal";
 import { OperationProgress } from "~/components/OperationProgress";
 import { SettingsPanel } from "~/components/SettingsPanel";
 import { SidebarHost } from "~/components/SidebarHost";
@@ -24,7 +25,6 @@ import {
   activate,
   cloneHost,
   deleteHost,
-  importClaudeAccounts,
   redeployClone,
   refreshClaudeUsage,
   reorder,
@@ -76,6 +76,7 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
   const [error, setError] = useState<string | null>(null);
   const [cloneSource, setCloneSource] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   // Responsive state. Below `lg` the sidebar is an off-canvas drawer; below `xl`
   // the notes editor and agent chat share the main pane via this tab toggle.
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -232,7 +233,7 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
           <ClaudeAccountsPanel
             accounts={state.claudeAccounts ?? []}
             onRefresh={() => run(refreshClaudeUsage())}
-            onImport={() => run(importClaudeAccounts())}
+            onImport={() => setImportOpen(true)}
           />
 
           <div>
@@ -375,6 +376,17 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
       ) : null}
 
       {settingsOpen ? <SettingsPanel onClose={() => setSettingsOpen(false)} /> : null}
+
+      {importOpen ? (
+        <ImportTokenModal
+          hosts={state.hosts}
+          onClose={() => setImportOpen(false)}
+          onImported={() => {
+            setImportOpen(false);
+            run(refreshClaudeUsage());
+          }}
+        />
+      ) : null}
     </div>
   );
 }

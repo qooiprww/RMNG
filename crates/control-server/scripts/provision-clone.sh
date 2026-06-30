@@ -41,11 +41,15 @@ mkdir -p /etc/sysctl.d && echo 'net.ipv4.ping_group_range = 0 65534' > /etc/sysc
 
 say "headless GNOME + Mutter + VA-API + PipeWire (NO gdm/g-r-d)"
 apt-get install -y -qq \
-  gnome-session gnome-shell mutter gnome-console nautilus gnome-text-editor \
+  gnome-session gnome-shell mutter ptyxis nautilus gnome-text-editor \
   dbus-user-session xwayland \
   mesa-va-drivers libva2 va-driver-all vainfo \
   pipewire wireplumber gstreamer1.0-pipewire \
   fonts-cantarell adwaita-icon-theme network-manager >/dev/null
+
+# Default terminal → Ptyxis (installed above in place of gnome-console; gnome-shell doesn't
+# Recommend Console, so dropping it from the list is enough — nothing pulls it back).
+update-alternatives --set x-terminal-emulator /usr/bin/ptyxis 2>/dev/null || true
 
 # Mask ModemManager. It's pulled in by network-manager but its unit has
 # ConditionVirtualization=!container, so it never starts in an LXC — yet its D-Bus
@@ -70,20 +74,224 @@ else
   say "no patched gnome-shell deb pushed; using stock (window-mgmt MCP unavailable)"
 fi
 
+# The header's "NO gdm3 / NO gnome-remote-desktop" isn't free: gnome-shell *Recommends*
+# gdm3 and the desktop pulls gnome-remote-desktop, so the recommends-on install above
+# drags both back in. We run gnome-shell headless under linger (below) with no display
+# manager and bypass g-r-d entirely — so strip them. gdm otherwise sits idle as the
+# registered display-manager.service (graphical.target pulls it in); g-r-d only adds an
+# unused VA-API encoder + a FreeRDP/TSS2 stack. autoremove then sweeps their orphaned
+# deps. (The explicitly-installed VA/PipeWire packages above are apt-marked manual, so
+# autoremove leaves them — Mesa VA-API decode stays intact.)
+say "strip unused gdm3 + gnome-remote-desktop (pulled in as Recommends); go DM-less"
+apt-get purge -y -qq gdm3 gnome-remote-desktop >/dev/null 2>&1 || true
+apt-get autoremove --purge -y -qq >/dev/null 2>&1 || true
+# No display manager → default to multi-user.target. The headless GNOME user unit starts
+# via linger, independent of graphical.target / any DM.
+systemctl set-default multi-user.target >/dev/null 2>&1 || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dev toolbox — the CT-104 dev-template app set, ALL via apt (no flatpak/snap):
+# dev/CLI tools, Docker, cloud CLIs, build libs, fonts, themes, browsers, Cursor,
+# Celluloid/ffmpeg, Extension Manager, ONLYOFFICE, plus HMCL from its GitHub release.
+# Best-effort: a transient network/apt failure WARNs rather than aborting the build.
+# ─────────────────────────────────────────────────────────────────────────────
+apti(){ apt-get install -y -qq "$@" || say "WARN: install failed: $*"; }
+say "dev toolbox: third-party apt repos (docker/chrome/gh/cursor/mozilla/azure/gcloud/stripe)"
+. /etc/os-release; CODENAME="${VERSION_CODENAME:-resolute}"
+apt-get install -y -qq ca-certificates curl gnupg >/dev/null 2>&1 || say "WARN: repo prereqs"
+install -d -m0755 /etc/apt/keyrings
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/docker.gpg || say "WARN: docker key"
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" > /etc/apt/sources.list.d/docker.list
+
+curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/google-chrome.gpg || say "WARN: chrome key"
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg || say "WARN: gh key"
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+
+# Cursor: its repo key is gated behind the download portal, so pin Anysphere's public
+# repo-signing key inline (fpr 380F F4BC DC34 A4BD 92A3 5653 42A1 772E 62E4 92D6). If
+# Anysphere ever rotates it, `apt update` will flag the cursor repo — refresh here.
+base64 -d > /usr/share/keyrings/anysphere.gpg <<'ANYSPHERE_KEY'
+mQINBGhv/tgBEAC24VCTfKi5NSVaUAuSaIERf2EC5PCyOQz7WOh/UwyuG/1RB2r8/SYtipV+fD2b+xdu7WGPqrSHrKNNO1A9j6TtqbLVDDweJU2keHOqfIaamxrcyfCw3LMF9elIsmdkbZBukezWM32YBrG5MOwfCmG782sN79jYIPYckGZehh8Q6uIlZAzMTR7Qr6mlRR9cRZOF1gY1hRVCXQc1P3SH+ncX1abo/w3idRjxW3l0tqzjLcovWXD1xQdgt5odrpHlUkXRxxr7ukkPu2yJ2tL0KJydLtRDFf7k6ipYoCQv6hrFziHBHqfAEAMymr4YH96GhlbeP/zTSeUn8Y9Blz18q8sJJ2AKoAwpxWTYDIk7D3GDxHQYkcWIuh3MNJd3nulrptCOXgLBPqAF9/N1PW6UyX2XZmcFf0MQYC++IO0FwgcRw968L4LvgIGJdSCA5umcadDPoCQNcdobTur0WtzrsZ8letGoZ18FAhfeWfMWfljHDPbG0LSImKthaiAwXggi76sQyo374azY/ZfjepxRG3U7iEcesopqeo9p8l/8R7aZEk3zUbVt45yhp7XN8YtDrFvAPZfcIuoQTkeDZEub9Cch+fbeqdNk+LAyUbVzX/cFWBvRWC4ajsI/rD4IgeZInV39uG5ngpiwdb755xmZFiZSD1riGUYFYMfFfI1d80EOtQARAQABtCVBbnlzcGhlcmUgSW5jIDxzZWN1cml0eUBhbnlzcGhlcmUuY28+iQJRBBMBCAA7FiEEOA/0vNw0pL2So1ZTQqF3LmLkktYFAmhv/tgCGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AACgkQQqF3LmLkktZXUw//fAEm1Vo8uQ1E/4lNToEPM24olQp6If49+HSwFLCB5HhsGFmed6Zx1L+iNDJ8eW8niuepIqSRTX8G/+0z487hP29moLTE85g/YNsgWfkptbps3vgxlStotfgXZIKI71/m7FItBiA/tMS2ZkL1UwCSUQWE1YJgYJ8Gm4IbvoqYNwHv+8i0wJi3/G6lphHMxQp6XuO4HVlIk0dteQPaeszFK7jf74udRVTpxu+ffM0x/NFw08qYPsmBQJ9Of4/dhRfAYI9ZQOAFnIhujykOs7QBnq49JlzF3pYG/ZnvXwpUzRQgga+ro+5bXoQ1DZrNH+zl4EXtiXKpowUoYOZpDSELRVPGUW4vsyi+n34M5jMnxglYQJGB/ZTW95al7c84WZANripx2szeIxKukDcln7y0Qd7jpfGIC7xAjTzwVK8JzsDPisP9KPfua/zifr972QMK/4xlwjRRS6yRyM7Z2QZVdtzpUdPsVgbnXJkb6IBQSJDXKN7LQeB5Wi+4Cg9hddAG6sPu5wIcig67qFN/GEaeu6P4SuQqgBhmtf0x26Y0MDBbJtQ4adHSr90F8Fn8si6/Hb5xjSSOTg9QsPbAbBpmXjblLLRmdhUt0JCbIrBn2+jPKL+bT7aLkXiyI/k6kNC3AbI+YYwYgIDqSpqNHbdu+t9IOHK033IS4qoybKtiKbY=
+ANYSPHERE_KEY
+chmod a+r /usr/share/keyrings/anysphere.gpg
+cat > /etc/apt/sources.list.d/cursor.sources <<'SRC'
+Types: deb
+URIs: https://downloads.cursor.com/aptrepo
+Suites: stable
+Components: main
+Architectures: amd64,arm64
+Signed-By: /usr/share/keyrings/anysphere.gpg
+SRC
+
+# Firefox from Mozilla's apt repo (pinned over the snap-transitional). Skip if the base
+# image already ships a packages.mozilla.org source — else apt warns "configured twice".
+if ! grep -rqs packages.mozilla.org /etc/apt/sources.list.d/ 2>/dev/null; then
+  curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg -o /etc/apt/keyrings/packages.mozilla.org.asc 2>/dev/null && chmod a+r /etc/apt/keyrings/packages.mozilla.org.asc || say "WARN: mozilla key"
+  echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" > /etc/apt/sources.list.d/mozilla.list
+  printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla
+fi
+
+curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/microsoft.gpg || say "WARN: msft key"
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ noble main" > /etc/apt/sources.list.d/azure-cli.list
+
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/cloud.google.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/cloud.google.gpg || say "WARN: gcloud key"
+echo "deb [signed-by=/etc/apt/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+
+curl -fsSL https://packages.stripe.dev/api/security/keypair/stripe-cli-gpg/public | gpg --dearmor -o /etc/apt/keyrings/stripe.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/stripe.gpg || say "WARN: stripe key"
+echo "deb [signed-by=/etc/apt/keyrings/stripe.gpg] https://packages.stripe.dev/stripe-cli-debian-local stable main" > /etc/apt/sources.list.d/stripe.list
+
+# ONLYOFFICE Desktop Editors — official repo (replaces the Flathub build). GPG-KEY file is
+# ASCII-armored; handle the binary case too just in case. "squeeze" is ONLYOFFICE's fixed
+# repo suite, not a Debian release.
+if curl -fsSL https://download.onlyoffice.com/GPG-KEY-ONLYOFFICE -o /tmp/oo.key 2>/dev/null; then
+  if grep -q "BEGIN PGP" /tmp/oo.key; then gpg --dearmor < /tmp/oo.key > /etc/apt/keyrings/onlyoffice.gpg || say "WARN: onlyoffice key"; else cp /tmp/oo.key /etc/apt/keyrings/onlyoffice.gpg; fi
+  chmod a+r /etc/apt/keyrings/onlyoffice.gpg; rm -f /tmp/oo.key
+  echo "deb [signed-by=/etc/apt/keyrings/onlyoffice.gpg] https://download.onlyoffice.com/repo/debian squeeze main" > /etc/apt/sources.list.d/onlyoffice.list
+else
+  say "WARN: onlyoffice key fetch failed"
+fi
+
+apt-get update -qq || say "WARN: apt update after adding toolbox repos"
+
+say "dev toolbox: install (grouped so one bad package doesn't sink the rest)"
+apti fish ripgrep micro tmux just gh xdotool build-essential clang libclang-dev default-jdk
+apti docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin fuse-overlayfs
+apti azure-cli google-cloud-cli stripe
+apti libsodium23 libpq-dev libcairo2 libcairo2-dev
+apti fonts-noto-cjk fonts-noto-color-emoji papirus-icon-theme
+apti celluloid ffmpeg firefox google-chrome-stable cursor
+# Former Flathub apps now available via apt: Extension Manager (Ubuntu universe) + ONLYOFFICE.
+apti gnome-shell-extension-manager onlyoffice-desktopeditors
+
+say "dev toolbox: HMCL (latest .deb from its GitHub release)"
+HMCL_URL="$(curl -fsSL https://api.github.com/repos/HMCL-dev/HMCL/releases/latest 2>/dev/null | grep -oE 'https://[^"]+/HMCL-[0-9.]+\.deb' | head -1)"
+if [ -n "${HMCL_URL:-}" ] && curl -fsSL "$HMCL_URL" -o /tmp/hmcl.deb 2>/dev/null; then
+  apti /tmp/hmcl.deb && say "HMCL installed ($(basename "$HMCL_URL"))"; rm -f /tmp/hmcl.deb
+else
+  say "WARN: could not fetch HMCL release"
+fi
+
+# Mission Center (system monitor) — no apt/deb upstream, only Flatpak + AppImage. Pull the
+# latest x86_64 AppImage, --appimage-extract it (no FUSE needed), install the raw tree under
+# /opt, and wire up a PATH wrapper + desktop entry (Exec rewritten to the wrapper). Defined
+# as a function so `set -e` is suppressed across the block (run as `mc_install && … || …`),
+# keeping this optional app from ever aborting the build.
+mc_install(){
+  local url d
+  url="$(curl -fsSL 'https://gitlab.com/api/v4/projects/mission-center-devs%2Fmission-center/releases' 2>/dev/null | grep -oE 'https://[^"]+x86_64\.AppImage' | head -1)"
+  [ -n "$url" ] || return 1
+  curl -fsSL "$url" -o /tmp/mc.AppImage || return 1
+  chmod +x /tmp/mc.AppImage
+  ( cd /tmp && rm -rf squashfs-root && /tmp/mc.AppImage --appimage-extract >/dev/null 2>&1 ) || true
+  [ -d /tmp/squashfs-root ] || return 1
+  rm -rf /opt/mission-center; mv /tmp/squashfs-root /opt/mission-center; chown -R root:root /opt/mission-center
+  printf '#!/bin/sh\nexec /opt/mission-center/AppRun "$@"\n' > /usr/local/bin/mission-center; chmod 755 /usr/local/bin/mission-center
+  [ -d /opt/mission-center/usr/share/icons ] && cp -rn /opt/mission-center/usr/share/icons/* /usr/share/icons/ 2>/dev/null || true
+  d="$(ls /opt/mission-center/usr/share/applications/*.desktop 2>/dev/null | head -1)"; [ -n "$d" ] || d="$(ls /opt/mission-center/*.desktop 2>/dev/null | head -1)"
+  [ -n "$d" ] && sed -E 's#^Exec=.*#Exec=/usr/local/bin/mission-center#; s#^TryExec=.*#TryExec=/usr/local/bin/mission-center#' "$d" > /usr/share/applications/io.missioncenter.MissionCenter.desktop
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+  gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+  rm -f /tmp/mc.AppImage
+}
+say "dev toolbox: Mission Center (AppImage → extract → /opt + desktop entry)"
+mc_install && say "Mission Center installed" || say "WARN: Mission Center install skipped"
+
+# Monaspace fonts (githubnext/monaspace) — full set: static (family "Monaspace Neon"),
+# frozen ("Monaspace Neon Frozen", texture-healing baked in — used as the default mono),
+# and variable ("Monaspace Neon Var"). frozen+variable are TTF, static is OTF — copy both.
+command -v unzip >/dev/null 2>&1 || apt-get install -y -qq unzip >/dev/null 2>&1
+mona_install(){
+  local json url v
+  json="$(curl -fsSL https://api.github.com/repos/githubnext/monaspace/releases/latest 2>/dev/null)"
+  [ -n "$json" ] || return 1
+  rm -rf /tmp/mona; mkdir -p /tmp/mona /usr/share/fonts/monaspace
+  for v in static frozen variable; do
+    url="$(echo "$json" | grep -oE "https://[^\"]+monaspace-$v-[^\"]+\.zip" | head -1)"
+    [ -n "$url" ] || continue
+    curl -fsSL "$url" -o "/tmp/mona/$v.zip" && unzip -oq "/tmp/mona/$v.zip" -d "/tmp/mona/$v" || true
+  done
+  find /tmp/mona -type f \( -iname '*.otf' -o -iname '*.ttf' \) -exec cp -f {} /usr/share/fonts/monaspace/ \;
+  fc-cache -f >/dev/null 2>&1 || true
+  rm -rf /tmp/mona
+  [ -n "$(find /usr/share/fonts/monaspace -type f -name '*.ttf' 2>/dev/null | head -1)" ]
+}
+say "dev toolbox: Monaspace fonts (full: static + frozen + variable)"
+mona_install && say "Monaspace installed ($(find /usr/share/fonts/monaspace -type f 2>/dev/null | wc -l) files)" || say "WARN: Monaspace install skipped"
+
+# GNOME desktop defaults, system-wide via dconf (session-independent → every clone gets them
+# on first boot): Papirus icons, Monaspace Neon Frozen 11 as the default monospace font, and
+# all three window buttons (minimize/maximize/close). Users can still override per-session.
+say "GNOME desktop defaults: Papirus icons + Monaspace Neon Frozen mono + 3 window buttons"
+install -d /etc/dconf/profile /etc/dconf/db/local.d
+printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user
+cat > /etc/dconf/db/local.d/00-rmng-desktop <<'DCONF'
+[org/gnome/desktop/interface]
+icon-theme='Papirus'
+monospace-font-name='Monaspace Neon Frozen 11'
+
+[org/gnome/desktop/wm/preferences]
+button-layout='appmenu:minimize,maximize,close'
+DCONF
+dconf update 2>/dev/null || say "WARN: dconf update failed"
+
 say "create user $USERNAME + groups + linger"
 id "$USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$USERNAME"
 usermod -aG sudo,render,video "$USERNAME"
+# docker group exists once docker-ce installed in the toolbox above; add the user so they
+# can run docker without sudo. Non-fatal if the group is absent (docker install failed).
+getent group docker >/dev/null 2>&1 && usermod -aG docker "$USERNAME" || say "WARN: docker group absent; not added"
 printf '%s:%s\n' "$USERNAME" "$PASSWORD" | chpasswd
 printf 'root:%s\n' "$PASSWORD" | chpasswd
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > "/etc/sudoers.d/$USERNAME"; chmod 0440 "/etc/sudoers.d/$USERNAME"
 loginctl enable-linger "$USERNAME"
 
+# Default shell → fish for the clone user + root (fish installed in the dev toolbox above;
+# it registers itself in /etc/shells so chsh accepts it). Non-fatal if fish is missing.
+FISH_SH="$(command -v fish || true)"
+if [ -n "$FISH_SH" ]; then
+  for u in "$USERNAME" root; do chsh -s "$FISH_SH" "$u" 2>/dev/null || usermod -s "$FISH_SH" "$u" || say "WARN: set fish shell for $u"; done
+fi
+
+# Passwordless GNOME keyring. The headless session has no login password to unlock a
+# keyring, so the first Secret Service client (Chrome, VS Code, etc.) pops a "Choose
+# password for new keyring" dialog. Pre-create an empty-password login keyring — the
+# unencrypted, never-locked [keyring] text format — and alias it as the default
+# collection, so every Secret Service app works silently. Secrets land in cleartext on
+# disk, which is fine for an ephemeral remote-desktop clone. (Verified: a daemon-created
+# empty-password keyring is byte-for-byte this text file; dropping it is enough — no
+# gnome-keyring --login dance, and it auto-serves on a cold boot via D-Bus activation.)
+say "passwordless gnome-keyring (no Secret Service prompt for Chrome/etc.)"
+KRDIR="/home/$USERNAME/.local/share/keyrings"
+install -d -o "$USERNAME" -g "$USERNAME" -m700 "$KRDIR"
+# install -d does NOT chown the intermediate parents it creates, so ~/.local and
+# ~/.local/share would be left root-owned — which blocks the user's own writes there
+# (notably the claude installer's `mkdir ~/.local/share/claude` → EACCES). Chown them.
+chown "$USERNAME:$USERNAME" "/home/$USERNAME/.local" "/home/$USERNAME/.local/share"
+cat > "$KRDIR/login.keyring" <<'KEYRING'
+[keyring]
+display-name=Login
+ctime=0
+mtime=0
+lock-on-idle=false
+lock-after=false
+KEYRING
+printf 'login' > "$KRDIR/default"
+chown "$USERNAME:$USERNAME" "$KRDIR/login.keyring" "$KRDIR/default"
+chmod 600 "$KRDIR/login.keyring" "$KRDIR/default"
+
+# Service binaries live in /opt/rmng/bin (root-owned, 755) — NOT the user's home, so they
+# don't clutter the Files/Nautilus Home view. The systemd --user units exec them from here.
+BINDIR=/opt/rmng/bin; install -d -m0755 "$BINDIR"
+
 say "install clone-daemon"
-install -o "$USERNAME" -g "$USERNAME" -m755 /root/rmng-clone-daemon "/home/$USERNAME/rmng-clone-daemon" 2>/dev/null || \
+install -m755 /root/rmng-clone-daemon "$BINDIR/rmng-clone-daemon" 2>/dev/null || \
   say "WARN: /root/rmng-clone-daemon not pushed; install it later"
 
 say "install agent-wrapper (Bun single-exec) + standalone claude CLI (no node)"
-install -o "$USERNAME" -g "$USERNAME" -m755 /root/agent-wrapper "/home/$USERNAME/agent-wrapper" 2>/dev/null || \
+install -m755 /root/agent-wrapper "$BINDIR/agent-wrapper" 2>/dev/null || \
   say "WARN: /root/agent-wrapper not pushed; install it later"
 # Claude Code installs standalone (self-contained binary, no system node) → ~/.local/bin/claude.
 runuser -u "$USERNAME" -- bash -lc 'command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash' 2>/dev/null || \
@@ -122,7 +330,7 @@ Environment=WAYLAND_DISPLAY=wayland-0
 # the daemon falls back to standalone capture self-test (no connection to the server).
 Environment=RMNG_SOCKET=/srv/rmng-sock/clones.sock
 ${MONITORS:+Environment=RMNG_MONITORS=$MONITORS}
-ExecStart=/home/$USERNAME/rmng-clone-daemon
+ExecStart=$BINDIR/rmng-clone-daemon
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -137,7 +345,7 @@ Type=simple
 # Self-contained Bun binary; the SDK drives the standalone claude CLI (~/.local/bin).
 Environment=PATH=/home/$USERNAME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=AGENT_PORT=4096
-ExecStart=/home/$USERNAME/agent-wrapper
+ExecStart=$BINDIR/agent-wrapper
 Restart=on-failure
 RestartSec=2
 [Install]

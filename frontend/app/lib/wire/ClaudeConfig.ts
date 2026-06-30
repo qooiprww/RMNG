@@ -10,14 +10,6 @@ pollSecs: bigint,
  */
 pinnedEmail: string | null, 
 /**
- * Host id whose mounted home holds claude-swap's data dir (the template).
- */
-templateHostId: string, 
-/**
- * claude-swap data dir relative to the host's home.
- */
-swapDataSubpath: string, 
-/**
  * Hot-swap a clone to another account when its usage is exhausted.
  */
 autoSwapOnExhaustion: boolean, };
