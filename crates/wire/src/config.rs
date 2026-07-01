@@ -240,6 +240,13 @@ pub struct AppConfig {
     /// env var overrides this at load time.
     #[serde(default)]
     pub chroma: ChromaMode,
+    /// Vision-LLM inference server the needs-human detector (`clone-daemon wait-for-stuck`)
+    /// polls — OpenAI-compatible `/v1/chat/completions`. Injected into each clone as
+    /// `RMNG_INFERENCE_URL` at clone time. External infra the control-server can't
+    /// auto-detect, so it's configured here (the old compiled-in default pointed at the
+    /// retired stack's subnet address, unreachable from vmbr0 clones).
+    #[serde(default = "default_inference_url")]
+    pub detector_inference_url: String,
 }
 
 impl Default for AppConfig {
@@ -258,12 +265,16 @@ impl Default for AppConfig {
             template: TemplateConfig::default(),
             env_presets: Vec::new(),
             chroma: ChromaMode::default(),
+            detector_inference_url: default_inference_url(),
         }
     }
 }
 
 fn default_agent_port() -> u16 {
     4096
+}
+fn default_inference_url() -> String {
+    "http://10.0.0.42:8080".into()
 }
 fn default_data_dir() -> String {
     "data".into()
@@ -316,6 +327,7 @@ impl AppConfig {
             template: self.template.clone(),
             env_presets: self.env_presets.clone(),
             chroma: self.chroma,
+            detector_inference_url: self.detector_inference_url.clone(),
         }
     }
 }
@@ -359,6 +371,7 @@ pub struct AppConfigRedacted {
     pub template: TemplateConfig,
     pub env_presets: Vec<EnvPreset>,
     pub chroma: ChromaMode,
+    pub detector_inference_url: String,
 }
 
 #[cfg(test)]

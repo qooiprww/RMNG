@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 /// [--timeout <secs>]` — flags match the old `computer-use` CLI so the agent's command
 /// pattern carries over with just a binary-name swap.
 async fn run_wait_for_stuck(args: Vec<String>) -> Result<()> {
-    let mut inference_url = detector::DEFAULT_INFERENCE_URL.to_string();
+    let mut inference_url = detector::default_inference_url();
     let mut ignore_reasons = Vec::new();
     let mut interval = 60u64;
     let mut timeout = 1200u64;
@@ -181,7 +181,7 @@ async fn run_wait_for_stuck(args: Vec<String>) -> Result<()> {
 async fn run_report_detection(args: Vec<String>) -> Result<()> {
     let mut false_positive = None;
     let mut note = String::new();
-    let mut control_url = detector::DEFAULT_CONTROL_URL.to_string();
+    let mut control_url = detector::default_control_url();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {

@@ -177,6 +177,47 @@ pub async fn clone_ct(
     Ok((ctid, ip))
 }
 
+/// The control-server's own IPv4 as reachable *by clones*: the local source address the
+/// kernel would use to reach the Proxmox node (clones share the node's `vmbr0` L2). The
+/// UDP-`connect` trick sends no packet — it just resolves the source address via the
+/// routing table. `ssh_target` is `[user@]host[:port]`.
+fn advertise_ip(ssh_target: &str) -> Option<String> {
+    let host = ssh_target.rsplit('@').next()?.rsplit(':').next_back()?;
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((host, 9)).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// The clone→control-server + detector-inference env every clone needs, as `environment.d`
+/// `KEY=VALUE` [`wire::EnvVar`]s. Points the detector's feedback (`report-detection`) and the
+/// agent's `set_state` MCP at THIS control-server (auto-detected address), and the detector's
+/// vision model at the configured inference server — replacing the retired stack's hardcoded
+/// `10.60.0.x` defaults, which are both wrong and unreachable from `vmbr0` clones. Empty (with
+/// a warning) if the address can't be detected, so clones fall back to the compiled defaults.
+pub fn control_env_vars(cfg: &AppConfig) -> Vec<wire::EnvVar> {
+    let ev = |key: &str, value: String| wire::EnvVar { key: key.to_string(), value };
+    let mut vars = Vec::new();
+    match advertise_ip(&cfg.proxmox.ssh) {
+        Some(ip) => {
+            vars.push(ev("RMNG_CONTROL_URL", format!("http://{ip}:{}", cfg.listen.web)));
+            vars.push(ev("AGENT_CONTROL_MCP_URL", format!("http://{ip}:{}", cfg.listen.clone_mcp)));
+        }
+        None => tracing::warn!(
+            "control_env_vars: could not auto-detect the control-server IP (proxmox.ssh={:?}); \
+             clones fall back to the compiled detector defaults",
+            cfg.proxmox.ssh
+        ),
+    }
+    let infer = cfg.detector_inference_url.trim();
+    if !infer.is_empty() {
+        vars.push(ev("RMNG_INFERENCE_URL", infer.to_string()));
+    }
+    vars
+}
+
 /// Build a template/clone CT **from a base image** (the from-zero path): create +
 /// render passthrough + headless-GNOME provisioning, all on the node. Returns
 /// `(ctid, ip)`. The in-CT provisioning script is shipped base64 to the node.

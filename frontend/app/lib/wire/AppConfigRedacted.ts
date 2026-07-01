@@ -13,4 +13,4 @@ import type { TemplateConfig } from "./TemplateConfig";
  * The shape `GET /api/config` returns: same structure as [`AppConfig`] but with
  * every secret replaced by a boolean "is set". Powers the Settings UI.
  */
-export type AppConfigRedacted = { listen: ListenConfig, agentPort: number, dataDir: string, staticDir: string, monitors: Array<MonitorSpec>, proxmoxSshSet: boolean, proxmoxHostnamePrefix: string, linearKeysSet: LinearKeysSet, claude: ClaudeConfig, cloneAccounts: Array<CloneAccountRedacted>, cloneGroups: Array<CloneGroup>, template: TemplateConfig, envPresets: Array<EnvPreset>, chroma: ChromaMode, };
+export type AppConfigRedacted = { listen: ListenConfig, agentPort: number, dataDir: string, staticDir: string, monitors: Array<MonitorSpec>, proxmoxSshSet: boolean, proxmoxHostnamePrefix: string, linearKeysSet: LinearKeysSet, claude: ClaudeConfig, cloneAccounts: Array<CloneAccountRedacted>, cloneGroups: Array<CloneGroup>, template: TemplateConfig, envPresets: Array<EnvPreset>, chroma: ChromaMode, detectorInferenceUrl: string, };

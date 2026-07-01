@@ -27,6 +27,24 @@ use serde_json::{Value, json};
 
 pub const DEFAULT_INFERENCE_URL: &str = "http://10.60.0.10:8080";
 pub const DEFAULT_CONTROL_URL: &str = "http://10.60.0.1:9000";
+
+/// Vision-inference server for `wait-for-stuck`: `RMNG_INFERENCE_URL` (injected per-clone by
+/// the control-server at clone time) else the compiled-in fallback. A `--inference-url` flag
+/// still overrides. The env is the real path — the fallback only matters if injection failed.
+pub fn default_inference_url() -> String {
+    non_empty_env("RMNG_INFERENCE_URL").unwrap_or_else(|| DEFAULT_INFERENCE_URL.to_string())
+}
+
+/// Control-server base for `report-detection` feedback: `RMNG_CONTROL_URL` (injected per-clone)
+/// else the compiled-in fallback. A `--control` flag still overrides. Points at THIS
+/// control-server, not the retired stack's `10.60.0.1` (unreachable from `vmbr0` clones).
+pub fn default_control_url() -> String {
+    non_empty_env("RMNG_CONTROL_URL").unwrap_or_else(|| DEFAULT_CONTROL_URL.to_string())
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
 const MODEL_MAX_H: u32 = 1080;
 const TILE_COLS: u32 = 2;
 const TILE_ROWS: u32 = 1;

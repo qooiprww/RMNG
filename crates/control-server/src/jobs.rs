@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wire::{Host, Operation, OperationKind, OperationStatus};
 
 use crate::app::App;
-use crate::orchestrate::{clone_ct, delete_ct, is_dns_label};
+use crate::orchestrate::{clone_ct, control_env_vars, delete_ct, is_dns_label};
 
 const LOG_LIMIT: usize = 200;
 const PRUNE_DONE_MS: u64 = 8_000;
@@ -223,8 +223,12 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
         }
     };
 
+    // The clone→control-server + inference URLs (auto-detected) go into the clone's session
+    // env first; the operator's chosen preset follows (so a preset key can still override).
+    let mut env = control_env_vars(&cfg);
+    env.extend(spec.env.iter().cloned());
     let (ctid, ip) =
-        match clone_ct(&cfg.proxmox, &spec.source_id, &spec.new_hostname, "rmng", &spec.env, progress).await {
+        match clone_ct(&cfg.proxmox, &spec.source_id, &spec.new_hostname, "rmng", &env, progress).await {
         Ok(v) => v,
         Err(e) => return fail_op(&app, &op_id, e.to_string()),
     };
