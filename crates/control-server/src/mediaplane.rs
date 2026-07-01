@@ -17,6 +17,8 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::broadcast::error::RecvError;
+
 use media::{Conn, Encoder, Listener};
 use wire::ChromaMode;
 use wire::socket::{
@@ -141,6 +143,43 @@ pub fn spawn(app: App) {
                 }
             }
             Err(e) => tracing::error!("port 1 bind {video_port} failed: {e}"),
+        });
+    }
+
+    // Repaint the viewer the instant the *selected* clone changes, without waiting for the
+    // next incoming frame. `/api/activate` only mutates the store; serve_clone's frame loop
+    // otherwise notices the switch lazily — on the next frame from *any* clone — which on a
+    // static, damage-driven desktop can be seconds away (the reported "few seconds before the
+    // new host appears"). Watch the store's change bus and, the moment `selected` flips, force
+    // a fresh IDR on every encoder + re-prime from the newly-selected clone's last frame /
+    // cursor / layout. Shares `last_sel` with the frame loop (same mutex, same lock order
+    // last_sel → encoders/viewer), so the two paths serialize and never double-prime.
+    {
+        let (app, encoders, viewer, last_sel, handle) =
+            (app.clone(), encoders.clone(), viewer.clone(), last_sel.clone(), handle.clone());
+        std::thread::spawn(move || {
+            let (_seed, mut rx) = app.store.subscribe();
+            loop {
+                match rx.blocking_recv() {
+                    // Any state mutation (or a lag) → re-check the selection; act only on a change.
+                    Ok(_) | Err(RecvError::Lagged(_)) => {
+                        let sel = app.store.selected();
+                        let mut ls = last_sel.lock().unwrap();
+                        if *ls == sel {
+                            continue;
+                        }
+                        *ls = sel.clone();
+                        // No viewer attached → nothing to repaint; the connect path primes on connect.
+                        if viewer.lock().unwrap().is_none() {
+                            continue;
+                        }
+                        let chroma = app.config().chroma;
+                        force_idr_all(&encoders);
+                        prime_viewer(&handle, &encoders, &viewer, sel, chroma);
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
         });
     }
 
