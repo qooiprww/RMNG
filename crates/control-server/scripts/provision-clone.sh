@@ -344,6 +344,51 @@ install -m755 /root/agent-wrapper "$BINDIR/agent-wrapper" 2>/dev/null || \
 runuser -u "$USERNAME" -- bash -lc 'command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash' 2>/dev/null || \
   say "WARN: standalone claude CLI install failed; install it later"
 
+# Shared user CLAUDE.md — operating memory read by EVERY `claude` on this clone: the
+# agent-wrapper's SDK agent (settingSources: ["user"]), the Claude Code it drives inside
+# Cursor to implement tickets, and any interactive `claude` a human opens. General
+# engineering guidance ONLY — deliberately NOT the desktop operating notes or the ticket
+# procedure (those are baked into the agent-wrapper and injected as its system prompt; the
+# ticket procedure must never reach the inner Cursor agent or it would recursively try to
+# open Cursor). install -d is idempotent — the claude installer already made ~/.claude.
+say "shared user CLAUDE.md (agent operating memory)"
+CLAUDE_DIR="/home/$USERNAME/.claude"
+install -d -o "$USERNAME" -g "$USERNAME" -m700 "$CLAUDE_DIR"
+cat > "$CLAUDE_DIR/CLAUDE.md" <<'CLAUDEMD'
+# Working in this clone
+
+This machine is a **disposable, single-purpose dev sandbox** that belongs to you,
+with **passwordless `sudo`**. Install packages, toolchains, and global CLIs freely
+and reconfigure the system as needed — the machine itself is throwaway and there is
+no other user to disturb. Optimize for getting the task done.
+
+## Engineering standards
+
+- **Verify before claiming done.** Build, typecheck, and run the relevant tests
+  after a change; don't leave the tree broken. If you can't verify something, say
+  so plainly instead of asserting it works.
+- **Match the surrounding code.** Follow the existing style, naming, and patterns
+  of the file and repo you're editing. Keep the diff minimal and scoped to the
+  task — no drive-by reformatting or unrelated refactors.
+- **Understand before you change.** Read the relevant code and how it's used first;
+  prefer the smallest change that correctly solves the problem.
+
+## Git
+
+- The checked-out branch is real work — write clear, present-tense commit messages
+  that explain *why*, not just *what*.
+- **Commit and push only when the task calls for it.** Never force-push a shared
+  branch or rewrite already-published history.
+
+## When you're blocked
+
+If you're genuinely stuck — missing access or credentials, an ambiguous
+requirement, or a call that's the human's to make — **stop and ask** rather than
+guessing or thrashing. A precise question beats a confident wrong turn.
+CLAUDEMD
+chown "$USERNAME:$USERNAME" "$CLAUDE_DIR/CLAUDE.md"
+chmod 644 "$CLAUDE_DIR/CLAUDE.md"
+
 # uv + nvm + fish-nvm, all installed as the clone user (per-user, like claude above).
 # Subshell cd's to the user's home so fisher can getcwd (root's cwd isn't readable by
 # the user → fisher would otherwise spew "Unable to open the current working directory").

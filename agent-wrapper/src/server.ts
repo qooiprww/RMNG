@@ -6,9 +6,11 @@
 // the monitoring loop work: the agent can start a background command (Bash
 // run_in_background), end its turn, and be re-engaged AUTOMATICALLY when that
 // command exits (a `task_notification` arrives in the still-open stream) — no new
-// user message needed. The monitor loop + general notes live in the deployed
-// ~/.claude/CLAUDE.md (see operating-notes.md); the per-host "implement a ticket"
-// procedure is the system-prompt append below (see ticket-procedure.md).
+// user message needed. The desktop operating notes + the per-host "implement a ticket"
+// procedure are baked into this binary and injected as the system-prompt append below
+// (see operating-notes.md / ticket-procedure.md). Separately, the clone's shared
+// ~/.claude/CLAUDE.md (general engineering guidance, deployed by provision-clone.sh) is
+// read as user memory via settingSources — see buildOptions.
 //
 // Turns are either:
 //   • solicited   — answering a POST /prompt; the reply rides /events as
@@ -43,10 +45,10 @@ import { CONFIG } from "./config";
 // `implement <link>` into) would also read it and recursively try to open Cursor.
 const TICKET_PROCEDURE = TICKET_PROCEDURE_RAW.trim();
 
-// General operating notes (sandbox, coordinates, launching GUIs, app quirks). Injected
-// from code as a system-prompt append — the SDK does NOT read ~/.claude/CLAUDE.md from
-// disk (settingSources is empty in buildOptions), so a clone needs no deployed memory
-// file; the instructions ship inside the wrapper.
+// General operating notes (sandbox, coordinates, launching GUIs, app quirks) for the
+// desktop agent. Injected from code as a system-prompt append — these are wrapper-only
+// (the inner Cursor agent has no desktop tool), so they must NOT go in the shared
+// ~/.claude/CLAUDE.md that every `claude` on the host reads (see buildOptions).
 const OPERATING_NOTES = OPERATING_NOTES_RAW.trim();
 
 // The full system-prompt append: operating notes first, then the ticket procedure.
@@ -164,12 +166,14 @@ function buildOptions(): Options {
     cwd: process.env.HOME ?? undefined,
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
-    // Do NOT read ~/.claude from disk (no CLAUDE.md memory, no settings.json): the
-    // agent's instructions are injected from code (SYSTEM_APPEND) so a clone needs no
-    // deployed memory file. Auth still works — the container's logged-in subscription
-    // (~/.claude/.credentials.json) is read by the SDK independently of settingSources;
-    // permissionMode/mcpServers/model are all set programmatically here anyway.
-    settingSources: [],
+    // Read ~/.claude from disk so the agent picks up the clone's shared user memory
+    // (~/.claude/CLAUDE.md — general engineering guidance deployed by provision-clone.sh,
+    // and also read by the inner Cursor Claude Code and any human `claude`). The
+    // wrapper-only desktop notes + ticket procedure ride SYSTEM_APPEND above, NOT that
+    // file. "user" also loads ~/.claude/settings.json (theme, etc.), but permissionMode/
+    // mcpServers/model are all set programmatically here and override it. Auth is
+    // independent — the container's ~/.claude/.credentials.json subscription.
+    settingSources: ["user"],
     // Claude Code preset + the code-injected operating notes + per-host ticket procedure.
     systemPrompt: {
       type: "preset",

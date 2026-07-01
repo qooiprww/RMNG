@@ -49,31 +49,32 @@ Code CLI under `node` (`AGENT_EXECUTABLE`).
 | `COMPUTER_USE_MAX_WIDTH` / `_HEIGHT` | unset | override the desktop MCP's screenshot cap; unset ⇒ its built-in 1080p default |
 | `LINEAR_{WE,DEV,HH,PER}_API_KEY` | unset | per-workspace Linear hosted MCP; empty key ⇒ that server is skipped |
 
-Instructions (the per-host "operating notes": coordinates, asking-the-human,
-app quirks, the monitor loop) live in `operating-notes.md`, deployed once to the
-container as `~/.claude/CLAUDE.md` (the wrapper does **not** write it — see Run /
-deploy). Both consumers read it from there: the SDK agent via
-`settingSources: ["user"]` (which also loads the user's own
-`~/.claude/settings.json` — theme, etc.), and any interactive `claude` a human
-opens in the container (auto-loads `~/.claude/CLAUDE.md`).
-`permissionMode`/`mcpServers`/`model` are set programmatically and override
-anything `settings.json` might contain.
+The agent's instructions come in two layers:
 
-The **"Implementing a ticket"** procedure (open Cursor, drive the Claude Code
-panel, open Firefox to the ticket, monitor) lives in `ticket-procedure.md` and is
-injected as a **system-prompt `append` for this one session agent only** — NOT in
-`~/.claude/CLAUDE.md`. That's deliberate: CLAUDE.md is read by every `claude` on
-the host, including the Claude Code inside Cursor that this agent types
-`implement <link>` into; if the procedure were shared, that inner agent would
-recursively try to open Cursor. The file is read at startup via `import.meta.url`,
-so it must sit next to `src/` (it ships with the repo — no extra deploy step).
+**Baked into the wrapper binary** — the desktop **operating notes**
+(`operating-notes.md`: coordinates, asking-the-human, app quirks, the monitor loop)
+and the **"Implementing a ticket"** procedure (`ticket-procedure.md`: open Cursor,
+drive the Claude Code panel, open Firefox to the ticket, monitor). Both are `with {
+type: "text" }` imports, so they ship inside the `bun build --compile` single-exec
+(no deploy step), and both are injected as a **system-prompt `append` for this
+session agent only**. They are deliberately kept OUT of `~/.claude/CLAUDE.md`,
+because that file is read by *every* `claude` on the host — including the Claude Code
+inside Cursor that this agent types `implement <link>` into; if the ticket procedure
+were shared, that inner agent would recursively try to open Cursor.
+
+**Shared on-disk memory** — `~/.claude/CLAUDE.md`: general engineering guidance
+(disposable sandbox, verify-before-done, git discipline), deployed once per clone by
+`provision-clone.sh`. Read by all three consumers: the SDK agent via
+`settingSources: ["user"]` (which also loads `~/.claude/settings.json` — theme,
+etc.), the inner Cursor Claude Code, and any interactive `claude` a human opens.
+`permissionMode`/`mcpServers`/`model` are set programmatically and override anything
+`settings.json` might contain.
 
 ## Run / deploy
 
 ```sh
 bun install
-cp operating-notes.md ~/.claude/CLAUDE.md   # the agent's operating notes (re-copy on change)
-bun run src/server.ts                        # local
+bun run src/server.ts   # local (reads your own ~/.claude/CLAUDE.md as user memory)
 ```
 
 Deployed as a user systemd unit — see `../tests/agent-wrapper.service`.
