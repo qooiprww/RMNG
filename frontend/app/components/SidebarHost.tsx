@@ -20,6 +20,44 @@ function effectiveStatus(host: Host): { dot: string; text: string; label: string
   return AGENT_STATUS[host.monitorState ?? "idle"];
 }
 
+/** How this clone's Claude account was chosen + which account is actually in use, for
+ *  the sidebar line. `mode` is the selection kind; `email` is the live account (absent
+ *  for "none", or when auto/specific hasn't resolved one). Returns null when there's
+ *  nothing Claude-related to show (e.g. auto with no accounts configured). */
+type ClaudeSel = { mode: "auto" | "group" | "specific" | "none"; group?: string; email?: string };
+function claudeSelection(host: Host): ClaudeSel | null {
+  const email = host.claudeAccountEmail || undefined;
+  const sel = host.claudeSelection;
+  if (host.claudeGroup) return { mode: "group", group: host.claudeGroup, email };
+  if (sel === "none") return { mode: "none" };
+  if (sel === "auto") return email ? { mode: "auto", email } : null;
+  if (sel && !sel.startsWith("group:")) return { mode: "specific", email: email ?? sel };
+  // Legacy host (no selection recorded): show the account, without a mode badge.
+  return email ? { mode: "specific", email } : null;
+}
+
+/** Short badge for the non-default selection modes (specific renders as the plain
+ *  email, so it — and legacy hosts — get no badge). Group shows the group name. */
+function selBadge(sel: ClaudeSel): string | null {
+  if (sel.mode === "auto") return "auto";
+  if (sel.mode === "none") return "none";
+  if (sel.mode === "group") return sel.group ?? "group";
+  return null; // specific
+}
+
+function selTitle(sel: ClaudeSel): string {
+  switch (sel.mode) {
+    case "group":
+      return `Claude group: ${sel.group} (on ${sel.email ?? "?"})`;
+    case "auto":
+      return `Claude: auto — server picks the best account${sel.email ? ` (on ${sel.email})` : ""}`;
+    case "none":
+      return "Claude: none — no token installed";
+    default:
+      return `Claude account: ${sel.email} (fixed)`;
+  }
+}
+
 export interface SidebarHostProps {
   host: Host;
   selected: boolean;
@@ -35,6 +73,8 @@ export interface SidebarHostProps {
   onClone: () => void;
   /** Hot-swap this clone's clone-daemon + agent-wrapper binaries (no reprovision). */
   onRedeploy: () => void;
+  /** Change this clone's Claude account/group. */
+  onChangeAccount: () => void;
 }
 
 function GripIcon() {
@@ -68,6 +108,25 @@ function CloneIcon() {
   );
 }
 
+function AccountIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M2.5 6h9M9.5 4l2 2-2 2" />
+      <path d="M13.5 10h-9M6.5 8l-2 2 2 2" />
+    </svg>
+  );
+}
+
 function RedeployIcon() {
   return (
     <svg
@@ -97,9 +156,11 @@ export function SidebarHost({
   onDelete,
   onClone,
   onRedeploy,
+  onChangeAccount,
 }: SidebarHostProps) {
   const busy = op?.status === "running";
   const status = effectiveStatus(host);
+  const claudeSel = claudeSelection(host);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: host.id, disabled: busy });
 
@@ -145,13 +206,22 @@ export function SidebarHost({
       </button>
 
       <div className="min-w-0 flex-1">
-        {!busy && host.claudeAccountEmail ? (
+        {!busy && claudeSel ? (
           <p
             className="mb-0.5 flex items-center gap-1 text-[10px] text-slate-400"
-            title={`Claude account: ${host.claudeAccountEmail}`}
+            title={selTitle(claudeSel)}
           >
             <img src={claudeLogo} alt="" className="h-3 w-3 shrink-0 object-contain" />
-            <span className="truncate">{host.claudeAccountEmail}</span>
+            {selBadge(claudeSel) ? (
+              <span className="shrink-0 rounded bg-slate-100 px-1 text-[9px] font-semibold text-slate-500">
+                {selBadge(claudeSel)}
+              </span>
+            ) : null}
+            {claudeSel.email ? (
+              <span className="truncate">{claudeSel.email}</span>
+            ) : claudeSel.mode === "none" ? (
+              <span className="italic text-slate-300">no token</span>
+            ) : null}
           </p>
         ) : null}
         <span className="flex items-center gap-1.5">
@@ -192,19 +262,34 @@ export function SidebarHost({
       </div>
 
       {host.ctid != null ? (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onRedeploy();
-          }}
-          disabled={busy}
-          aria-label={`redeploy ${host.id}`}
-          title="redeploy clone-daemon + agent-wrapper"
-          className="rounded p-1 text-slate-400 opacity-0 hover:bg-sky-50 hover:text-sky-600 group-hover:opacity-100 disabled:opacity-0"
-        >
-          <RedeployIcon />
-        </button>
+        <>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onChangeAccount();
+            }}
+            disabled={busy}
+            aria-label={`change Claude account for ${host.id}`}
+            title="change Claude account / group"
+            className="rounded p-1 text-slate-400 opacity-0 hover:bg-emerald-50 hover:text-emerald-600 group-hover:opacity-100 disabled:opacity-0"
+          >
+            <AccountIcon />
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRedeploy();
+            }}
+            disabled={busy}
+            aria-label={`redeploy ${host.id}`}
+            title="redeploy clone-daemon + agent-wrapper"
+            className="rounded p-1 text-slate-400 opacity-0 hover:bg-sky-50 hover:text-sky-600 group-hover:opacity-100 disabled:opacity-0"
+          >
+            <RedeployIcon />
+          </button>
+        </>
       ) : null}
 
       {isTemplate ? (

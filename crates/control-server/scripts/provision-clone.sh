@@ -255,6 +255,42 @@ if [ -n "$FISH_SH" ]; then
   for u in "$USERNAME" root; do chsh -s "$FISH_SH" "$u" 2>/dev/null || usermod -s "$FISH_SH" "$u" || say "WARN: set fish shell for $u"; done
 fi
 
+# ~/.local/bin on PATH for interactive shells. Claude Code (and other user-local tools)
+# install to ~/.local/bin, but neither fish (the clones' default shell, set above) nor a
+# non-login bash puts it on PATH — so `claude` isn't found in a terminal, even though the
+# agent-wrapper unit hardcodes it. Cover every fish shell (conf.d), login sh/bash
+# (profile.d), and non-login interactive bash (/etc/bash.bashrc). Guards keep it
+# idempotent and skip the dir until the claude installer creates it.
+say "PATH: add ~/.local/bin for interactive fish + bash"
+install -d -m0755 /etc/fish/conf.d
+cat > /etc/fish/conf.d/rmng-local-bin.fish <<'FISH'
+if test -d "$HOME/.local/bin"; and not contains -- "$HOME/.local/bin" $PATH
+    set -gx PATH "$HOME/.local/bin" $PATH
+end
+FISH
+cat > /etc/profile.d/rmng-local-bin.sh <<'SH'
+# Claude Code + other user-local tools install to ~/.local/bin.
+if [ -d "$HOME/.local/bin" ]; then
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) : ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+  esac
+fi
+SH
+if ! grep -q 'rmng-local-bin' /etc/bash.bashrc 2>/dev/null; then
+  cat >> /etc/bash.bashrc <<'SH'
+
+# rmng-local-bin: user-local tools (Claude Code) install to ~/.local/bin; add it for
+# non-login interactive bash (login shells get it via /etc/profile.d/rmng-local-bin.sh).
+if [ -d "$HOME/.local/bin" ]; then
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) : ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+  esac
+fi
+SH
+fi
+
 # Passwordless GNOME keyring. The headless session has no login password to unlock a
 # keyring, so the first Secret Service client (Chrome, VS Code, etc.) pops a "Choose
 # password for new keyring" dialog. Pre-create an empty-password login keyring — the

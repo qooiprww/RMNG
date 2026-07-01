@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 
+import { AccountGroupSelect } from "~/components/AccountGroupSelect";
 import { getConfig, recommendedClaudeAccount, type ClonePayload } from "~/lib/api";
 import type { ClaudeUsage } from "~/lib/types";
+import type { CloneGroup } from "~/lib/wire/CloneGroup";
 import type { EnvPreset } from "~/lib/wire/EnvPreset";
 import {
   parseTicketInput,
@@ -9,14 +11,6 @@ import {
   WORKSPACE_PREFIXES,
   type WorkspacePrefix,
 } from "~/lib/workspace";
-
-/** "me@pegasis.site — 5h 12% · 7d 40%" (usage suffix only when known). */
-function accountLabel(a: ClaudeUsage): string {
-  const bits: string[] = [];
-  if (a.fiveHour) bits.push(`5h ${a.fiveHour.pct}%`);
-  if (a.sevenDay) bits.push(`7d ${a.sevenDay.pct}%`);
-  return bits.length ? `${a.email} — ${bits.join(" · ")}` : a.email;
-}
 
 /**
  * Clone dialog. Three modes: paste an existing Linear ticket (link or `WE-142`),
@@ -50,17 +44,24 @@ export function CloneModal({
   // The Claude account email to clone under. Initialized to the first account,
   // then pre-set to the server's recommendation once it loads (operator can
   // still change it). The recommendation is fetched, not decided at clone time.
-  const [account, setAccount] = useState(() => accounts[0]?.email ?? "");
+  // Account selection: "auto" | "<email>" | "group:<name>". Defaults to auto; the
+  // recommendation (below) pre-selects a concrete account when one is available.
+  const [account, setAccount] = useState("auto");
   const [recommended, setRecommended] = useState<string | null>(null);
+  // Account groups (from config), for the group options in the picker.
+  const [groups, setGroups] = useState<CloneGroup[]>([]);
   // Env-var presets (from config) + the chosen one ("" = none).
   const [presets, setPresets] = useState<EnvPreset[]>([]);
   const [envPreset, setEnvPreset] = useState("");
 
   useEffect(() => {
     getConfig()
-      .then((c) => setPresets(c.envPresets))
+      .then((c) => {
+        setPresets(c.envPresets);
+        setGroups(c.cloneGroups);
+      })
       .catch(() => {
-        // Config unreachable — just no preset options.
+        // Config unreachable — just no preset/group options.
       });
   }, []);
 
@@ -261,21 +262,17 @@ export function CloneModal({
           </div>
         )}
 
-        {accounts.length > 0 ? (
+        {accounts.length > 0 || groups.length > 0 ? (
           <label className="mt-3 block text-xs font-medium text-slate-500">
             Claude account
-            <select
+            <AccountGroupSelect
+              groups={groups}
+              accounts={accounts}
               value={account}
-              onChange={(e) => setAccount(e.target.value)}
+              onChange={setAccount}
+              recommended={recommended}
               className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none"
-            >
-              {accounts.map((a) => (
-                <option key={a.id} value={a.email}>
-                  {accountLabel(a)}
-                  {a.email === recommended ? " · recommended" : ""}
-                </option>
-              ))}
-            </select>
+            />
           </label>
         ) : null}
 

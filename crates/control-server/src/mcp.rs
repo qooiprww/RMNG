@@ -148,7 +148,13 @@ fn tools_for(scope: Scope) -> Value {
         tools.push(tool(
             "claude_swap",
             "Hot-swap a clone's Claude account",
-            json!({ "clone": { "type": "string" }, "account": { "type": "string" } }),
+            json!({
+                "clone": { "type": "string" },
+                "account": {
+                    "type": "string",
+                    "description": "An account email, \"auto\" (server picks best), \"group:<name>\", or \"none\" (remove the clone's token)",
+                },
+            }),
             json!(["clone", "account"]),
         ));
     }
@@ -281,15 +287,42 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
             let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
             let account = args.get("account").and_then(Value::as_str).unwrap_or("auto");
             let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-            let acct = crate::claude::resolve_clone_account(app, Some(account)).ok_or("no clone accounts")?;
-            crate::claude::apply_clone_token(&host, &acct.long_lived_token).await.map_err(|e| e.to_string())?;
-            let (id, email) = (host.id.clone(), acct.email.clone());
+            let ctid = host.ctid.ok_or("clone has no container")?;
+            let assignment = crate::claude::resolve_assignment(app, Some(account)).ok_or("no clone accounts")?;
+            let selection = crate::claude::normalize_selection(Some(account));
+            let ssh = app.config().proxmox.ssh;
+            let (group, email) = match assignment {
+                crate::claude::Assignment::None => {
+                    crate::claude::clear_clone_token(&ssh, ctid).await.map_err(|e| e.to_string())?;
+                    (None, None)
+                }
+                crate::claude::Assignment::Group { name, initial } => {
+                    crate::claude::apply_clone_token(&ssh, ctid, &initial.long_lived_token)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    (Some(name), Some(initial.email))
+                }
+                crate::claude::Assignment::Account(a) => {
+                    crate::claude::apply_clone_token(&ssh, ctid, &a.long_lived_token)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    (None, Some(a.email))
+                }
+            };
+            let (id, email_set, group_set, sel_set) =
+                (host.id.clone(), email.clone(), group.clone(), selection.clone());
             app.store.mutate(|s| {
                 if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
-                    h.claude_account_email = Some(email.clone());
+                    h.claude_account_email = email_set;
+                    h.claude_group = group_set;
+                    h.claude_selection = Some(sel_set);
                 }
             });
-            Ok(text(format!("swapped {clone} → {}", acct.email)))
+            Ok(text(match (&group, &email) {
+                (Some(g), Some(e)) => format!("swapped {clone} → {e} (group {g})"),
+                (None, Some(e)) => format!("swapped {clone} → {e}"),
+                _ => format!("swapped {clone} → none (no token)"),
+            }))
         }
         other => Err(format!("unknown tool '{other}'")),
     }

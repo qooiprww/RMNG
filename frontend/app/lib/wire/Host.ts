@@ -15,4 +15,17 @@ host: string,
 /**
  * Port (defaults to 3389 for the legacy RDP path).
  */
-port: number, username: string, password: string, domain: string | null, gdm_username: string | null, gdm_password: string | null, ctid: number | null, source: string | null, claudeAccountEmail: string | null, linearWorkspace: LinearWorkspace | null, linearTicket: string | null, linearTicketUrl: string | null, linearBranch: string | null, displayName: string | null, linearLabel: string | null, agentReport: AgentReport | null, stateNote: string | null, monitorState: MonitorState | null, };
+port: number, username: string, password: string, domain: string | null, gdm_username: string | null, gdm_password: string | null, ctid: number | null, source: string | null, claudeAccountEmail: string | null, 
+/**
+ * Name of the Claude group this clone rotates within; `None` when bound to a
+ * single fixed account. When set, `claude_account_email` holds the current pick.
+ */
+claudeGroup: string | null, 
+/**
+ * The operator's Claude *selection* verbatim: `"auto"`, `"none"`, `"group:<name>"`,
+ * or an account email. Distinguishes an auto-managed clone (server picks the best
+ * account and may hot-swap it) from one pinned to a fixed account or opted out of
+ * a token entirely — `claude_account_email` alone can't tell these apart. `None` on
+ * hosts created before this field / when no Claude account is configured.
+ */
+claudeSelection: string | null, linearWorkspace: LinearWorkspace | null, linearTicket: string | null, linearTicketUrl: string | null, linearBranch: string | null, displayName: string | null, linearLabel: string | null, agentReport: AgentReport | null, stateNote: string | null, monitorState: MonitorState | null, };

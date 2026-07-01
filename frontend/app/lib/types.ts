@@ -37,6 +37,15 @@ export interface Host {
    * panel this host is spending. Server-only; the Rust client ignores it.
    */
   claudeAccountEmail?: string;
+  /** Name of the Claude group this clone rotates within (null/absent = single account). */
+  claudeGroup?: string;
+  /**
+   * The operator's Claude selection verbatim: "auto" (server picks the best account
+   * and may hot-swap it), "none" (no token installed), "group:<name>", or an account
+   * email (pinned). Distinguishes auto from a fixed account — `claudeAccountEmail`
+   * alone can't. Absent on hosts created before this field / when Claude isn't used.
+   */
+  claudeSelection?: string;
   /** Linear workspace this host's ticket belongs to (selects the card color). */
   linearWorkspace?: "we" | "dev" | "hh" | "per";
   /** Linear ticket identifier, e.g. "WE-142". */

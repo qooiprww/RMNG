@@ -3,11 +3,14 @@
 # Executes a Claude credential op INSIDE the target clone CT as its user, printing
 # the raw result to stdout. Used by the control-server's token-import flow.
 #
-#   claude-import.sh <ctid> <user> status|read|clear
+#   claude-import.sh <ctid> <user> status|read|clear|apply [arg]
 #     status — `claude auth status` JSON (stderr merged so a missing/logged-out
 #              clone still produces a parseable message; never fails the script)
 #     read   — contents of the clone's ~/.claude/.credentials.json (fails if absent)
 #     clear  — delete that credentials file, then print CLEARED
+#     apply  — write ~/.claude/.credentials.json from base64 arg $4 (the full JSON,
+#              long-lived token as accessToken, refreshToken empty), print OK. Does
+#              NOT restart agent-wrapper — Claude Code re-reads creds at request time.
 set -euo pipefail
 CTID="$1"; USER="${2:-rmng}"; OP="$3"
 # Force bash with an explicit PATH rather than the user's login shell: clones default
@@ -19,5 +22,6 @@ case "$OP" in
   status) inct 'claude auth status' 2>&1 || true ;;
   read)   inct 'cat "$HOME/.claude/.credentials.json"' ;;
   clear)  inct 'rm -f "$HOME/.claude/.credentials.json"'; echo CLEARED ;;
+  apply)  B64="$4"; inct "umask 077; mkdir -p \"\$HOME/.claude\"; echo '$B64' | base64 -d > \"\$HOME/.claude/.credentials.json\"; chmod 600 \"\$HOME/.claude/.credentials.json\"; echo OK" ;;
   *)      echo "unknown op: $OP" >&2; exit 2 ;;
 esac

@@ -37,7 +37,7 @@ pub fn load() -> Result<AppConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wire::CloneAccount;
+    use wire::{CloneAccount, CloneGroup};
 
     #[test]
     fn merge_preserves_blank_secrets_and_applies_changes() {
@@ -61,6 +61,23 @@ mod tests {
         assert_eq!(merged.proxmox.hostname_prefix, "clone-"); // non-secret changed
         assert_eq!(merged.clone_accounts[0].long_lived_token, "LONG"); // blank kept
         assert_eq!(merged.clone_accounts[0].refresh_token, "NEWREF"); // changed
+    }
+
+    #[test]
+    fn merge_replaces_clone_groups_wholesale() {
+        // The editor always sends the full group list, so a plain array replace is right.
+        let mut base = AppConfig::default();
+        base.clone_groups = vec![CloneGroup { name: "old".into(), accounts: vec!["a@b".into()] }];
+        let incoming = serde_json::json!({
+            "cloneGroups": [{ "name": "team", "accounts": ["a@b", "c@d"] }],
+        });
+        let merged = merge_update(&base, incoming).unwrap();
+        assert_eq!(merged.clone_groups.len(), 1);
+        assert_eq!(merged.clone_groups[0].name, "team");
+        assert_eq!(merged.clone_groups[0].accounts, vec!["a@b".to_string(), "c@d".to_string()]);
+        // An empty array clears all groups.
+        let cleared = merge_update(&merged, serde_json::json!({ "cloneGroups": [] })).unwrap();
+        assert!(cleared.clone_groups.is_empty());
     }
 }
 

@@ -144,6 +144,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [monitors, setMonitors] = useState<Mon[]>([]);
   const [envPresets, setEnvPresets] =
     useState<{ name: string; vars: { key: string; value: string }[] }[]>([]);
+  const [claudeGroups, setClaudeGroups] = useState<{ name: string; accounts: string[] }[]>([]);
   const [template, setTemplate] = useState({ baseImage: "", cores: 4, memoryMb: 8192, diskGb: 40 });
   const [proxmoxSsh, setProxmoxSsh] = useState("");
   const [hostnamePrefix, setHostnamePrefix] = useState("");
@@ -177,6 +178,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     setDataDir(c.dataDir);
     setStaticDir(c.staticDir);
     setEnvPresets(c.envPresets.map((p) => ({ name: p.name, vars: p.vars.map((v) => ({ ...v })) })));
+    setClaudeGroups(c.cloneGroups.map((g) => ({ name: g.name, accounts: [...g.accounts] })));
   }
 
   useEffect(() => {
@@ -219,6 +221,25 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
       ),
     );
 
+  // Claude group editors (a group = a name + a set of member account emails).
+  const addGroup = () => setClaudeGroups((gs) => [...gs, { name: "", accounts: [] }]);
+  const rmGroup = (i: number) => setClaudeGroups((gs) => gs.filter((_, j) => j !== i));
+  const setGroupName = (i: number, name: string) =>
+    setClaudeGroups((gs) => gs.map((g, j) => (j === i ? { ...g, name } : g)));
+  const toggleGroupAccount = (i: number, email: string) =>
+    setClaudeGroups((gs) =>
+      gs.map((g, j) =>
+        j === i
+          ? {
+              ...g,
+              accounts: g.accounts.includes(email)
+                ? g.accounts.filter((e) => e !== email)
+                : [...g.accounts, email],
+            }
+          : g,
+      ),
+    );
+
   async function save() {
     setSaving(true);
     setError(null);
@@ -246,6 +267,9 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             name: p.name.trim(),
             vars: p.vars.filter((v) => v.key.trim()).map((v) => ({ key: v.key.trim(), value: v.value })),
           })),
+        cloneGroups: claudeGroups
+          .filter((g) => g.name.trim())
+          .map((g) => ({ name: g.name.trim(), accounts: [...new Set(g.accounts)] })),
       };
       const next = await putConfig(patch);
       load(next); // re-seed from the server's redacted view; clears write-only inputs
@@ -605,7 +629,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             {/* Clone accounts (read-only; managed via Import). */}
             <Section
               title="Clone Claude accounts"
-              hint="Imported from claude-swap (use Import in the sidebar). Tokens are write-only and never shown."
+              hint="Imported from a signed-in clone (use Import in the sidebar). Tokens are write-only and never shown."
             >
               {cfg.cloneAccounts.length === 0 ? (
                 <p className="text-xs text-slate-400">None imported.</p>
@@ -625,6 +649,62 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                   ))}
                 </ul>
               )}
+            </Section>
+
+            {/* Claude groups (named account pools; a group-bound clone rotates every 10 min). */}
+            <Section
+              title="Claude groups"
+              hint="A pool of accounts. A clone bound to a group rotates among its members every 10 minutes, skipping any over 90% 5h usage."
+            >
+              <div className="space-y-3">
+                {claudeGroups.length === 0 ? (
+                  <p className="text-xs text-slate-400">No groups.</p>
+                ) : null}
+                {claudeGroups.map((g, i) => (
+                  <div key={i} className="rounded border border-slate-200 p-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={g.name}
+                        onChange={(e) => setGroupName(i, e.target.value)}
+                        placeholder="group name"
+                        className={input}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => rmGroup(i)}
+                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    {cfg.cloneAccounts.length === 0 ? (
+                      <p className="mt-2 text-xs text-slate-400">
+                        Import some accounts first to add them to a group.
+                      </p>
+                    ) : (
+                      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
+                        {cfg.cloneAccounts.map((a) => (
+                          <label key={a.email} className="flex items-center gap-1.5 text-xs text-slate-600">
+                            <input
+                              type="checkbox"
+                              checked={g.accounts.includes(a.email)}
+                              onChange={() => toggleGroupAccount(i, a.email)}
+                            />
+                            {a.email}
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={addGroup}
+                  className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                >
+                  + Add group
+                </button>
+              </div>
             </Section>
 
             {/* Advanced (ports + dirs; need a full control-server restart). */}

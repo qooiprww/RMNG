@@ -71,6 +71,7 @@ pub fn router(app: App) -> Router {
         .route("/api/claude/refresh", post(claude_refresh))
         .route("/api/claude/recommended", get(claude_recommended))
         .route("/api/claude/swap", post(claude_swap))
+        .route("/api/claude/rotate", post(claude_rotate))
         .route("/api/chat/:id", get(chat_get).post(chat_send))
         .route("/api/chat/:id/events", get(chat_events))
         .route("/api/chat/:id/abort", post(chat_abort));
@@ -552,11 +553,13 @@ async fn claude_recommended(State(app): State<App>) -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct SwapReq {
     host: String,
-    /// Account email, or "auto".
+    /// Account email, `auto`, `none`, or `group:<name>`.
     account: String,
 }
 
-/// `POST /api/claude/swap` — hot-swap a running clone's Claude token.
+/// `POST /api/claude/swap` — change a clone's Claude account/group. `account` is an
+/// email, `auto`, `group:<name>`, or `none`. Binding to a group enrolls the clone in
+/// rotation; `none` removes the clone's credentials so it runs with no token.
 async fn claude_swap(
     State(app): State<App>,
     Json(req): Json<SwapReq>,
@@ -568,18 +571,50 @@ async fn claude_swap(
         .into_iter()
         .find(|h| h.id == req.host)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
-    let account = crate::claude::resolve_clone_account(&app, Some(&req.account))
+    let ctid = host
+        .ctid
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{}' has no container", host.id)))?;
+    let assignment = crate::claude::resolve_assignment(&app, Some(&req.account))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "no clone accounts configured".into()))?;
-    crate::claude::apply_clone_token(&host, &account.long_lived_token)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let (id, email) = (host.id.clone(), account.email.clone());
+    let selection = crate::claude::normalize_selection(Some(&req.account));
+    let ssh = app.config().proxmox.ssh;
+    let (group, email) = match assignment {
+        crate::claude::Assignment::None => {
+            crate::claude::clear_clone_token(&ssh, ctid)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            (None, None)
+        }
+        crate::claude::Assignment::Group { name, initial } => {
+            crate::claude::apply_clone_token(&ssh, ctid, &initial.long_lived_token)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            (Some(name), Some(initial.email))
+        }
+        crate::claude::Assignment::Account(a) => {
+            crate::claude::apply_clone_token(&ssh, ctid, &a.long_lived_token)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            (None, Some(a.email))
+        }
+    };
+    let (id, email_set, group_set, sel_set) =
+        (host.id.clone(), email.clone(), group.clone(), selection.clone());
     app.store.mutate(|s| {
         if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
-            h.claude_account_email = Some(email);
+            h.claude_account_email = email_set;
+            h.claude_group = group_set;
+            h.claude_selection = Some(sel_set);
         }
     });
-    Ok(Json(json!({ "ok": true, "account": account.email })))
+    Ok(Json(json!({ "ok": true, "account": email, "group": group, "selection": selection })))
+}
+
+/// `POST /api/claude/rotate` — run one group-rotation pass immediately (the rotator
+/// otherwise runs every 10 min). Useful for ops + testing.
+async fn claude_rotate(State(app): State<App>) -> Json<serde_json::Value> {
+    crate::claude::rotate_once(&app).await;
+    Json(json!({ "ok": true }))
 }
 
 // --- per-host chat ---------------------------------------------------------

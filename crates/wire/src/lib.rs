@@ -24,8 +24,8 @@ pub mod socket;
 pub mod viewer;
 
 pub use config::{
-    AppConfig, AppConfigRedacted, ChromaMode, ClaudeConfig, CloneAccount, EnvPreset, EnvVar,
-    ListenConfig, LinearConfig, ProxmoxConfig, TemplateConfig,
+    AppConfig, AppConfigRedacted, ChromaMode, ClaudeConfig, CloneAccount, CloneGroup, EnvPreset,
+    EnvVar, ListenConfig, LinearConfig, ProxmoxConfig, TemplateConfig,
 };
 pub use control::{
     AgentReport, Chat, ChatMessage, ChatRole, ClaudeSpend, ClaudeUsage, ClaudeUsageWindow,

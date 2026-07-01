@@ -101,6 +101,19 @@ pub struct CloneAccount {
     pub refresh_token: String,
 }
 
+/// A named pool of clone accounts (by email). A clone bound to a group has its
+/// account rotated among the group's members every cycle (by 5h usage). Carries no
+/// secrets — just a name + member emails — so it's TS-exported and shown verbatim in
+/// the redacted config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct CloneGroup {
+    pub name: String,
+    #[serde(default)]
+    pub accounts: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxmoxConfig {
@@ -214,6 +227,10 @@ pub struct AppConfig {
     pub claude: ClaudeConfig,
     #[serde(default)]
     pub clone_accounts: Vec<CloneAccount>,
+    /// Named account pools a clone can be bound to for rotation (members are
+    /// `clone_accounts` emails).
+    #[serde(default)]
+    pub clone_groups: Vec<CloneGroup>,
     #[serde(default)]
     pub template: TemplateConfig,
     /// Named environment-variable presets the operator picks from at clone time.
@@ -237,6 +254,7 @@ impl Default for AppConfig {
             linear: LinearConfig::default(),
             claude: ClaudeConfig::default(),
             clone_accounts: Vec::new(),
+            clone_groups: Vec::new(),
             template: TemplateConfig::default(),
             env_presets: Vec::new(),
             chroma: ChromaMode::default(),
@@ -294,6 +312,7 @@ impl AppConfig {
                     refresh_token_set: !a.refresh_token.is_empty(),
                 })
                 .collect(),
+            clone_groups: self.clone_groups.clone(),
             template: self.template.clone(),
             env_presets: self.env_presets.clone(),
             chroma: self.chroma,
@@ -336,6 +355,7 @@ pub struct AppConfigRedacted {
     pub linear_keys_set: LinearKeysSet,
     pub claude: ClaudeConfig,
     pub clone_accounts: Vec<CloneAccountRedacted>,
+    pub clone_groups: Vec<CloneGroup>,
     pub template: TemplateConfig,
     pub env_presets: Vec<EnvPreset>,
     pub chroma: ChromaMode,

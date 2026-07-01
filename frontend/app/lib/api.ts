@@ -24,8 +24,8 @@ async function getJson(url: string): Promise<unknown> {
 /** Clone payload: an existing ticket link/id, a new ticket to create, or a plain
  *  no-ticket clone (just a container title + an optional first agent message).
  *  The ticket modes also accept optional host-agent + Claude Code overrides.
- *  `claudeAccount` (all modes) picks the Claude account to run under — an email
- *  or "auto" (the default when omitted). */
+ *  `claudeAccount` (all modes) picks the Claude account to run under — an email,
+ *  "auto" (the default when omitted), "group:<name>", or "none" (install no token). */
 export type ClonePayload = (
   | ((
       | { ticket: string }
@@ -40,6 +40,19 @@ export const reorder = (order: string[]) => postJson("/api/reorder", { order });
 export const cloneHost = (source: string, payload: ClonePayload) =>
   postJson("/api/clone", { source, ...payload });
 export const deleteHost = (id: string) => postJson("/api/delete", { id });
+/** Provision a brand-new template CT from the configured base image. Its
+ *  cores/memory/disk/base image come from Settings → "Clone container"; the new
+ *  CT is registered as a clonable template. Progress streams over /events like a
+ *  clone. (Bootstrap errors are plain text, so read the body as text on failure.) */
+export async function bootstrapTemplate(hostname: string): Promise<{ id: string }> {
+  const res = await fetch("/api/template/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hostname }),
+  });
+  if (!res.ok) throw new Error((await res.text().catch(() => "")) || res.statusText);
+  return res.json().catch(() => ({})) as Promise<{ id: string }>;
+}
 /** Hot-swap a clone's clone-daemon (+ agent-wrapper unless daemonOnly) binaries from the
  *  control-server's embedded copies, without reprovisioning. Restarts the unit(s). */
 export const redeployClone = (id: string, daemonOnly = false) =>
@@ -61,6 +74,15 @@ export const importClaudeToken = (host: string, token: string) =>
 /** The account the clone dialog should pre-select (scored by usage + load). */
 export const recommendedClaudeAccount = () =>
   getJson("/api/claude/recommended") as Promise<{ email: string | null }>;
+/** Change a clone's Claude account/group. `account` is "auto", "none", an email, or
+ *  "group:<name>". `account` in the reply is null when set to "none". */
+export const swapClaudeAccount = (host: string, account: string) =>
+  postJson("/api/claude/swap", { host, account }) as Promise<{
+    ok: boolean;
+    account: string | null;
+    group: string | null;
+    selection: string;
+  }>;
 
 // --- Settings / config (redacted read · partial write · validate) ----------
 // Config errors come back as plain text (not the {error} JSON shape), so PUT

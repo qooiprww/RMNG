@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use wire::{ClaudeSpend, ClaudeUsage, ClaudeUsageWindow, CloneAccount, Host};
+use wire::{ClaudeSpend, ClaudeUsage, ClaudeUsageWindow, CloneAccount, CloneGroup, Host};
 
 use crate::app::App;
 
@@ -41,7 +41,10 @@ const STAGGER: Duration = Duration::from_millis(400);
 // scoring knobs (clone-accounts.server.ts)
 const SESSION_HEADROOM_PCT: f64 = 40.0;
 const SEVEN_DAY_CAP_PCT: f64 = 95.0;
-const APPLY_CREDENTIALS_SCRIPT: &str = include_str!("../scripts/apply-credentials.sh");
+/// 5h utilization at/above which an account is filtered out of group rotation.
+const ROTATE_MAX_FIVE_HOUR_PCT: f64 = 90.0;
+/// How often group-bound clones are re-balanced across their group's accounts.
+const ROTATE_SECS: u64 = 600;
 const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
 /// The user every clone runs Claude Code (and everything else) as.
 const CLONE_USER: &str = "rmng";
@@ -184,14 +187,19 @@ fn extract_json(s: &str) -> &str {
     }
 }
 
-/// Run one [`claude-import.sh`] op (`status`|`read`|`clear`) inside clone `ctid` via
-/// the Proxmox node, returning its raw stdout. `status` never fails (stderr merged in);
-/// `read`/`clear` surface a non-zero exit as an error.
-async fn run_clone_op(ssh_target: &str, ctid: u32, op: &str) -> Result<String> {
+/// Run one [`claude-import.sh`] op (`status`|`read`|`clear`|`apply`) inside clone
+/// `ctid` via the Proxmox node, returning its raw stdout. `extra` are extra positional
+/// args (e.g. the base64 credentials for `apply`). `status` never fails (stderr merged
+/// in); the others surface a non-zero exit as an error.
+async fn run_clone_op(ssh_target: &str, ctid: u32, op: &str, extra: &[&str]) -> Result<String> {
     if ssh_target.is_empty() {
         bail!("proxmox.ssh is not set; cannot reach the node to run a clone command");
     }
-    let remote = format!("bash -s -- {} {} {}", ctid, sq(CLONE_USER), sq(op));
+    let mut remote = format!("bash -s -- {} {} {}", ctid, sq(CLONE_USER), sq(op));
+    for a in extra {
+        remote.push(' ');
+        remote.push_str(&sq(a));
+    }
     let mut child = tokio::process::Command::new("ssh")
         .args([
             "-o", "BatchMode=yes",
@@ -221,7 +229,7 @@ pub async fn check_clone_auth(app: &App, host: &Host) -> Result<AuthStatus> {
     let ctid = host
         .ctid
         .with_context(|| format!("host '{}' has no container; only clones can be imported", host.id))?;
-    let raw = run_clone_op(&app.config().proxmox.ssh, ctid, "status").await?;
+    let raw = run_clone_op(&app.config().proxmox.ssh, ctid, "status", &[]).await?;
     let status: AuthStatus = serde_json::from_str(extract_json(&raw)).map_err(|_| {
         anyhow::anyhow!(
             "couldn't read `claude auth status` on '{}' — is Claude Code installed and the clone running? (got: {})",
@@ -264,7 +272,7 @@ pub async fn import_clone_token(app: &App, host: &Host, long_lived_token: &str) 
     let org_uuid = status.org_id.clone().unwrap_or_default();
 
     // 2. Read the short-lived OAuth pair straight off the clone's disk.
-    let raw = run_clone_op(&ssh, ctid, "read")
+    let raw = run_clone_op(&ssh, ctid, "read", &[])
         .await
         .with_context(|| format!("reading '{}' Claude credentials", host.id))?;
     let oauth = serde_json::from_str::<ClaudeCreds>(extract_json(&raw))
@@ -317,7 +325,7 @@ pub async fn import_clone_token(app: &App, host: &Host, long_lived_token: &str) 
 
     // 4. Clear the clone's credentials so its Claude Code can't rotate the refresh
     //    token we just took ownership of. Best-effort: the account is already stored.
-    let cleared = match run_clone_op(&ssh, ctid, "clear").await {
+    let cleared = match run_clone_op(&ssh, ctid, "clear", &[]).await {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!("import: clearing '{}' credentials failed: {e}", host.id);
@@ -583,6 +591,15 @@ async fn poll_inner(app: &App) -> Result<bool> {
 // --- scoring + assignment (clone-accounts.server.ts) ----------------------
 
 const AUTO: &str = "auto";
+/// Selection sentinel: install no token at all (leave the clone tokenless).
+const NONE: &str = "none";
+
+/// Canonicalize a raw account-selection string into its stored form: `"auto"`,
+/// `"none"`, `"group:<name>"`, or an account email. Missing/blank → `"auto"`.
+pub fn normalize_selection(requested: Option<&str>) -> String {
+    let want = requested.unwrap_or("").trim();
+    if want.is_empty() { AUTO.to_string() } else { want.to_string() }
+}
 
 struct Scored {
     account: CloneAccount,
@@ -659,31 +676,236 @@ pub fn resolve_clone_account(app: &App, requested: Option<&str>) -> Option<Clone
     best_scored(app)
 }
 
-/// Install a long-lived token into a clone's `~/.claude/.credentials.json` over
-/// SSH (hot-swaps a running clone). Best-effort; errors are returned to log.
-pub async fn apply_clone_token(host: &Host, token: &str) -> Result<()> {
-    let target = format!("{}@{}", host.username, host.host);
-    let remote = format!("bash -s -- '{}'", token.replace('\'', r"'\''"));
-    let mut child = tokio::process::Command::new("ssh")
-        .args([
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=15",
-            &target, &remote,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    use tokio::io::AsyncWriteExt;
-    child.stdin.take().unwrap().write_all(APPLY_CREDENTIALS_SCRIPT.as_bytes()).await?;
-    let out = child.wait_with_output().await?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if out.status.success() && stdout.contains("OK") {
+// --- groups: selection + rotation -----------------------------------------
+
+/// What a clone is bound to. `Group` carries the initial pick to apply right away;
+/// `None` means the operator explicitly opted out of a token (leave the clone tokenless).
+pub enum Assignment {
+    Account(CloneAccount),
+    Group { name: String, initial: CloneAccount },
+    None,
+}
+
+/// Resolve a selection string to an [`Assignment`]: `none` → no token, `group:<name>` →
+/// a group (with an initial account picked from it), else an email / `auto` → a single
+/// account. Outer `None` if nothing usable is configured for an account/group pick.
+pub fn resolve_assignment(app: &App, requested: Option<&str>) -> Option<Assignment> {
+    let want = requested.unwrap_or("").trim();
+    if want.eq_ignore_ascii_case(NONE) {
+        return Some(Assignment::None);
+    }
+    if let Some(name) = want.strip_prefix("group:") {
+        let name = name.trim();
+        let initial = pick_group_account(app, name, None)?;
+        return Some(Assignment::Group { name: name.to_string(), initial });
+    }
+    resolve_clone_account(app, requested).map(Assignment::Account)
+}
+
+/// Non-cryptographic randomness from `/dev/urandom` (mirrors `files::rand_hex`),
+/// enough to shuffle/tiebreak rotation; falls back to the clock.
+fn rand_u64() -> u64 {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok() {
+        u64::from_le_bytes(buf)
+    } else {
+        now_ms() as u64
+    }
+}
+
+/// In-place Fisher–Yates shuffle.
+fn shuffle<T>(v: &mut [T]) {
+    for i in (1..v.len()).rev() {
+        let j = (rand_u64() % (i as u64 + 1)) as usize;
+        v.swap(i, j);
+    }
+}
+
+/// How many clones each account email is currently assigned to.
+fn clone_counts(app: &App) -> HashMap<String, u32> {
+    let mut m = HashMap::new();
+    for h in &app.store.get().hosts {
+        if let Some(e) = &h.claude_account_email {
+            *m.entry(e.clone()).or_insert(0) += 1;
+        }
+    }
+    m
+}
+
+/// The 5h utilization for `email` from the latest usage view (0 if unknown).
+fn five_hour_pct(app: &App, email: &str) -> f64 {
+    app.store
+        .get()
+        .claude_accounts
+        .iter()
+        .find(|u| u.email == email)
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| w.pct)
+        .unwrap_or(0.0)
+}
+
+/// Group members that have a long-lived token (exist in `clone_accounts`) and 5h usage
+/// at/below the rotation cap. Missing usage counts as eligible.
+fn eligible_group_accounts(app: &App, group: &CloneGroup) -> Vec<CloneAccount> {
+    let cfg = app.config();
+    group
+        .accounts
+        .iter()
+        .filter_map(|email| cfg.clone_accounts.iter().find(|a| &a.email == email).cloned())
+        .filter(|a| five_hour_pct(app, &a.email) <= ROTATE_MAX_FIVE_HOUR_PCT)
+        .collect()
+}
+
+/// Pick one account from group `group_name` for an initial assignment: among eligible
+/// members (or any member if none are eligible), least-loaded and preferring `!= exclude`,
+/// random tiebreak. `None` if the group is empty / has no configured members.
+fn pick_group_account(app: &App, group_name: &str, exclude: Option<&str>) -> Option<CloneAccount> {
+    let cfg = app.config();
+    let group = cfg.clone_groups.iter().find(|g| g.name == group_name)?;
+    let counts = clone_counts(app);
+    let mut pool = eligible_group_accounts(app, group);
+    if pool.is_empty() {
+        // All over the cap → still need a valid token; fall back to any member.
+        pool = group
+            .accounts
+            .iter()
+            .filter_map(|e| cfg.clone_accounts.iter().find(|a| &a.email == e).cloned())
+            .collect();
+    }
+    shuffle(&mut pool); // randomize ties
+    pool.into_iter().min_by_key(|a| {
+        let load = *counts.get(&a.email).unwrap_or(&0);
+        let same = u32::from(Some(a.email.as_str()) == exclude);
+        (load, same)
+    })
+}
+
+/// Randomized greedy assignment of `clones` to `eligible` accounts, returning
+/// `(clone, account)` pairs. Rules (best-effort): (a) every clone gets a group
+/// account [guaranteed]; (b) spread across distinct accounts [primary `used` term];
+/// (c) prefer an account different from the clone's current one [secondary term].
+fn assign_rotation(clones: &[Host], eligible: &[CloneAccount]) -> Vec<(Host, CloneAccount)> {
+    let mut order: Vec<usize> = (0..clones.len()).collect();
+    shuffle(&mut order);
+    let mut used: HashMap<String, u32> = HashMap::new();
+    let mut out: Vec<(Host, CloneAccount)> = Vec::with_capacity(clones.len());
+    for &i in &order {
+        let prev = clones[i].claude_account_email.clone();
+        let pick = eligible
+            .iter()
+            .min_by_key(|a| {
+                let u = *used.get(&a.email).unwrap_or(&0);
+                let same = u32::from(Some(&a.email) == prev.as_ref());
+                (u, same, rand_u64() as u32)
+            })
+            .expect("eligible is non-empty")
+            .clone();
+        *used.entry(pick.email.clone()).or_insert(0) += 1;
+        out.push((clones[i].clone(), pick));
+    }
+    out
+}
+
+/// One rotation pass: for each group with bound clones, re-balance them across the
+/// group's eligible accounts and write the new credentials (no agent-wrapper restart).
+pub async fn rotate_once(app: &App) {
+    let cfg = app.config();
+    if cfg.clone_groups.is_empty() {
+        return;
+    }
+    // group name -> its bound clones (with a container)
+    let mut by_group: HashMap<String, Vec<Host>> = HashMap::new();
+    for h in &app.store.get().hosts {
+        if let (Some(g), Some(_)) = (&h.claude_group, h.ctid) {
+            by_group.entry(g.clone()).or_default().push(h.clone());
+        }
+    }
+    let ssh = cfg.proxmox.ssh.clone();
+    for (gname, clones) in by_group {
+        let Some(group) = cfg.clone_groups.iter().find(|g| g.name == gname) else {
+            continue; // group deleted → leave its clones on their current account
+        };
+        let eligible = eligible_group_accounts(app, group);
+        if eligible.is_empty() {
+            tracing::info!(
+                "rotate: group '{gname}' has no account <= {ROTATE_MAX_FIVE_HOUR_PCT}% 5h; leaving {} clone(s)",
+                clones.len()
+            );
+            continue;
+        }
+        for (host, acct) in assign_rotation(&clones, &eligible) {
+            if host.claude_account_email.as_deref() == Some(acct.email.as_str()) {
+                continue; // unchanged → no rewrite
+            }
+            let ctid = host.ctid.expect("filtered to Some(ctid)");
+            match apply_clone_token(&ssh, ctid, &acct.long_lived_token).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "rotate: {} {} -> {}",
+                        host.id,
+                        host.claude_account_email.as_deref().unwrap_or("none"),
+                        acct.email
+                    );
+                    let (id, email) = (host.id.clone(), acct.email.clone());
+                    app.store.mutate(|s| {
+                        if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
+                            h.claude_account_email = Some(email);
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!("rotate: applying {} to {} failed: {e}", acct.email, host.id),
+            }
+            tokio::time::sleep(STAGGER).await; // gentle on the node
+        }
+    }
+}
+
+/// Self-scheduling 10-minute group-rotation loop.
+pub async fn run_rotator(app: App) {
+    // Let the usage poller publish 5h numbers before the first rotation.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    loop {
+        rotate_once(&app).await;
+        tokio::time::sleep(Duration::from_secs(ROTATE_SECS)).await;
+    }
+}
+
+/// The `~/.claude/.credentials.json` body that runs Claude Code under `token`: the
+/// long-lived token goes where the access token lives and the refresh token is left
+/// **empty** so the SDK never rotates (and thus never invalidates) it.
+fn credentials_json(token: &str) -> String {
+    format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"{token}","refreshToken":"","expiresAt":4102444800000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}}}"#
+    )
+}
+
+/// Install a long-lived token into clone `ctid`'s `~/.claude/.credentials.json` via the
+/// Proxmox node (`pct exec`, fish-proof). Hot-swaps a running clone with **no**
+/// agent-wrapper restart — Claude Code re-reads the file at request time. Best-effort;
+/// errors are returned to log.
+pub async fn apply_clone_token(ssh_target: &str, ctid: u32, token: &str) -> Result<()> {
+    let token = token.trim();
+    if !token.starts_with("sk-ant-") {
+        bail!("refusing to apply a non-`sk-ant-` token");
+    }
+    let b64 = crate::orchestrate::b64_encode(credentials_json(token).as_bytes());
+    let out = run_clone_op(ssh_target, ctid, "apply", &[&b64]).await?;
+    if out.contains("OK") {
         Ok(())
     } else {
-        let tail = String::from_utf8_lossy(&out.stderr);
-        bail!("token apply failed (exit {:?}): {}", out.status.code(), tail.trim());
+        bail!("token apply produced unexpected output: {}", out.trim());
+    }
+}
+
+/// Remove clone `ctid`'s `~/.claude/.credentials.json` via the Proxmox node, leaving it
+/// with no Claude token. Used when a clone's account is set to "none" (unassigned).
+pub async fn clear_clone_token(ssh_target: &str, ctid: u32) -> Result<()> {
+    let out = run_clone_op(ssh_target, ctid, "clear", &[]).await?;
+    if out.contains("CLEARED") {
+        Ok(())
+    } else {
+        bail!("token clear produced unexpected output: {}", out.trim());
     }
 }
 
@@ -699,7 +921,13 @@ async fn auto_swap_exhausted(app: &App) {
             (100.0 - five) < SESSION_HEADROOM_PCT || seven >= SEVEN_DAY_CAP_PCT
         })
     };
+    let ssh = app.config().proxmox.ssh;
     for host in &st.hosts {
+        // Group-bound clones are handled by the rotator, not exhaustion-swap.
+        if host.claude_group.is_some() {
+            continue;
+        }
+        let Some(ctid) = host.ctid else { continue };
         let Some(cur) = &host.claude_account_email else { continue };
         if !exhausted(cur) {
             continue;
@@ -708,7 +936,7 @@ async fn auto_swap_exhausted(app: &App) {
         if &next.email == cur || exhausted(&next.email) {
             continue; // no better option
         }
-        match apply_clone_token(host, &next.long_lived_token).await {
+        match apply_clone_token(&ssh, ctid, &next.long_lived_token).await {
             Ok(()) => {
                 tracing::info!("auto-swapped {} from {cur} to {}", host.id, next.email);
                 let id = host.id.clone();
@@ -816,5 +1044,70 @@ mod tests {
         assert!(s.logged_in);
         // No JSON at all → falls back to the trimmed input (which then fails to parse).
         assert_eq!(extract_json("  claude: command not found  "), "claude: command not found");
+    }
+
+    // --- groups: rotation assignment ---------------------------------------
+
+    fn acct(email: &str) -> CloneAccount {
+        CloneAccount { email: email.into(), long_lived_token: format!("sk-ant-oat01-{email}"), refresh_token: String::new() }
+    }
+    fn clone_host(id: &str, cur: Option<&str>) -> Host {
+        Host { id: id.into(), ctid: Some(1), claude_account_email: cur.map(str::to_string), ..Default::default() }
+    }
+
+    #[test]
+    fn credentials_json_uses_long_lived_token_with_empty_refresh() {
+        let j = credentials_json("sk-ant-oat01-XYZ");
+        assert!(j.contains(r#""accessToken":"sk-ant-oat01-XYZ""#));
+        assert!(j.contains(r#""refreshToken":"""#));
+        // parses as the same shape Claude Code writes
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["claudeAiOauth"]["accessToken"], "sk-ant-oat01-XYZ");
+        assert_eq!(v["claudeAiOauth"]["refreshToken"], "");
+    }
+
+    #[test]
+    fn assignment_rule_a_only_group_accounts() {
+        // Every clone is assigned an account from the eligible set, never outside it.
+        let eligible = [acct("a@x"), acct("b@x")];
+        let clones = [clone_host("c1", Some("z@outside")), clone_host("c2", None)];
+        for (_h, picked) in assign_rotation(&clones, &eligible) {
+            assert!(eligible.iter().any(|e| e.email == picked.email), "{} not in group", picked.email);
+        }
+    }
+
+    #[test]
+    fn assignment_rule_b_distinct_when_enough_accounts() {
+        // |eligible| >= |clones| ⇒ all clones land on distinct accounts (run repeatedly:
+        // randomized, but the spread term forces distinctness here).
+        let eligible = [acct("a@x"), acct("b@x"), acct("c@x")];
+        let clones = [clone_host("c1", None), clone_host("c2", None), clone_host("c3", None)];
+        for _ in 0..50 {
+            let got = assign_rotation(&clones, &eligible);
+            let mut emails: Vec<_> = got.iter().map(|(_, a)| a.email.clone()).collect();
+            emails.sort();
+            emails.dedup();
+            assert_eq!(emails.len(), 3, "expected 3 distinct accounts, got {emails:?}");
+        }
+    }
+
+    #[test]
+    fn assignment_rule_c_prefers_a_different_account() {
+        // One clone on A, two eligible {A,B} ⇒ always rotates to B (different from prev).
+        let eligible = [acct("a@x"), acct("b@x")];
+        let clones = [clone_host("c1", Some("a@x"))];
+        for _ in 0..50 {
+            let got = assign_rotation(&clones, &eligible);
+            assert_eq!(got[0].1.email, "b@x");
+        }
+    }
+
+    #[test]
+    fn assignment_degrades_with_single_eligible() {
+        // Only one usable account ⇒ all clones get it even though (b)/(c) can't hold.
+        let eligible = [acct("only@x")];
+        let clones = [clone_host("c1", Some("only@x")), clone_host("c2", Some("old@x"))];
+        let got = assign_rotation(&clones, &eligible);
+        assert!(got.iter().all(|(_, a)| a.email == "only@x"));
     }
 }

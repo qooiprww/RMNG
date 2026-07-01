@@ -39,7 +39,8 @@ JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}` with
 | POST | `/api/claude/import` | Import a Claude account from a signed-in clone | 200 `{ok,email,cleared}` |
 | POST | `/api/claude/refresh` | Force one usage poll now | 200 `{ok,rateLimited}` |
 | GET | `/api/claude/recommended` | Recommended account for a new clone | 200 `{email}` |
-| POST | `/api/claude/swap` | Hot-swap a clone's Claude account | 200 `{ok,account}` |
+| POST | `/api/claude/swap` | Change a clone's Claude account/group (email/`auto`/`group:<name>`/`none`) | 200 `{ok,account,group,selection}` |
+| POST | `/api/claude/rotate` | Run one group-rotation pass now | 200 `{ok}` |
 | GET | `/api/chat/:id` | Chat snapshot for a host | 200 `ChatSnapshot` |
 | POST | `/api/chat/:id` | Send a message to the host's agent | 202 |
 | GET | `/api/chat/:id/events` | Per-host chat SSE | 200 SSE `ChatSnapshot` |
@@ -104,7 +105,7 @@ Body (one of three task modes + optional account/instructions):
   "create": { "workspace": "dev", "title": "...", "description": "..." }, // new ticket, OR
   "plain":  { "title": "quick task", "message": "do X" },                 // no ticket
   // -- optional --
-  "claudeAccount": "user@anthropic.com" | "auto",
+  "claudeAccount": "user@anthropic.com" | "auto" | "group:<name>" | "none",
   "agentInstructions": "...",       // extra context for the agent-wrapper
   "claudeInstructions": "..."       // extra instructions for Claude Code
 }
@@ -186,7 +187,8 @@ Synchronously test a setting. Currently only `"proxmox"` (runs `ssh -o BatchMode
 | `POST /api/claude/import` | `{host, token}` | `{ok, email, cleared}` | Store the operator's long-lived `token` + the clone's short-lived OAuth pair (read off its disk), then delete the clone's credentials file |
 | `POST /api/claude/refresh` | — | `{ok, rateLimited}` | Force one usage poll; `rateLimited` if any account hit 429 |
 | `GET /api/claude/recommended` | — | `{email}` | Pinned account, else lowest-usage; `null` if none |
-| `POST /api/claude/swap` | `{host, account}` | `{ok, account}` | Resolve `account` (email/`auto`) and write the clone's `~/.claude/.credentials.json` to hot-swap a running clone (`502` if unreachable) |
+| `POST /api/claude/swap` | `{host, account}` | `{ok, account, group, selection}` | Resolve `account` (email / `auto` / `group:<name>` / `none`) and write the clone's `~/.claude/.credentials.json` via the Proxmox node. A `group:` selection binds the clone to that group for rotation; `none` removes the credentials file (`account` null); the verbatim choice is echoed as `selection` and stored on the host (`502` if unreachable) |
+| `POST /api/claude/rotate` | — | `{ok}` | Run one group-rotation pass immediately (the rotator otherwise runs every 10 min): re-balance each group's bound clones across its members with 5h usage ≤ 90% |
 
 The two-token model (short-lived+refresh for usage polling; long-lived for running Claude
 Code) is described in [PROTOCOL.md](PROTOCOL.md#cloneaccount).

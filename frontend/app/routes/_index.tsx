@@ -15,21 +15,25 @@ import {
 } from "@dnd-kit/sortable";
 import { lazy, Suspense, useEffect, useState } from "react";
 
+import { ChangeAccountModal } from "~/components/ChangeAccountModal";
 import { ClaudeAccountsPanel } from "~/components/ClaudeAccountsPanel";
 import { CloneModal } from "~/components/CloneModal";
 import { ImportTokenModal } from "~/components/ImportTokenModal";
+import { NewTemplateModal } from "~/components/NewTemplateModal";
 import { OperationProgress } from "~/components/OperationProgress";
 import { SettingsPanel } from "~/components/SettingsPanel";
 import { SidebarHost } from "~/components/SidebarHost";
 import {
   activate,
+  bootstrapTemplate,
   cloneHost,
   deleteHost,
   redeployClone,
   refreshClaudeUsage,
   reorder,
+  swapClaudeAccount,
 } from "~/lib/api";
-import { type ControlState, emptyState } from "~/lib/types";
+import { type ControlState, type Host, emptyState } from "~/lib/types";
 
 import type { Route } from "./+types/_index";
 
@@ -77,6 +81,10 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
   const [cloneSource, setCloneSource] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [newTemplateOpen, setNewTemplateOpen] = useState(false);
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const [changeHost, setChangeHost] = useState<Host | null>(null);
+  const [changing, setChanging] = useState(false);
   // Responsive state. Below `lg` the sidebar is an off-canvas drawer; below `xl`
   // the notes editor and agent chat share the main pane via this tab toggle.
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -237,9 +245,19 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
           />
 
           <div>
-            <h2 className="mb-1 px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-              Hosts ({orderedHosts.length})
-            </h2>
+            <div className="mb-1 flex items-center justify-between px-1">
+              <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                Hosts ({orderedHosts.length})
+              </h2>
+              <button
+                type="button"
+                onClick={() => setNewTemplateOpen(true)}
+                title="Provision a new template container from the configured base image"
+                className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600"
+              >
+                + Template
+              </button>
+            </div>
             {orderedHosts.length === 0 ? (
               <p className="rounded-lg border border-dashed border-slate-300 bg-white p-4 text-center text-xs text-slate-400">
                 No hosts yet.
@@ -280,6 +298,7 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
                           )
                             run(redeployClone(host.id));
                         }}
+                        onChangeAccount={() => setChangeHost(host)}
                       />
                     ))}
                   </div>
@@ -377,6 +396,24 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
 
       {settingsOpen ? <SettingsPanel onClose={() => setSettingsOpen(false)} /> : null}
 
+      {newTemplateOpen ? (
+        <NewTemplateModal
+          busy={bootstrapping}
+          existing={new Set(state.hosts.map((h) => h.id))}
+          onClose={() => setNewTemplateOpen(false)}
+          onCreate={(hostname) => {
+            setBootstrapping(true);
+            bootstrapTemplate(hostname)
+              .then(() => setError(null))
+              .catch((e: Error) => setError(e.message))
+              .finally(() => {
+                setBootstrapping(false);
+                setNewTemplateOpen(false);
+              });
+          }}
+        />
+      ) : null}
+
       {importOpen ? (
         <ImportTokenModal
           hosts={state.hosts}
@@ -384,6 +421,27 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
           onImported={() => {
             setImportOpen(false);
             run(refreshClaudeUsage());
+          }}
+        />
+      ) : null}
+
+      {changeHost ? (
+        <ChangeAccountModal
+          host={changeHost}
+          accounts={(state.claudeAccounts ?? []).filter(
+            (a) => a.assignable && a.provider !== "codex",
+          )}
+          busy={changing}
+          onClose={() => setChangeHost(null)}
+          onSubmit={(value) => {
+            setChanging(true);
+            swapClaudeAccount(changeHost.id, value)
+              .then(() => setError(null))
+              .catch((e: Error) => setError(e.message))
+              .finally(() => {
+                setChanging(false);
+                setChangeHost(null);
+              });
           }}
         />
       ) : null}

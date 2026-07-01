@@ -107,6 +107,17 @@ pub struct Host {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_account_email: Option<String>,
+    /// Name of the Claude group this clone rotates within; `None` when bound to a
+    /// single fixed account. When set, `claude_account_email` holds the current pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_group: Option<String>,
+    /// The operator's Claude *selection* verbatim: `"auto"`, `"none"`, `"group:<name>"`,
+    /// or an account email. Distinguishes an auto-managed clone (server picks the best
+    /// account and may hot-swap it) from one pinned to a fixed account or opted out of
+    /// a token entirely — `claude_account_email` alone can't tell these apart. `None` on
+    /// hosts created before this field / when no Claude account is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_selection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_workspace: Option<LinearWorkspace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

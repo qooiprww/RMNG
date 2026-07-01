@@ -131,6 +131,7 @@ returns `AppConfigRedacted` (secrets → `*_set: bool`). Source: [config.rs](../
 | `linear` | `LinearConfig` | — | per-workspace API keys (**secret**) |
 | `claude` | `ClaudeConfig` | — | usage polling config |
 | `clone_accounts` | `CloneAccount[]` | `[]` | Claude accounts for clones (**secret tokens**) |
+| `clone_groups` | `CloneGroup[]` | `[]` | named account pools for rotation (not secret) |
 | `template` | `TemplateConfig` | — | golden-template build params |
 
 - **`ListenConfig`**: `web 9000`, `video 9001`, `clone_mcp 9002`, `global_mcp 9003`,
@@ -146,7 +147,10 @@ returns `AppConfigRedacted` (secrets → `*_set: bool`). Source: [config.rs](../
   clone's `~/.claude/.credentials.json` as the token that *runs* Claude Code — **secret**),
   `refresh_token` (short-lived+refresh, used server-side **only to poll 5h/7d usage** —
   **secret**). Writing the long-lived token with the refresh emptied lets a *running* clone be
-  hot-swapped without restart.
+  hot-swapped without restart (written via the Proxmox node's `pct exec`, no agent-wrapper restart).
+- **`CloneGroup`**: `name`, `accounts` (member emails). A clone bound to a group
+  (`Host.claude_group`) is re-balanced across the group's members every 10 min (rotator),
+  skipping any over 90% 5h usage; selected at clone/swap time as `group:<name>`.
 - **`TemplateConfig`**: `base_image` (`local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst`),
   `cores`, `memory_mb`, `disk_gb`.
 - **`MonitorSpec`**: `width`, `height`, `x`, `y`, `primary`.

@@ -39,8 +39,10 @@ async fn main() -> Result<()> {
 
     let app = app::App::new(store, cfg);
 
-    // Background loops: Claude usage poller, per-host agent-state poller, sshfs mounts.
+    // Background loops: Claude usage poller, group-rotation loop, per-host agent-state
+    // poller, sshfs mounts.
     tokio::spawn(claude::run_poller(app.clone()));
+    tokio::spawn(claude::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
     tokio::spawn(mounts::run(app.clone()));
 
