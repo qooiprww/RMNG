@@ -1119,10 +1119,17 @@ impl DockerCtl {
     }
 }
 
+/// Per-request timeout for plain (non-hijacked) daemon calls. `docker commit` of a
+/// provisioned base image exports a multi-GB layer diff and legitimately runs for
+/// minutes; at bollard's 120 s default the client cancels mid-CreateDiff (daemon logs
+/// status=499) and the bootstrap dies at the commit step. Hijacked streams (exec
+/// attach) are not subject to this timeout, so only slow one-shot calls need the room.
+const CLIENT_TIMEOUT_SECS: u64 = 3600;
+
 /// Build a bollard client for `socket`. No daemon I/O — bollard only validates that the
 /// socket path exists, which is exactly the failure [`DockerCtl::daemon`] retries on.
 fn build_client(socket: &str) -> Result<Docker> {
-    Docker::connect_with_unix(socket, 120, bollard::API_DEFAULT_VERSION)
+    Docker::connect_with_unix(socket, CLIENT_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
         .with_context(|| format!("connecting to the Docker daemon at {socket}"))
 }
 
