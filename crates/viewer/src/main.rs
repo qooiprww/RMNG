@@ -243,9 +243,19 @@ fn run_gui() -> Result<()> {
                                     if c.warp {
                                         e.warp_until = Some(now + AGENT_CURSOR_SHOW);
                                     }
-                                    if c.shape.is_some() {
-                                        e.shape = c.shape;
+                                    if let Some(shape) = c.shape {
                                         e.version += 1;
+                                        tracing::debug!(
+                                            "cursor meta: mon={} pos=({},{}) warp={} shape {}x{} hot=({},{}) → version {}",
+                                            c.monitor_id, c.x, c.y, c.warp,
+                                            shape.width, shape.height, shape.hotspot_x, shape.hotspot_y, e.version
+                                        );
+                                        e.shape = Some(shape);
+                                    } else {
+                                        tracing::trace!(
+                                            "cursor meta: mon={} pos=({},{}) warp={} (position only)",
+                                            c.monitor_id, c.x, c.y, c.warp
+                                        );
                                     }
                                 }
                                 continue;
@@ -490,12 +500,23 @@ fn build_ui(
                                 if !locked {
                                     win.video.set_cursor(win.native_cursor.as_ref());
                                 }
+                                tracing::debug!(
+                                    "cursor apply: mon={mid} version={} {}x{} locked={locked}{}",
+                                    e.version, shape.width, shape.height,
+                                    if locked { " (set_cursor SKIPPED: pointer-lock)" } else { "" }
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "cursor apply: mon={mid} version={} texture build FAILED ({}x{}, {} bytes)",
+                                    e.version, shape.width, shape.height, shape.rgba.len()
+                                );
                             }
                         }
                     }
                 }
                 // Native cursor: hide for pointer-lock, else show the remote-shaped cursor.
                 if locked != win.cursor_hidden {
+                    tracing::debug!("cursor hide flip: mon={mid} locked={locked}");
                     if locked {
                         win.video.set_cursor_from_name(Some("none"));
                     } else {
@@ -910,18 +931,35 @@ fn install_pointer(
 ) {
     let motion = gtk4::EventControllerMotion::new();
     {
-        let (state, window2, video2) = (state.clone(), window.clone(), video.clone());
-        motion.connect_enter(move |_c, _x, _y| {
+        let (state, window2, video2, pl) = (state.clone(), window.clone(), video.clone(), pointer_lock.clone());
+        motion.connect_enter(move |_c, x, y| {
+            tracing::debug!("pointer enter: mon={mid} at ({x:.0},{y:.0})");
             state.inside.set(true);
             grab_keys(&window2);
             // Pull keyboard focus onto the video while the pointer is over it (mirrors
             // grab_keys), so keys reach the remote rather than a focused title-bar button.
             video2.grab_focus();
+            // GTK 4.20 Wayland stuck-cursor workaround. When the pointer crosses a monitor
+            // seam out of this window, GDK's cursor-surface scale listener re-sends
+            // wl_pointer.set_cursor AFTER the leave with the stale enter serial (mutter
+            // ignores it) and marks its cursor surface as attached; the next enter then
+            // skips set_cursor entirely (buffer-attach + wl_surface.offset only), so the
+            // compositor never binds our cursor and remote shape updates become invisible
+            // no-ops until the following crossing. Bouncing through a *named* cursor takes
+            // GDK's cursor-shape path (clearing the attached flag), and restoring the
+            // texture cursor then forces a full set_cursor with the current enter serial.
+            if !pl.as_ref().is_some_and(|p| p.is_engaged()) {
+                if let Some(cur) = video2.cursor() {
+                    video2.set_cursor_from_name(Some("default"));
+                    video2.set_cursor(Some(&cur));
+                }
+            }
         });
     }
     {
         let (state, window2) = (state.clone(), window.clone());
         motion.connect_leave(move |_c| {
+            tracing::debug!("pointer leave: mon={mid}");
             state.inside.set(false);
             // Don't ungrab mid-drag: the implicit grab carries the pointer off the edge.
             if state.buttons.borrow().is_empty() {
@@ -1119,6 +1157,7 @@ fn install_keyboard(
     {
         let (w, state, window2) = (writer.clone(), state.clone(), window.clone());
         window.connect_is_active_notify(move |win| {
+            tracing::debug!("window active: {:?} active={}", win.title().map(|t| t.to_string()), win.is_active());
             if win.is_active() {
                 if state.inside.get() {
                     grab_keys(&window2);
