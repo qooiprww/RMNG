@@ -11,3 +11,12 @@ body {
   font-family:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
+
+/* Notes: links are disabled (see HostEditor.tsx). New ones can't be created, but
+   the link mark stays in the schema so old notes still load — render any legacy
+   link as plain text instead of a clickable-looking anchor. */
+.bn-editor a {
+  color: inherit;
+  text-decoration: none;
+  cursor: text;
+}

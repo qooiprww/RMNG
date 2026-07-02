@@ -36,19 +36,37 @@ function Editor({
   const editor = useCreateBlockNote({
     initialContent: initialContent && initialContent.length ? initialContent : undefined,
     uploadFile,
-    // No automatic links. `enablePasteRules: false` stops pasted URLs from being
+    // No links, period. `enablePasteRules: false` stops pasted URLs from being
     // turned into links (also disables markdown-on-paste like **bold**; typing it
-    // still works). The `autolink`/`handlePasteLink` plugins (removed below) cover
-    // typed URLs and paste-onto-selection. We keep the link mark in the schema so
-    // notes that already contain links still load and render.
-    _tiptapOptions: { enablePasteRules: false },
+    // still works). The plugins removed below cover typed URLs, paste-onto-selection
+    // and clicks on existing links. We keep the link mark in the schema so notes
+    // that already contain links still load; app.css renders them as plain text.
+    _tiptapOptions: {
+      enablePasteRules: false,
+      editorProps: {
+        // The link mark's `a[href]` parse rule would re-create links from pasted
+        // HTML (browser/VSCode copies) — strip anchors up front, keeping their text.
+        transformPastedHTML: (html: string) => {
+          const doc = new DOMParser().parseFromString(html, "text/html");
+          for (const a of doc.body.querySelectorAll("a")) {
+            a.replaceWith(...a.childNodes);
+          }
+          return doc.body.innerHTML;
+        },
+      },
+    },
   });
 
-  // Drop the ProseMirror plugins that auto-convert typed URLs into links and
-  // turn a selection into a link when a URL is pasted over it. Runs after the
-  // BlockNoteView child has mounted the editor view.
+  // Drop the ProseMirror plugins that auto-convert typed URLs into links
+  // (`autolink`), turn a selection into a link when a URL is pasted over it
+  // (`handlePasteLink`), and open legacy links on click (`handleClickLink`).
+  // Runs after the BlockNoteView child has mounted the editor view.
   useEffect(() => {
-    editor._tiptapEditor.unregisterPlugin(["autolink", "handlePasteLink"]);
+    editor._tiptapEditor.unregisterPlugin([
+      "autolink",
+      "handlePasteLink",
+      "handleClickLink",
+    ]);
   }, [editor]);
 
   // Debounced autosave; flushed immediately when the editor unmounts (host
