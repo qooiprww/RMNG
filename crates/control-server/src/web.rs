@@ -126,7 +126,15 @@ struct ActivateReq {
 }
 
 async fn activate(State(app): State<App>, Json(req): Json<ActivateReq>) -> Json<ControlState> {
-    Json(app.store.mutate(|s| s.selected = req.id))
+    Json(app.store.mutate(|s| {
+        // Switching to a clone clears its unread dot.
+        if let Some(id) = req.id.as_deref() {
+            if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
+                h.unread = false;
+            }
+        }
+        s.selected = req.id;
+    }))
 }
 
 #[derive(Deserialize)]

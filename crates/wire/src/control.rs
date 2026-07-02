@@ -128,6 +128,11 @@ pub struct Host {
     pub state_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_state: Option<MonitorState>,
+    /// True when this clone fell out of `working` (→ idle/offline) since the
+    /// operator last viewed it — drives the sidebar "unread" dot. Set by the
+    /// monitor poller on that transition, cleared when the clone is activated.
+    #[serde(default)]
+    pub unread: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

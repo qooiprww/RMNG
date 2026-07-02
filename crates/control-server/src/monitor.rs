@@ -75,9 +75,18 @@ async fn poll_once(app: &App) {
         return;
     }
     app.store.mutate(|s| {
+        let sel = s.selected.clone();
         for h in &mut s.hosts {
-            if let Some(state) = next.get(&h.id) {
-                h.monitor_state = Some(*state);
+            if let Some(&state) = next.get(&h.id) {
+                // Light the unread dot when a clone drops out of `working`
+                // (→ idle/offline), unless the operator is already viewing it.
+                if h.monitor_state == Some(MonitorState::Working)
+                    && state != MonitorState::Working
+                    && sel.as_deref() != Some(h.id.as_str())
+                {
+                    h.unread = true;
+                }
+                h.monitor_state = Some(state);
             }
         }
     });

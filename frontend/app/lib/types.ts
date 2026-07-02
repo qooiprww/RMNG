@@ -76,6 +76,11 @@ export interface Host {
    * attention"). A running host is just `working` or `idle`.
    */
   monitorState?: "working" | "idle" | "offline";
+  /**
+   * True when this clone dropped from `working` to idle/offline since it was
+   * last viewed. Drives the sidebar unread dot; cleared when you switch to it.
+   */
+  unread?: boolean;
 }
 
 export type OperationKind = "clone" | "delete";

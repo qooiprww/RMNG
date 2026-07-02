@@ -245,6 +245,13 @@ export function SidebarHost({
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800">
             {host.displayName ?? host.id}
           </span>
+          {!busy && host.unread && !selected ? (
+            <span
+              className="ml-auto h-2 w-2 shrink-0 rounded-full bg-indigo-500"
+              title="stopped working since you last viewed it"
+              aria-label="unread: stopped working since last viewed"
+            />
+          ) : null}
           {busy ? (
             <span className="ml-auto shrink-0 text-[10px] font-medium text-sky-600">
               {op?.kind === "delete" ? "deleting…" : op?.step}
