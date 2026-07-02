@@ -53,7 +53,10 @@ say "headless GNOME + Mutter + VA-API + PipeWire (NO gdm/g-r-d)"
 # `appsrc ! vapostproc ! videoconvert ! pngenc`: vapostproc is the `va` plugin in
 # gstreamer1.0-plugins-bad, pngenc is in -good, videoconvert/app in -base. Without
 # these the tool fails with `no element "vapostproc"` and the agent can't see the screen.
+# `sudo` is explicit: the ubuntu:26.04 DOCKER image ships without it (the old LXC
+# template had it), and the rmng sudoers drop-in below needs /etc/sudoers.d to exist.
 apt-get install -y -qq \
+  sudo \
   gnome-session gnome-shell mutter ptyxis nautilus gnome-text-editor loupe \
   dbus-user-session xwayland \
   mesa-va-drivers libva2 va-driver-all vainfo \
