@@ -282,7 +282,13 @@ DCONF
 dconf update 2>/dev/null || say "WARN: dconf update failed"
 
 say "create user $USERNAME + groups + linger"
-id "$USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$USERNAME"
+# The ubuntu:26.04 DOCKER image ships a stock `ubuntu` user squatting on uid 1000 (the
+# LXC templates never did). Everything downstream (tar ownership, XDG_RUNTIME_DIR paths,
+# unit files) assumes $USERNAME == uid 1000, so evict it and pin the uid explicitly.
+if id ubuntu >/dev/null 2>&1 && [ "$USERNAME" != ubuntu ]; then
+  userdel -r ubuntu 2>/dev/null || userdel ubuntu 2>/dev/null || say "WARN: could not remove stock ubuntu user"
+fi
+id "$USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash -u 1000 "$USERNAME"
 usermod -aG sudo,render,video "$USERNAME"
 # docker group exists once docker-ce installed in the toolbox above; add the user so they
 # can run docker without sudo. Non-fatal if the group is absent (docker install failed).
