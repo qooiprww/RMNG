@@ -75,6 +75,9 @@ const SOCK_DIR: &str = "/srv/rmng-sock";
 /// Where each clone's per-clone named volume mounts (inner Docker state — never
 /// committed, see gotcha #11).
 const DIND_TARGET: &str = "/var/lib/docker";
+/// Docker ≥28's containerd image store — needs its own volume for the same
+/// overlay-on-overlay reason as [`DIND_TARGET`].
+const CTD_TARGET: &str = "/var/lib/containerd";
 /// Extra swap over the memory limit, in bytes (+8 GiB, matching LXC parity).
 const SWAP_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 
@@ -714,16 +717,31 @@ impl DockerCtl {
     /// container id. Does NOT start it (caller decides). A stale same-named container
     /// 409s here — the daemon message is surfaced verbatim (gotcha #7).
     pub async fn create_clone_container(&self, spec: &CreateSpec) -> Result<String> {
-        let dind_volume = format!("rmng-dind-{}", spec.name);
-        // Ensure the per-clone inner-Docker volume exists (idempotent).
+        let dind_volume = Self::dind_volume_name(&spec.name);
+        let ctd_volume = Self::ctd_volume_name(&spec.name);
+        // Ensure the per-clone inner-Docker volumes exist (idempotent).
         self.ensure_volume(&dind_volume).await?;
+        self.ensure_volume(&ctd_volume).await?;
 
-        let mut mounts = vec![Mount {
-            target: Some(DIND_TARGET.to_string()),
-            source: Some(dind_volume.clone()),
-            typ: Some(MountTypeEnum::VOLUME),
-            ..Default::default()
-        }];
+        let mut mounts = vec![
+            Mount {
+                target: Some(DIND_TARGET.to_string()),
+                source: Some(dind_volume.clone()),
+                typ: Some(MountTypeEnum::VOLUME),
+                ..Default::default()
+            },
+            // Docker ≥28 stores images via the containerd snapshotter under
+            // /var/lib/containerd, NOT /var/lib/docker — without its own volume the
+            // inner daemon mounts overlay-on-overlay and every `docker run` fails
+            // with EINVAL (found live in the E2E; the classic dind volume alone no
+            // longer covers gotcha #11's fix).
+            Mount {
+                target: Some(CTD_TARGET.to_string()),
+                source: Some(ctd_volume.clone()),
+                typ: Some(MountTypeEnum::VOLUME),
+                ..Default::default()
+            },
+        ];
         if !spec.sock_source.trim().is_empty() {
             mounts.push(Mount {
                 target: Some(SOCK_DIR.to_string()),
@@ -876,6 +894,12 @@ impl DockerCtl {
     /// can pair `remove_container` + `remove_volume` on delete.
     pub fn dind_volume_name(name: &str) -> String {
         format!("rmng-dind-{name}")
+    }
+
+    /// The per-clone containerd-store volume name (`rmng-ctd-<name>`), sibling of
+    /// [`Self::dind_volume_name`] — see `CTD_TARGET`.
+    pub fn ctd_volume_name(name: &str) -> String {
+        format!("rmng-ctd-{name}")
     }
 
     /// The container's IPv4 on the rmng network, or `None` if not attached / not running.

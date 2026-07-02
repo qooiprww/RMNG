@@ -68,6 +68,13 @@ apt-get install -y -qq \
 # Recommend Console, so dropping it from the list is enough — nothing pulls it back).
 update-alternatives --set x-terminal-emulator /usr/bin/ptyxis 2>/dev/null || true
 
+# /var/lib/dbus/machine-id must be a SYMLINK to /etc/machine-id (the Debian norm), not the
+# regular file dbus's postinst bakes here. With a baked file, systemd "initializes the
+# machine ID from the D-Bus machine ID" on every clone → the whole fleet shares one id
+# (found live in the E2E). Symlinked, the per-clone empty /etc/machine-id regenerates
+# fresh on first boot and dbus follows.
+ln -sf /etc/machine-id /var/lib/dbus/machine-id
+
 # Mask ModemManager. It's pulled in by network-manager but its unit has
 # ConditionVirtualization=!container, so it never starts in an LXC — yet its D-Bus
 # activation file still asks systemd to start it, so the bus name never appears and

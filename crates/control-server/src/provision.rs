@@ -294,6 +294,7 @@ pub async fn clone_container(
             tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
             docker.remove_container(&container).await.ok();
             docker.remove_volume(&crate::docker::DockerCtl::dind_volume_name(hostname)).await.ok();
+            docker.remove_volume(&crate::docker::DockerCtl::ctd_volume_name(hostname)).await.ok();
             Err(e)
         }
     }
@@ -704,12 +705,16 @@ pub async fn delete_clone(
     on_progress("remove", "removing the container");
     docker.remove_container(container).await?;
 
-    // The per-clone inner-Docker volume is named + not auto-removed with the container;
-    // drop it explicitly. In-use / already-gone is logged, not fatal.
-    let volume = crate::docker::DockerCtl::dind_volume_name(host_id);
-    match docker.remove_volume(&volume).await {
-        Ok(()) => {}
-        Err(e) => tracing::warn!("delete {host_id}: removing volume {volume}: {e} (non-fatal)"),
+    // The per-clone inner-Docker volumes are named + not auto-removed with the
+    // container; drop them explicitly. In-use / already-gone is logged, not fatal.
+    for volume in [
+        crate::docker::DockerCtl::dind_volume_name(host_id),
+        crate::docker::DockerCtl::ctd_volume_name(host_id),
+    ] {
+        match docker.remove_volume(&volume).await {
+            Ok(()) => {}
+            Err(e) => tracing::warn!("delete {host_id}: removing volume {volume}: {e} (non-fatal)"),
+        }
     }
 
     on_progress("done", &format!("clone {host_id} destroyed"));
