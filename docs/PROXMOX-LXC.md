@@ -19,7 +19,13 @@ features: nesting=1,keyctl=1
 dev0: /dev/dri/renderD128,mode=0666
 
 # Let the guest's Docker/systemd operate without the host AppArmor profile fighting it.
+# The unconfined profile alone is NOT enough for nested Docker: the runtime still probes
+# /sys/kernel/security/apparmor and dies with "Could not check if docker-default AppArmor
+# profile was loaded: permission denied". The /dev/null bind makes nested runtimes see
+# AppArmor as disabled; the relaxed auto-mounts match what the old LXC clones used.
 lxc.apparmor.profile: unconfined
+lxc.mount.entry: /dev/null sys/module/apparmor/parameters/enabled none bind,optional 0 0
+lxc.mount.auto: cgroup:mixed proc:rw sys:mixed
 ```
 
 Set them via `pct set <id> --features nesting=1,keyctl=1` and edit the conf for the `dev0` /
@@ -30,6 +36,10 @@ fleet you intend to run (clones default to 16 cores / 32 GiB each — tune
 ## 2. Install Docker in the CT
 
 ```sh
+# The standard CT template ships without curl — install it first, or the pipe below
+# silently feeds `sh` nothing and "succeeds" having installed nothing.
+apt-get update && apt-get install -y curl ca-certificates
+
 # Docker CE from the official repo (get.docker.com is the quickest path).
 curl -fsSL https://get.docker.com | sh
 ```
@@ -37,12 +47,12 @@ curl -fsSL https://get.docker.com | sh
 ## 3. Verify the daemon before deploying RMNG
 
 ```sh
-docker info | grep -i 'storage driver'    # must be: Storage Driver: overlay2
+docker info | grep -i 'storage driver'    # overlay2 (or overlayfs on Docker ≥29) — NOT vfs
 ls -l /dev/dri/renderD128                  # the render node must be present in the CT
 docker run --rm hello-world                # nested Docker actually runs
 ```
 
-If the storage driver is `vfs` instead of `overlay2`, nested overlayfs isn't available —
+If the storage driver is `vfs`, nested overlayfs isn't available —
 recheck `features: nesting=1` and that the CT was restarted. RMNG's per-clone
 `rmng-dind-<id>` volume at `/var/lib/docker` is the overlay-on-overlay fix for the clones'
 own inner Docker, but the CT's *outer* Docker still needs overlay2.
