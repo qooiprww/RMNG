@@ -20,8 +20,8 @@ pub fn load() -> Result<AppConfig> {
             // Legacy fields (serde ignores them at parse): fold what's still useful
             // into the current shape and rewrite the file once, so dead secrets
             // (long-lived clone tokens, per-workspace Linear keys) don't linger on disk.
-            // Also scrubs the retired `proxmox.macPrefix` and grandfathers a pre-wizard
-            // config's `setupComplete`.
+            // Also scrubs the retired `proxmox` block, carrying its `hostnamePrefix`
+            // into `docker.hostnamePrefix` when no `docker` key is present.
             let raw = serde_json::from_str::<serde_json::Value>(&s).unwrap_or_default();
             if migrate_legacy(&raw, &mut cfg) {
                 tracing::info!("migrating legacy config fields in {}", path.display());
@@ -43,10 +43,11 @@ pub fn load() -> Result<AppConfig> {
 /// `presets` (no labels/key — the operator adds those in Settings). Legacy `linear`
 /// workspace keys (now per-preset) and `cloneAccounts` long-lived tokens (dead since
 /// the single-token model) are dropped; the rewrite scrubs them from disk. The retired
-/// `proxmox.macPrefix` is likewise scrubbed. Finally, a config written before the
-/// first-run setup wizard existed (no `setupComplete` key) but that already has a
-/// proxmox ssh target is **grandfathered** to `setupComplete = true`, so upgrades don't
-/// bounce operators back through setup.
+/// Proxmox backend is gone: any `proxmox` block is scrubbed (rewrite), and its
+/// `hostnamePrefix` is carried into `docker.hostnamePrefix` when the new config has no
+/// `docker` key. There is no `setupComplete` grandfather — an old `config.json` re-runs
+/// the wizard (new machine, no `rmng` network / base image), so `setupComplete` stays
+/// whatever the file said (default `false` when absent).
 fn migrate_legacy(raw: &serde_json::Value, cfg: &mut AppConfig) -> bool {
     let non_empty = |k: &str| match raw.get(k) {
         Some(serde_json::Value::Array(a)) => !a.is_empty(),
@@ -73,24 +74,25 @@ fn migrate_legacy(raw: &serde_json::Value, cfg: &mut AppConfig) -> bool {
     if non_empty("linear") {
         tracing::info!("dropping legacy per-workspace Linear keys (now per-preset — re-enter in Settings)");
     }
-    // Retired: MACs are now generated with a compiled-in OUI, not a config field.
-    let has_mac_prefix = raw.get("proxmox").and_then(|p| p.get("macPrefix")).is_some();
-    if has_mac_prefix {
-        tracing::info!("scrubbing retired proxmox.macPrefix from config");
-    }
-    // Grandfather setupComplete for configs predating the setup wizard: only when the key
-    // is entirely absent (raw) AND a proxmox ssh target is already configured (parsed).
-    let has_setup_key = raw.get("setupComplete").is_some();
-    let grandfather = !has_setup_key && !cfg.proxmox.ssh.is_empty();
-    if grandfather {
-        tracing::info!("grandfathering setupComplete=true (existing config with a proxmox ssh target)");
-        cfg.setup_complete = true;
+    // Retired: the whole Proxmox backend is gone. Scrub any `proxmox` block from disk;
+    // carry its `hostnamePrefix` into `docker.hostnamePrefix` when the file predates the
+    // Docker backend (no `docker` key), so the operator's clone-name prefix survives.
+    let has_proxmox = raw.get("proxmox").is_some();
+    if has_proxmox {
+        tracing::info!("scrubbing retired proxmox settings from config");
+        if raw.get("docker").is_none() {
+            if let Some(prefix) =
+                raw.get("proxmox").and_then(|p| p.get("hostnamePrefix")).and_then(|v| v.as_str())
+            {
+                tracing::info!("carrying proxmox.hostnamePrefix into docker.hostnamePrefix");
+                cfg.docker.hostname_prefix = prefix.to_string();
+            }
+        }
     }
     non_empty("envPresets")
         || non_empty("linear")
         || non_empty("cloneAccounts")
-        || has_mac_prefix
-        || grandfather
+        || has_proxmox
 }
 
 #[cfg(test)]
@@ -101,17 +103,18 @@ mod tests {
     #[test]
     fn merge_preserves_blank_secrets_and_applies_changes() {
         let mut base = AppConfig::default();
-        base.proxmox.ssh = "root@node".into();
-        // The UI sends back blanks for unchanged secrets, plus a real change.
+        base.detector_inference_url = "http://infer:8080".into();
+        // The UI sends back a blank for an unchanged scalar, plus real changes.
         let incoming = serde_json::json!({
             "listen": { "web": 9100 },
-            "proxmox": { "ssh": "", "hostnamePrefix": "clone-" },
+            "detectorInferenceUrl": "",
+            "docker": { "hostnamePrefix": "clone-" },
         });
         let merged = merge_update(&base, incoming).unwrap();
         assert_eq!(merged.listen.web, 9100); // changed
         assert_eq!(merged.listen.video, 9001); // untouched (merge kept it)
-        assert_eq!(merged.proxmox.ssh, "root@node"); // blank secret preserved
-        assert_eq!(merged.proxmox.hostname_prefix, "clone-"); // non-secret changed
+        assert_eq!(merged.detector_inference_url, "http://infer:8080"); // blank = unchanged
+        assert_eq!(merged.docker.hostname_prefix, "clone-"); // non-secret changed
     }
 
     #[test]
@@ -195,8 +198,7 @@ mod tests {
         base.setup_complete = true;
         base.data_dir = "data".into();
         base.clone_socket = "/srv/rmng-sock/clones.sock".into();
-        base.proxmox.storage = "local-lvm".into();
-        base.proxmox.bridge = "vmbr0".into();
+        base.docker.subnet = "10.99.0.0/24".into();
         base
     }
 
@@ -212,18 +214,15 @@ mod tests {
             .unwrap_err();
         assert!(e.to_string().contains("cloneSocket"), "err: {e}");
         assert!(e.to_string().contains("first-run"), "err: {e}");
-        // proxmox.storage
-        let e = merge_update(&base, serde_json::json!({ "proxmox": { "storage": "fast-nvme" } }))
+        // docker.subnet
+        let e = merge_update(&base, serde_json::json!({ "docker": { "subnet": "10.42.0.0/24" } }))
             .unwrap_err();
-        assert!(e.to_string().contains("storage"), "err: {e}");
-        // proxmox.bridge
-        let e = merge_update(&base, serde_json::json!({ "proxmox": { "bridge": "vmbr1" } }))
-            .unwrap_err();
-        assert!(e.to_string().contains("bridge"), "err: {e}");
+        assert!(e.to_string().contains("subnet"), "err: {e}");
+        assert!(e.to_string().contains("first-run"), "err: {e}");
         // A no-op resend of the same values is fine (final value == base value).
         let ok = merge_update(
             &base,
-            serde_json::json!({ "dataDir": "data", "cloneSocket": "/srv/rmng-sock/clones.sock", "proxmox": { "storage": "local-lvm", "bridge": "vmbr0" } }),
+            serde_json::json!({ "dataDir": "data", "cloneSocket": "/srv/rmng-sock/clones.sock", "docker": { "subnet": "10.99.0.0/24" } }),
         )
         .unwrap();
         assert_eq!(ok.data_dir, "data");
@@ -231,10 +230,10 @@ mod tests {
         // Blank strings are unchanged (deep-merge protects them) — never an error.
         let ok = merge_update(
             &base,
-            serde_json::json!({ "dataDir": "", "proxmox": { "storage": "", "bridge": "" } }),
+            serde_json::json!({ "dataDir": "", "docker": { "subnet": "" } }),
         )
         .unwrap();
-        assert_eq!(ok.proxmox.storage, "local-lvm");
+        assert_eq!(ok.docker.subnet, "10.99.0.0/24");
     }
 
     #[test]
@@ -246,14 +245,13 @@ mod tests {
             serde_json::json!({
                 "dataDir": "elsewhere",
                 "cloneSocket": "/run/other/clones.sock",
-                "proxmox": { "storage": "fast-nvme", "bridge": "vmbr9" },
+                "docker": { "subnet": "10.42.0.0/24" },
             }),
         )
         .unwrap();
         assert_eq!(merged.data_dir, "elsewhere");
         assert_eq!(merged.clone_socket, "/run/other/clones.sock");
-        assert_eq!(merged.proxmox.storage, "fast-nvme");
-        assert_eq!(merged.proxmox.bridge, "vmbr9");
+        assert_eq!(merged.docker.subnet, "10.42.0.0/24");
     }
 
     #[test]
@@ -274,38 +272,39 @@ mod tests {
     }
 
     #[test]
-    fn migrate_grandfathers_setup_complete() {
-        // ssh set + setupComplete key absent → grandfathered true (and rewrite).
-        let raw = serde_json::json!({ "proxmox": { "ssh": "root@node" } });
+    fn migrate_scrubs_proxmox() {
+        // A legacy config with a proxmox block: it's scrubbed (rewrite flagged), its
+        // hostnamePrefix is folded into docker.hostnamePrefix (no docker key present),
+        // and setupComplete is NOT grandfathered — it stays false when the key is absent.
+        let raw = serde_json::json!({
+            "proxmox": { "ssh": "root@node", "storage": "local-lvm", "hostnamePrefix": "clone-" },
+        });
         let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
         assert!(!cfg.setup_complete); // serde default before migration
-        assert!(migrate_legacy(&raw, &mut cfg));
-        assert!(cfg.setup_complete);
-
-        // ssh empty + key absent → stays false (no rewrite from grandfathering).
-        let raw = serde_json::json!({ "proxmox": { "ssh": "" } });
-        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
-        assert!(!migrate_legacy(&raw, &mut cfg));
+        assert!(migrate_legacy(&raw, &mut cfg)); // rewrite flagged
+        // The `proxmox` key is gone from the serialized output (AppConfig has no such field).
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert!(out.get("proxmox").is_none(), "proxmox not scrubbed: {out}");
+        // hostnamePrefix folded into docker.
+        assert_eq!(cfg.docker.hostname_prefix, "clone-");
+        // NOT grandfathered — an ssh target no longer implies setup is done.
         assert!(!cfg.setup_complete);
 
-        // Explicit false present → respected, never grandfathered, no rewrite.
-        let raw = serde_json::json!({ "setupComplete": false, "proxmox": { "ssh": "root@node" } });
-        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
-        assert!(!migrate_legacy(&raw, &mut cfg));
-        assert!(!cfg.setup_complete);
-    }
-
-    #[test]
-    fn migrate_scrubs_mac_prefix() {
-        // A legacy macPrefix field triggers a scrubbing rewrite; the parsed cfg is unaffected.
-        let raw = serde_json::json!({ "proxmox": { "ssh": "", "macPrefix": "AA:BB:CC" } });
+        // When a `docker` key already exists, the proxmox prefix is NOT folded (the new
+        // config's docker settings win); proxmox is still scrubbed (rewrite flagged).
+        let raw = serde_json::json!({
+            "proxmox": { "hostnamePrefix": "old-" },
+            "docker": { "hostnamePrefix": "new-" },
+        });
         let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
         assert!(migrate_legacy(&raw, &mut cfg));
+        assert_eq!(cfg.docker.hostname_prefix, "new-");
 
-        // No macPrefix → no rewrite (on this account alone).
-        let raw = serde_json::json!({ "proxmox": { "ssh": "" } });
+        // No `proxmox` key and a fully-migrated file → no rewrite from proxmox scrubbing.
+        let raw = serde_json::json!({ "docker": { "hostnamePrefix": "keep-" } });
         let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
         assert!(!migrate_legacy(&raw, &mut cfg));
+        assert_eq!(cfg.docker.hostname_prefix, "keep-");
     }
 
     #[test]
@@ -331,6 +330,9 @@ mod tests {
         n.clone_socket = "/tmp/other.sock".into();
         assert!(restart_required(&base, &n));
         let mut n = base.clone();
+        n.docker.socket = "/run/docker.sock".into();
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
         n.static_dir = "frontend/build/client".into();
         assert!(restart_required(&base, &n));
         let mut n = base.clone();
@@ -339,7 +341,7 @@ mod tests {
 
         // A non-trigger field (immediate-apply) does NOT require a restart.
         let mut n = base.clone();
-        n.proxmox.hostname_prefix = "other-".into();
+        n.docker.hostname_prefix = "other-".into();
         assert!(!restart_required(&base, &n));
     }
 }
@@ -401,11 +403,8 @@ fn enforce_categories(base: &AppConfig, merged: &AppConfig) -> Result<()> {
         if merged.clone_socket != base.clone_socket {
             bail!("cloneSocket is a one-time setting (set during first-run setup) and cannot be changed after setup");
         }
-        if merged.proxmox.storage != base.proxmox.storage {
-            bail!("proxmox.storage is a one-time setting (set during first-run setup) and cannot be changed after setup");
-        }
-        if merged.proxmox.bridge != base.proxmox.bridge {
-            bail!("proxmox.bridge is a one-time setting (set during first-run setup) and cannot be changed after setup");
+        if merged.docker.subnet != base.docker.subnet {
+            bail!("docker.subnet is a one-time setting (baked into the rmng network + clone IPs at first-run setup) and cannot be changed after setup");
         }
     }
     Ok(())
@@ -413,15 +412,17 @@ fn enforce_categories(base: &AppConfig, merged: &AppConfig) -> Result<()> {
 
 /// Whether applying `new` over `old` requires a server restart to take effect. The
 /// restart-required settings are the ones wired once at startup: the four listen ports,
-/// the clone-daemon unix socket, the static-file directory, and the chroma mode.
-/// Everything else applies live. Consumed by web.rs's `PUT /api/config` handler,
-/// which surfaces the result as `ConfigPutResponse.restart_required`.
+/// the clone-daemon unix socket, the Docker daemon socket (the bollard client is built
+/// at startup), the static-file directory, and the chroma mode. Everything else applies
+/// live. Consumed by web.rs's `PUT /api/config` handler, which surfaces the result as
+/// `ConfigPutResponse.restart_required`.
 pub fn restart_required(old: &AppConfig, new: &AppConfig) -> bool {
     old.listen.web != new.listen.web
         || old.listen.video != new.listen.video
         || old.listen.clone_mcp != new.listen.clone_mcp
         || old.listen.global_mcp != new.listen.global_mcp
         || old.clone_socket != new.clone_socket
+        || old.docker.socket != new.docker.socket
         || old.static_dir != new.static_dir
         || old.chroma != new.chroma
 }
