@@ -7,6 +7,7 @@ use wire::AppConfig;
 
 use crate::chat::ChatState;
 use crate::claude::ClaudeStore;
+use crate::docker::DockerCtl;
 use crate::state::StateStore;
 
 #[derive(Clone)]
@@ -21,11 +22,20 @@ pub struct App {
     pub chat: Arc<ChatState>,
     /// Media plane shared state (clone conns + latest frames).
     pub media: Arc<crate::mediaplane::MediaHandle>,
+    /// The Docker fleet backend (bollard). Constructed I/O-free at startup; every call
+    /// surfaces its own daemon-connection failure, so the server still boots the wizard
+    /// even when Docker is down.
+    pub docker: Arc<DockerCtl>,
 }
 
 impl App {
     pub fn new(store: Arc<StateStore>, cfg: AppConfig) -> Self {
         let claude = Arc::new(ClaudeStore::load(&cfg.data_dir));
+        // `DockerCtl::connect` is pure (only validates the socket path); a down daemon is
+        // reported per-call, never here, so the server can always reach the setup wizard.
+        let docker = Arc::new(
+            DockerCtl::connect(&cfg.docker).expect("building the Docker client from config"),
+        );
         Self {
             store,
             cfg: Arc::new(RwLock::new(cfg)),
@@ -36,6 +46,7 @@ impl App {
             claude,
             chat: Arc::new(ChatState::default()),
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
+            docker,
         }
     }
 

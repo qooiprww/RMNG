@@ -835,6 +835,43 @@ impl DockerCtl {
         }
     }
 
+    /// The last `n` combined stdout+stderr log lines of a container, newest at the end,
+    /// as one newline-joined string. For the wait-ready death path: a clone whose systemd
+    /// PID 1 died before its daemon registered leaves its failure in these logs, which the
+    /// caller folds into the operation log. Best-effort — a log-fetch failure yields an
+    /// empty string rather than masking the real (container-dead) error.
+    pub async fn container_logs_tail(&self, id: &str, n: usize) -> String {
+        let opts = bollard::query_parameters::LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .tail(&n.to_string())
+            .build();
+        let mut stream = self.docker.logs(id, Some(opts));
+        let mut lines: Vec<String> = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(out.into_bytes().as_ref()).into_owned();
+                    for line in text.split('\n') {
+                        let line = line.trim_end_matches('\r');
+                        if !line.is_empty() {
+                            lines.push(line.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: "docker", "logs tail for {id}: {e}");
+                    break;
+                }
+            }
+        }
+        // Keep only the last `n` (a chunk can carry more than one line).
+        if lines.len() > n {
+            lines.drain(0..lines.len() - n);
+        }
+        lines.join("\n")
+    }
+
     // --- file upload ------------------------------------------------------------------
 
     /// Upload files into a running container by building an in-memory tar and PUTting it

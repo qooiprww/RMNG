@@ -16,8 +16,7 @@ mod linear;
 mod mcp;
 mod mediaplane;
 mod monitor;
-mod mounts;
-mod orchestrate;
+mod provision;
 mod state;
 mod web;
 
@@ -43,11 +42,11 @@ async fn main() -> Result<()> {
     let app = app::App::new(store, cfg);
 
     // Background loops: Claude usage poller, group-rotation loop, per-host agent-state
-    // poller, sshfs mounts.
+    // poller. (The Proxmox-era sshfs host-mount reconciler is gone with the Docker port —
+    // clone homes live in named volumes on the same daemon, not on a remote SSH node.)
     tokio::spawn(claude::run_poller(app.clone()));
     tokio::spawn(claude::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
-    tokio::spawn(mounts::run(app.clone()));
 
     // Port 1 (video) — ingest clone dmabufs, VA-API encode, serve the viewer.
     mediaplane::spawn(app.clone());

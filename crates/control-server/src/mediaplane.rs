@@ -81,6 +81,15 @@ impl MediaHandle {
     }
     // NB: on-demand screenshots moved into the clone-daemon's own MCP (the fleet MCP
     // proxies to it); the control-server no longer encodes screenshots itself.
+
+    /// True when a clone-daemon session for `id` is live — i.e. its daemon has sent a
+    /// `Hello{clone_id}` (keyed by clone_id == the clone's hostname == its host id) and
+    /// the connection hasn't dropped. This is the readiness signal `provision.rs`'s
+    /// clone-container wait-ready poll watches: a clone is "up + registered" once its
+    /// daemon appears here.
+    pub fn is_connected(&self, id: &str) -> bool {
+        self.conns.lock().unwrap().contains_key(id)
+    }
 }
 
 type Viewer = Arc<Mutex<Option<TcpStream>>>;
