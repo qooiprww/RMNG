@@ -83,7 +83,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                // `clip` (the clipboard bridge) logs debug by default: copy/paste-driven
+                // only (sparse), and the go-to trail for cross-machine clipboard issues.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,clip=debug")),
         )
         .init();
 

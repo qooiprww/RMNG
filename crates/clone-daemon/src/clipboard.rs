@@ -76,7 +76,7 @@ pub async fn run(
                     continue;
                 }
                 let serial = local_serial.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("clone copied: offering {} mime type(s) serial={serial}", mimes.len());
+                tracing::debug!(target: "clip", "clone copied: offering {mimes:?} serial={serial}");
                 let _ = transport.send(&DaemonMsg::ClipboardOffer(ClipboardOffer { serial, mime_types: mimes }), &[]);
             }
         });
@@ -115,25 +115,55 @@ pub async fn run(
                 opts.insert("mime-types", Value::new(o.mime_types.clone()));
                 match rd.set_selection(opts).await {
                     Ok(()) => {
+                        tracing::debug!(target: "clip", "owning remote selection in clone: {:?}", o.mime_types);
                         *remote.lock().await = Some(o);
-                        tracing::debug!("owning remote selection in clone");
                     }
                     Err(e) => tracing::warn!("SetSelection: {e}"),
                 }
             }
             // Flow 2: a remote wants our clone's data for `mime` — read + ship it.
-            FromServer::Request(r) => match rd.selection_read(&r.mime_type).await {
-                Ok(fd) => match read_all(fd) {
-                    Ok(bytes) => {
-                        let _ = transport.send(
-                            &DaemonMsg::ClipboardData(ClipboardData { serial: r.serial, mime_type: r.mime_type, bytes }),
-                            &[],
-                        );
-                    }
-                    Err(e) => tracing::warn!("SelectionRead read: {e}"),
-                },
-                Err(e) => tracing::warn!("SelectionRead({}): {e}", r.mime_type),
-            },
+            // Spawned: a slow source app must not wedge this loop (Chromium can sit on
+            // a SelectionRead), and the fd read gets a hard timeout. ALWAYS reply, with
+            // empty bytes on failure — a dropped reply leaves the broker's pending entry
+            // and the requester's clipboard silently stale.
+            FromServer::Request(r) => {
+                let (rd, transport) = (rd.clone(), transport.clone());
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let bytes = match rd.selection_read(&r.mime_type).await {
+                        Ok(fd) => {
+                            let read = tokio::task::spawn_blocking(move || read_all(fd));
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
+                                Ok(Ok(Ok(bytes))) => bytes,
+                                Ok(Ok(Err(e))) => {
+                                    tracing::warn!("SelectionRead({}) read: {e}", r.mime_type);
+                                    Vec::new()
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!("SelectionRead({}) join: {e}", r.mime_type);
+                                    Vec::new()
+                                }
+                                Err(_) => {
+                                    tracing::warn!("SelectionRead({}) timed out after 5s (source app not responding?)", r.mime_type);
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("SelectionRead({}): {e}", r.mime_type);
+                            Vec::new()
+                        }
+                    };
+                    tracing::debug!(target: "clip",
+                        "read {} -> {} bytes in {:?}",
+                        r.mime_type, bytes.len(), started.elapsed()
+                    );
+                    let _ = transport.send(
+                        &DaemonMsg::ClipboardData(ClipboardData { serial: r.serial, mime_type: r.mime_type, bytes }),
+                        &[],
+                    );
+                });
+            }
             // Flow 4 reply: bytes for a pending paste — write them to Mutter's fd.
             FromServer::Data(d) => {
                 let serials = pending.lock().await.remove(&d.mime_type).unwrap_or_default();

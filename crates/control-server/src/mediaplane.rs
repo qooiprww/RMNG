@@ -293,6 +293,7 @@ fn send_clip_to(handle: &MediaHandle, viewer: &Viewer, dest: &str, msg: Clipboar
 /// Broker: a new selection is offered by `source`. Becomes the current clipboard;
 /// advertise it to the viewer + every *other* clone (remote↔local + remote↔remote).
 fn broker_offer(handle: &MediaHandle, viewer: &Viewer, offer: ClipboardOffer, source: &str) {
+    tracing::debug!(target: "clip", "offer serial={} from {source:?}: {:?}", offer.serial, offer.mime_types);
     handle.clip.lock().unwrap().offer = Some((offer.clone(), source.to_string()));
     let dests: Vec<String> = clip_dests(handle, source);
     for d in dests {
@@ -305,13 +306,17 @@ fn broker_offer(handle: &MediaHandle, viewer: &Viewer, offer: ClipboardOffer, so
 fn broker_request(handle: &MediaHandle, viewer: &Viewer, req: ClipboardRequest, requester: &str) {
     let owner = {
         let mut clip = handle.clip.lock().unwrap();
-        let Some((_, owner)) = clip.offer.clone() else { return };
+        let Some((_, owner)) = clip.offer.clone() else {
+            tracing::debug!(target: "clip", "request serial={} mime={} from {requester:?} dropped: no offer", req.serial, req.mime_type);
+            return;
+        };
         if owner == requester {
             return; // don't ask the owner to fetch from itself
         }
         clip.pending.entry((req.serial, req.mime_type.clone())).or_default().push(requester.to_string());
         owner
     };
+    tracing::debug!(target: "clip", "request serial={} mime={} from {requester:?} -> owner {owner:?}", req.serial, req.mime_type);
     send_clip_to(handle, viewer, &owner, ClipboardMsg::Request(req));
 }
 
@@ -324,6 +329,10 @@ fn broker_data(handle: &MediaHandle, viewer: &Viewer, data: ClipboardData) {
         .pending
         .remove(&(data.serial, data.mime_type.clone()))
         .unwrap_or_default();
+    tracing::debug!(target: "clip",
+        "data serial={} mime={} ({} bytes) -> {requesters:?}",
+        data.serial, data.mime_type, data.bytes.len()
+    );
     for r in requesters {
         send_clip_to(handle, viewer, &r, ClipboardMsg::Data(data.clone()));
     }
@@ -470,7 +479,6 @@ fn serve_clone(
             }
             Ok((DaemonMsg::ClipboardOffer(o), _)) => {
                 if let Some(id) = clone_id.clone() {
-                    tracing::debug!("clipboard offer from clone '{id}': {} mime(s)", o.mime_types.len());
                     broker_offer(&handle, &viewer, o, &id);
                 }
             }
