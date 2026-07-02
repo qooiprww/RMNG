@@ -77,12 +77,16 @@ fn migrate_legacy(raw: &serde_json::Value, cfg: &mut AppConfig) -> bool {
     // Retired: the whole Proxmox backend is gone. Scrub any `proxmox` block from disk;
     // carry its `hostnamePrefix` into `docker.hostnamePrefix` when the file predates the
     // Docker backend (no `docker` key), so the operator's clone-name prefix survives.
+    // A blank legacy prefix is NOT folded — it would clobber the docker default.
     let has_proxmox = raw.get("proxmox").is_some();
     if has_proxmox {
         tracing::info!("scrubbing retired proxmox settings from config");
         if raw.get("docker").is_none() {
-            if let Some(prefix) =
-                raw.get("proxmox").and_then(|p| p.get("hostnamePrefix")).and_then(|v| v.as_str())
+            if let Some(prefix) = raw
+                .get("proxmox")
+                .and_then(|p| p.get("hostnamePrefix"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
             {
                 tracing::info!("carrying proxmox.hostnamePrefix into docker.hostnamePrefix");
                 cfg.docker.hostname_prefix = prefix.to_string();
@@ -255,6 +259,33 @@ mod tests {
     }
 
     #[test]
+    fn subnet_validated_at_merge() {
+        let base = AppConfig::default(); // pre-setup: subnet is editable, but must be valid
+        let set = |s: &str| serde_json::json!({ "docker": { "subnet": s } });
+        // Valid CIDRs across the allowed prefix range are accepted.
+        for good in ["10.99.0.0/24", "172.30.0.0/16", "192.168.0.0/20"] {
+            let ok = merge_update(&base, set(good)).unwrap();
+            assert_eq!(ok.docker.subnet, good);
+        }
+        // Bad format / bad prefix / non-IP are all rejected, naming the field.
+        for bad in [
+            "10.99.0.0",      // no prefix
+            "10.99.0.0/",     // empty prefix
+            "10.99.0.0/8",    // prefix too wide (<16)
+            "10.99.0.0/25",   // prefix too narrow (>24)
+            "10.99.0/24",     // not a full IPv4 address
+            "banana/24",      // non-IP
+            "fd00::/24",      // IPv6 not supported
+        ] {
+            let e = merge_update(&base, set(bad)).unwrap_err();
+            assert!(e.to_string().contains("docker.subnet"), "subnet {bad:?} err: {e}");
+        }
+        // Blank = unchanged (deep-merge collapses it before validation) — never an error.
+        let ok = merge_update(&base, set("")).unwrap();
+        assert_eq!(ok.docker.subnet, base.docker.subnet);
+    }
+
+    #[test]
     fn setup_complete_latches_one_way() {
         // false → true is allowed (the wizard finishing).
         let base = AppConfig::default();
@@ -299,6 +330,13 @@ mod tests {
         let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
         assert!(migrate_legacy(&raw, &mut cfg));
         assert_eq!(cfg.docker.hostname_prefix, "new-");
+
+        // A blank legacy prefix is NOT folded — the docker default survives
+        // (still scrubbed / rewrite flagged, since the proxmox block is present).
+        let raw = serde_json::json!({ "proxmox": { "hostnamePrefix": "" } });
+        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(migrate_legacy(&raw, &mut cfg));
+        assert_eq!(cfg.docker.hostname_prefix, "pega-"); // default kept
 
         // No `proxmox` key and a fully-migrated file → no rewrite from proxmox scrubbing.
         let raw = serde_json::json!({ "docker": { "hostnamePrefix": "keep-" } });
@@ -384,7 +422,24 @@ pub fn merge_update(base: &AppConfig, incoming: serde_json::Value) -> Result<App
         merged.presets = merge_presets(&base.presets, &rows);
     }
     enforce_categories(base, &merged)?;
+    validate_docker_subnet(&merged.docker.subnet)?;
     Ok(merged)
+}
+
+/// Reject a `docker.subnet` that isn't an IPv4 CIDR with a `/16`–`/24` prefix (the
+/// design range for the `rmng` bridge: room for the `.1` gateway / `.2` control-server /
+/// `.10+` clone pool without an absurdly large network). Validated on the merged value,
+/// so a bad subnet can never be saved; blank-string "unchanged" is already collapsed by
+/// `deep_merge`, so this always sees a concrete value (the default is valid).
+fn validate_docker_subnet(subnet: &str) -> Result<()> {
+    let ok = subnet.split_once('/').is_some_and(|(ip, prefix)| {
+        ip.parse::<std::net::Ipv4Addr>().is_ok()
+            && prefix.parse::<u8>().is_ok_and(|p| (16..=24).contains(&p))
+    });
+    if !ok {
+        bail!("docker.subnet must be an IPv4 CIDR with a /16–/24 prefix (e.g. 10.99.0.0/24), got {subnet:?}");
+    }
+    Ok(())
 }
 
 /// Guard the effect-category invariants on a merged config. Once first-run setup has
