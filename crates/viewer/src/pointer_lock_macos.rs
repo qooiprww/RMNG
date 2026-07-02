@@ -89,13 +89,6 @@ impl PointerLock {
             return;
         }
 
-        // Disassociate the cursor from physical pointer position.
-        // The cursor stays frozen at its current location; no per-frame warping needed —
-        // the OS holds the freeze until CGAssociateMouseAndMouseCursorPosition(true).
-        let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
-        // Hide the local cursor so the remote's cursor texture (set via GDK) is visible.
-        NSCursor::hide();
-
         // Sub-pixel accumulator shared across block invocations.
         // Mirrors pointer_lock.rs (Wayland) State::rem_x / rem_y.
         let acc: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((0.0, 0.0)));
@@ -104,6 +97,9 @@ impl PointerLock {
 
         // Local NSEvent monitor: runs in-process, on the main thread, no TCC permission.
         // The block receives each mouse-moved / drag event and extracts deltaX/Y.
+        //
+        // Install the monitor FIRST (before hide/disassociate) so that if the runtime
+        // declines (returns nil) we can bail out with nothing to roll back.
         let block = {
             let (writer, acc) = (writer.clone(), acc.clone());
             RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
@@ -137,6 +133,37 @@ impl PointerLock {
         // SAFETY: called on the main thread; block is heap-allocated via RcBlock.
         let monitor =
             unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) };
+
+        // Finding 1: the runtime can return nil if it declines the monitor install.
+        // In that case bail out immediately — nothing has been hidden or disassociated
+        // yet, so no rollback is needed.
+        if monitor.is_none() {
+            tracing::warn!(
+                "macOS pointer lock: NSEvent local monitor install failed (runtime returned nil); \
+                 pointer lock NOT engaged"
+            );
+            return;
+        }
+
+        // Hide the local cursor so the remote's cursor texture (set via GDK) is visible.
+        NSCursor::hide();
+
+        // Disassociate the cursor from physical pointer position.
+        // The cursor stays frozen at its current location; no per-frame warping needed —
+        // the OS holds the freeze until CGAssociateMouseAndMouseCursorPosition(true).
+        //
+        // Finding 2: a failed disassociation means the cursor is NOT frozen — relative
+        // deltas would arrive while absolute motion is still active, so abort here.
+        // Roll back the hide before returning.
+        if let Err(cg_err) = CGDisplay::associate_mouse_and_mouse_cursor_position(false) {
+            tracing::warn!(
+                "macOS pointer lock: CGAssociateMouseAndMouseCursorPosition(false) failed \
+                 (error {cg_err}); pointer lock NOT engaged"
+            );
+            NSCursor::unhide();
+            return;
+        }
+
         *self.monitor.borrow_mut() = monitor;
         self.engaged.set(true);
         tracing::info!("macOS pointer lock engaged");
@@ -154,7 +181,12 @@ impl PointerLock {
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
         NSCursor::unhide();
-        let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+        if let Err(cg_err) = CGDisplay::associate_mouse_and_mouse_cursor_position(true) {
+            tracing::warn!(
+                "macOS pointer lock: CGAssociateMouseAndMouseCursorPosition(true) failed on \
+                 release (error {cg_err}); cursor may remain frozen"
+            );
+        }
         self.engaged.set(false);
         tracing::info!("macOS pointer lock released");
     }
