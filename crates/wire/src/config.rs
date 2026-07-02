@@ -36,8 +36,7 @@ fn default_daemon_mcp() -> u16 {
 /// `Yuv444` recovers full chroma using the RDP **AVC444** packing carried in a single
 /// double-height `W×2H` stream (main view stacked over an auxiliary chroma view),
 /// reassembled to 4:4:4 on the GPU at the viewer. Server-wide, chosen at launch
-/// (`config.chroma` or the `RMNG_CHROMA` env override); the viewer learns the active
-/// mode from the port-1 connect handshake.
+/// (`config.chroma`); the viewer learns the active mode from the port-1 connect handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export, export_to = "../../../frontend/app/lib/wire/")]
@@ -47,17 +46,6 @@ pub enum ChromaMode {
     Yuv420,
     /// 4:4:4 — AVC444 double-height stream (≤1440p per monitor).
     Yuv444,
-}
-
-impl ChromaMode {
-    /// Parse the `RMNG_CHROMA` env value (`yuv420`/`420`, `yuv444`/`444`); `None` if unset/unknown.
-    pub fn from_env_value(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "yuv420" | "420" | "i420" | "nv12" => Some(Self::Yuv420),
-            "yuv444" | "444" | "avc444" => Some(Self::Yuv444),
-            _ => None,
-        }
-    }
 }
 
 impl Default for ListenConfig {
@@ -141,19 +129,26 @@ pub struct ProxmoxConfig {
     /// SSH target for the Proxmox node, e.g. `root@10.0.0.100` (secret-ish).
     #[serde(default)]
     pub ssh: String,
-    /// OUI prefix for freshly-generated clone MACs, e.g. `BC:24:11`. A CoW clone inherits
-    /// the template's MAC, so `clone.sh` regenerates one with this prefix to avoid a
-    /// collision on the shared bridge. Config-only (not surfaced in the Settings UI).
-    #[serde(default = "default_mac_prefix")]
-    pub mac_prefix: String,
+    /// Proxmox storage pool that backs freshly-provisioned CT volumes, e.g. `local-lvm`.
+    /// **One-time**: baked into the CT's volumes/bind-mounts at provision, so it can only
+    /// be set during first-run setup (changing it later wouldn't migrate existing CTs).
+    #[serde(default = "default_storage")]
+    pub storage: String,
+    /// Proxmox network bridge clone NICs attach to, e.g. `vmbr0`. **One-time**: baked into
+    /// the CT's netif at provision, so it can only be set during first-run setup.
+    #[serde(default = "default_bridge")]
+    pub bridge: String,
     /// Prefix for derived clone hostnames, e.g. `pega-` → `pega-dev-123` / `pega-my-task`.
     /// Sanitized to DNS-label-safe chars at use; blank in the UI keeps the stored value.
     #[serde(default = "default_hostname_prefix")]
     pub hostname_prefix: String,
 }
 
-fn default_mac_prefix() -> String {
-    "BC:24:11".into()
+fn default_storage() -> String {
+    "local-lvm".into()
+}
+fn default_bridge() -> String {
+    "vmbr0".into()
 }
 fn default_hostname_prefix() -> String {
     "pega-".into()
@@ -163,7 +158,8 @@ impl Default for ProxmoxConfig {
     fn default() -> Self {
         Self {
             ssh: String::new(),
-            mac_prefix: default_mac_prefix(),
+            storage: default_storage(),
+            bridge: default_bridge(),
             hostname_prefix: default_hostname_prefix(),
         }
     }
@@ -202,9 +198,21 @@ pub struct AppConfig {
     /// Data directory (state.json, chats, uploads, hosts mounts, secrets).
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    /// Built frontend bundle directory served on the web port.
+    /// Built frontend bundle directory served on the web port. Empty (the default) serves
+    /// the frontend embedded in the binary; a non-empty path serves the bundle from disk.
+    /// Restart-required (the static-file service is wired at startup).
     #[serde(default = "default_static_dir")]
     pub static_dir: String,
+    /// Unix socket the clone-daemons connect to (media plane over `SCM_RIGHTS`, not the
+    /// network). Restart-required (the socket is bound at startup).
+    #[serde(default = "default_clone_socket")]
+    pub clone_socket: String,
+    /// Latched `true` by the first-run setup wizard once setup is complete; gates the
+    /// frontend until then. A `config.json` missing this key entirely is grandfathered to
+    /// `true` at load time when a proxmox ssh target is already configured (see
+    /// `control-server::config::load`).
+    #[serde(default)]
+    pub setup_complete: bool,
     #[serde(default)]
     pub monitors: Vec<MonitorSpec>,
     #[serde(default)]
@@ -219,8 +227,8 @@ pub struct AppConfig {
     /// by ticket label when cloning from a ticket; required pick otherwise.
     #[serde(default)]
     pub presets: Vec<Preset>,
-    /// Chroma subsampling for the viewer video stream (default 4:2:0). The `RMNG_CHROMA`
-    /// env var overrides this at load time.
+    /// Chroma subsampling for the viewer video stream (default 4:2:0). Restart-required
+    /// (the media plane's encode path is wired at startup).
     #[serde(default)]
     pub chroma: ChromaMode,
     /// Vision-LLM inference server the needs-human detector (`clone-daemon wait-for-stuck`)
@@ -239,6 +247,8 @@ impl Default for AppConfig {
             agent_port: default_agent_port(),
             data_dir: default_data_dir(),
             static_dir: default_static_dir(),
+            clone_socket: default_clone_socket(),
+            setup_complete: false,
             monitors: Vec::new(),
             proxmox: ProxmoxConfig::default(),
             claude: ClaudeConfig::default(),
@@ -260,7 +270,10 @@ fn default_data_dir() -> String {
     "data".into()
 }
 fn default_static_dir() -> String {
-    "frontend/build/client".into()
+    String::new()
+}
+fn default_clone_socket() -> String {
+    "/srv/rmng-sock/clones.sock".into()
 }
 
 impl AppConfig {
@@ -284,8 +297,12 @@ impl AppConfig {
             agent_port: self.agent_port,
             data_dir: self.data_dir.clone(),
             static_dir: self.static_dir.clone(),
+            clone_socket: self.clone_socket.clone(),
+            setup_complete: self.setup_complete,
             monitors: self.monitors.clone(),
             proxmox_ssh_set: !self.proxmox.ssh.is_empty(),
+            proxmox_storage: self.proxmox.storage.clone(),
+            proxmox_bridge: self.proxmox.bridge.clone(),
             proxmox_hostname_prefix: self.proxmox.hostname_prefix.clone(),
             claude: self.claude.clone(),
             clone_groups: self.clone_groups.clone(),
@@ -306,14 +323,29 @@ pub struct AppConfigRedacted {
     pub agent_port: u16,
     pub data_dir: String,
     pub static_dir: String,
+    pub clone_socket: String,
+    pub setup_complete: bool,
     pub monitors: Vec<MonitorSpec>,
     pub proxmox_ssh_set: bool,
+    pub proxmox_storage: String,
+    pub proxmox_bridge: String,
     pub proxmox_hostname_prefix: String,
     pub claude: ClaudeConfig,
     pub clone_groups: Vec<CloneGroup>,
     pub presets: Vec<PresetRedacted>,
     pub chroma: ChromaMode,
     pub detector_inference_url: String,
+}
+
+/// Response body for `PUT /api/config`: the redacted config after the merge, plus
+/// whether the change touched a restart-required setting (the UI surfaces a restart
+/// prompt when `restartRequired` is true).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct ConfigPutResponse {
+    pub config: AppConfigRedacted,
+    pub restart_required: bool,
 }
 
 #[cfg(test)]
@@ -326,6 +358,20 @@ mod tests {
         assert_eq!(c.listen.web, 9000);
         assert_eq!(c.listen.video, 9001);
         assert_eq!(c.agent_port, 4096);
+        // New one-time / restart-required fields carry their documented defaults.
+        assert_eq!(c.static_dir, ""); // empty = embedded frontend
+        assert_eq!(c.clone_socket, "/srv/rmng-sock/clones.sock");
+        assert!(!c.setup_complete); // wizard latches this true
+        assert_eq!(c.proxmox.storage, "local-lvm");
+        assert_eq!(c.proxmox.bridge, "vmbr0");
+        assert_eq!(c.proxmox.hostname_prefix, "pega-");
+        // Missing keys fall back to the same defaults (older config.json stays valid).
+        let d: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.static_dir, "");
+        assert_eq!(d.clone_socket, "/srv/rmng-sock/clones.sock");
+        assert!(!d.setup_complete);
+        assert_eq!(d.proxmox.storage, "local-lvm");
+        assert_eq!(d.proxmox.bridge, "vmbr0");
         let mons = c.effective_monitors();
         assert_eq!(mons.len(), 2);
         assert_eq!((mons[0].width, mons[0].height, mons[0].x), (2560, 1440, 2560));
@@ -339,17 +385,12 @@ mod tests {
         // Default is 4:2:0 (today's behavior / full capacity).
         assert_eq!(ChromaMode::default(), ChromaMode::Yuv420);
         assert_eq!(AppConfig::default().chroma, ChromaMode::Yuv420);
-        // Wire/JSON representation is lowercase, matching RMNG_CHROMA values.
+        // Wire/JSON representation is lowercase.
         assert_eq!(serde_json::to_string(&ChromaMode::Yuv420).unwrap(), "\"yuv420\"");
         assert_eq!(serde_json::to_string(&ChromaMode::Yuv444).unwrap(), "\"yuv444\"");
         // Missing field falls back to the default (older config.json stays valid).
         let c: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(c.chroma, ChromaMode::Yuv420);
-        // Env parser accepts the documented spellings.
-        assert_eq!(ChromaMode::from_env_value("yuv444"), Some(ChromaMode::Yuv444));
-        assert_eq!(ChromaMode::from_env_value("444"), Some(ChromaMode::Yuv444));
-        assert_eq!(ChromaMode::from_env_value(" YUV420 "), Some(ChromaMode::Yuv420));
-        assert_eq!(ChromaMode::from_env_value("nonsense"), None);
         // Redaction passes chroma through (non-secret).
         let r = AppConfig { chroma: ChromaMode::Yuv444, ..Default::default() }.redacted();
         assert_eq!(r.chroma, ChromaMode::Yuv444);
@@ -382,7 +423,14 @@ mod tests {
     #[test]
     fn redaction_hides_secrets() {
         let c = AppConfig {
-            proxmox: ProxmoxConfig { ssh: "root@10.0.0.100".into(), ..Default::default() },
+            clone_socket: "/srv/rmng-sock/clones.sock".into(),
+            setup_complete: true,
+            proxmox: ProxmoxConfig {
+                ssh: "root@10.0.0.100".into(),
+                storage: "fast-nvme".into(),
+                bridge: "vmbr1".into(),
+                ..Default::default()
+            },
             presets: vec![
                 Preset {
                     name: "med".into(),
@@ -404,5 +452,10 @@ mod tests {
         assert_eq!(r.presets[0].vars.len(), 1);
         assert!(!r.presets[1].linear_key_set);
         assert!(r.proxmox_ssh_set);
+        // New non-secret fields pass through verbatim.
+        assert_eq!(r.clone_socket, "/srv/rmng-sock/clones.sock");
+        assert!(r.setup_complete);
+        assert_eq!(r.proxmox_storage, "fast-nvme");
+        assert_eq!(r.proxmox_bridge, "vmbr1");
     }
 }

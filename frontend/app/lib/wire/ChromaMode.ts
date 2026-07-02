@@ -7,7 +7,6 @@
  * `Yuv444` recovers full chroma using the RDP **AVC444** packing carried in a single
  * double-height `W×2H` stream (main view stacked over an auxiliary chroma view),
  * reassembled to 4:4:4 on the GPU at the viewer. Server-wide, chosen at launch
- * (`config.chroma` or the `RMNG_CHROMA` env override); the viewer learns the active
- * mode from the port-1 connect handshake.
+ * (`config.chroma`); the viewer learns the active mode from the port-1 connect handshake.
  */
 export type ChromaMode = "yuv420" | "yuv444";

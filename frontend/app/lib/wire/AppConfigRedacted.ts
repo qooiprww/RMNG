@@ -10,4 +10,4 @@ import type { PresetRedacted } from "./PresetRedacted";
  * The shape `GET /api/config` returns: same structure as [`AppConfig`] but with
  * every secret replaced by a boolean "is set". Powers the Settings UI.
  */
-export type AppConfigRedacted = { listen: ListenConfig, agentPort: number, dataDir: string, staticDir: string, monitors: Array<MonitorSpec>, proxmoxSshSet: boolean, proxmoxHostnamePrefix: string, claude: ClaudeConfig, cloneGroups: Array<CloneGroup>, presets: Array<PresetRedacted>, chroma: ChromaMode, detectorInferenceUrl: string, };
+export type AppConfigRedacted = { listen: ListenConfig, agentPort: number, dataDir: string, staticDir: string, cloneSocket: string, setupComplete: boolean, monitors: Array<MonitorSpec>, proxmoxSshSet: boolean, proxmoxStorage: string, proxmoxBridge: string, proxmoxHostnamePrefix: string, claude: ClaudeConfig, cloneGroups: Array<CloneGroup>, presets: Array<PresetRedacted>, chroma: ChromaMode, detectorInferenceUrl: string, };

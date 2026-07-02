@@ -162,10 +162,15 @@ pub async fn clone_ct(
     let env_content: String =
         env.iter().filter(|v| !v.key.is_empty()).map(|v| format!("{}={}\n", v.key, v.value)).collect();
     let env_b64 = b64_encode(env_content.as_bytes());
+    // OUI prefix for freshly-generated clone MACs, e.g. `BC:24:11`. A CoW clone inherits
+    // the template's MAC, so `clone.sh` regenerates one with this prefix to avoid a
+    // collision on the shared bridge. TODO(task-3): Task 2 removed `ProxmoxConfig.mac_prefix`
+    // and inlined this literal so the workspace keeps compiling; re-wire the real source.
+    let mac_prefix = "BC:24:11";
     let result = run_remote(
         &cfg.ssh,
         CLONE_SCRIPT,
-        &[source_id, new_hostname, &cfg.mac_prefix, username, &env_b64],
+        &[source_id, new_hostname, mac_prefix, username, &env_b64],
         on_progress,
     )
     .await?;

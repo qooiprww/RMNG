@@ -1,27 +1,27 @@
-//! Config loading. `config.json` (path via `RMNG_CONFIG`, else `./config.json`)
-//! holds every setting incl. secrets; missing → defaults. The Settings UI
-//! (`/api/config`, Phase 2) is the intended editor — this is just load/save.
+//! Config loading. `./config.json` is the single source of truth: it holds every
+//! setting incl. secrets (no `RMNG_*` env overrides); missing → defaults. The Settings
+//! UI (`/api/config`) is the intended editor — this is load/save + merge/category logic.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use wire::{AppConfig, ChromaMode};
+use anyhow::{bail, Context, Result};
+use wire::AppConfig;
 
 pub fn config_path() -> PathBuf {
-    std::env::var_os("RMNG_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("config.json"))
+    PathBuf::from("config.json")
 }
 
 pub fn load() -> Result<AppConfig> {
     let path = config_path();
-    let mut cfg = match std::fs::read_to_string(&path) {
+    let cfg = match std::fs::read_to_string(&path) {
         Ok(s) => {
             let mut cfg: AppConfig = serde_json::from_str(&s)
                 .with_context(|| format!("parsing {}", path.display()))?;
             // Legacy fields (serde ignores them at parse): fold what's still useful
             // into the current shape and rewrite the file once, so dead secrets
             // (long-lived clone tokens, per-workspace Linear keys) don't linger on disk.
+            // Also scrubs the retired `proxmox.macPrefix` and grandfathers a pre-wizard
+            // config's `setupComplete`.
             let raw = serde_json::from_str::<serde_json::Value>(&s).unwrap_or_default();
             if migrate_legacy(&raw, &mut cfg) {
                 tracing::info!("migrating legacy config fields in {}", path.display());
@@ -35,13 +35,6 @@ pub fn load() -> Result<AppConfig> {
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    // `RMNG_CHROMA` overrides the file/default chroma mode at load time.
-    if let Ok(v) = std::env::var("RMNG_CHROMA") {
-        match ChromaMode::from_env_value(&v) {
-            Some(m) => cfg.chroma = m,
-            None => tracing::warn!("ignoring unrecognized RMNG_CHROMA={v:?}"),
-        }
-    }
     Ok(cfg)
 }
 
@@ -49,7 +42,11 @@ pub fn load() -> Result<AppConfig> {
 /// rewritten. Legacy `envPresets` (env-only presets, pre Linear unification) seed
 /// `presets` (no labels/key — the operator adds those in Settings). Legacy `linear`
 /// workspace keys (now per-preset) and `cloneAccounts` long-lived tokens (dead since
-/// the single-token model) are dropped; the rewrite scrubs them from disk.
+/// the single-token model) are dropped; the rewrite scrubs them from disk. The retired
+/// `proxmox.macPrefix` is likewise scrubbed. Finally, a config written before the
+/// first-run setup wizard existed (no `setupComplete` key) but that already has a
+/// proxmox ssh target is **grandfathered** to `setupComplete = true`, so upgrades don't
+/// bounce operators back through setup.
 fn migrate_legacy(raw: &serde_json::Value, cfg: &mut AppConfig) -> bool {
     let non_empty = |k: &str| match raw.get(k) {
         Some(serde_json::Value::Array(a)) => !a.is_empty(),
@@ -76,7 +73,24 @@ fn migrate_legacy(raw: &serde_json::Value, cfg: &mut AppConfig) -> bool {
     if non_empty("linear") {
         tracing::info!("dropping legacy per-workspace Linear keys (now per-preset — re-enter in Settings)");
     }
-    non_empty("envPresets") || non_empty("linear") || non_empty("cloneAccounts")
+    // Retired: MACs are now generated with a compiled-in OUI, not a config field.
+    let has_mac_prefix = raw.get("proxmox").and_then(|p| p.get("macPrefix")).is_some();
+    if has_mac_prefix {
+        tracing::info!("scrubbing retired proxmox.macPrefix from config");
+    }
+    // Grandfather setupComplete for configs predating the setup wizard: only when the key
+    // is entirely absent (raw) AND a proxmox ssh target is already configured (parsed).
+    let has_setup_key = raw.get("setupComplete").is_some();
+    let grandfather = !has_setup_key && !cfg.proxmox.ssh.is_empty();
+    if grandfather {
+        tracing::info!("grandfathering setupComplete=true (existing config with a proxmox ssh target)");
+        cfg.setup_complete = true;
+    }
+    non_empty("envPresets")
+        || non_empty("linear")
+        || non_empty("cloneAccounts")
+        || has_mac_prefix
+        || grandfather
 }
 
 #[cfg(test)]
@@ -174,13 +188,155 @@ mod tests {
         let cleared = merge_update(&merged, serde_json::json!({ "cloneGroups": [] })).unwrap();
         assert!(cleared.clone_groups.is_empty());
     }
+
+    /// A base config that has finished first-run setup (one-time fields locked).
+    fn setup_done() -> AppConfig {
+        let mut base = AppConfig::default();
+        base.setup_complete = true;
+        base.data_dir = "data".into();
+        base.proxmox.storage = "local-lvm".into();
+        base.proxmox.bridge = "vmbr0".into();
+        base
+    }
+
+    #[test]
+    fn one_time_fields_rejected_after_setup() {
+        let base = setup_done();
+        // data_dir
+        let e = merge_update(&base, serde_json::json!({ "dataDir": "other" })).unwrap_err();
+        assert!(e.to_string().contains("dataDir"), "err: {e}");
+        assert!(e.to_string().contains("first-run"), "err: {e}");
+        // proxmox.storage
+        let e = merge_update(&base, serde_json::json!({ "proxmox": { "storage": "fast-nvme" } }))
+            .unwrap_err();
+        assert!(e.to_string().contains("storage"), "err: {e}");
+        // proxmox.bridge
+        let e = merge_update(&base, serde_json::json!({ "proxmox": { "bridge": "vmbr1" } }))
+            .unwrap_err();
+        assert!(e.to_string().contains("bridge"), "err: {e}");
+        // A no-op resend of the same values is fine (final value == base value).
+        let ok = merge_update(
+            &base,
+            serde_json::json!({ "dataDir": "data", "proxmox": { "storage": "local-lvm", "bridge": "vmbr0" } }),
+        )
+        .unwrap();
+        assert_eq!(ok.data_dir, "data");
+        // Blank strings are unchanged (deep-merge protects them) — never an error.
+        let ok = merge_update(
+            &base,
+            serde_json::json!({ "dataDir": "", "proxmox": { "storage": "", "bridge": "" } }),
+        )
+        .unwrap();
+        assert_eq!(ok.proxmox.storage, "local-lvm");
+    }
+
+    #[test]
+    fn one_time_fields_editable_before_setup() {
+        // Before setup completes, the one-time fields are freely editable.
+        let base = AppConfig::default(); // setup_complete == false
+        let merged = merge_update(
+            &base,
+            serde_json::json!({
+                "dataDir": "elsewhere",
+                "proxmox": { "storage": "fast-nvme", "bridge": "vmbr9" },
+            }),
+        )
+        .unwrap();
+        assert_eq!(merged.data_dir, "elsewhere");
+        assert_eq!(merged.proxmox.storage, "fast-nvme");
+        assert_eq!(merged.proxmox.bridge, "vmbr9");
+    }
+
+    #[test]
+    fn setup_complete_latches_one_way() {
+        // false → true is allowed (the wizard finishing).
+        let base = AppConfig::default();
+        let merged = merge_update(&base, serde_json::json!({ "setupComplete": true })).unwrap();
+        assert!(merged.setup_complete);
+        // true → false is rejected (the latch can't be undone via the API).
+        let base = setup_done();
+        let e = merge_update(&base, serde_json::json!({ "setupComplete": false })).unwrap_err();
+        assert!(e.to_string().contains("setupComplete"), "err: {e}");
+        // true → true (or omitted) is fine.
+        let ok = merge_update(&base, serde_json::json!({ "setupComplete": true })).unwrap();
+        assert!(ok.setup_complete);
+        let ok = merge_update(&base, serde_json::json!({})).unwrap();
+        assert!(ok.setup_complete);
+    }
+
+    #[test]
+    fn migrate_grandfathers_setup_complete() {
+        // ssh set + setupComplete key absent → grandfathered true (and rewrite).
+        let raw = serde_json::json!({ "proxmox": { "ssh": "root@node" } });
+        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!cfg.setup_complete); // serde default before migration
+        assert!(migrate_legacy(&raw, &mut cfg));
+        assert!(cfg.setup_complete);
+
+        // ssh empty + key absent → stays false (no rewrite from grandfathering).
+        let raw = serde_json::json!({ "proxmox": { "ssh": "" } });
+        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!migrate_legacy(&raw, &mut cfg));
+        assert!(!cfg.setup_complete);
+
+        // Explicit false present → respected, never grandfathered, no rewrite.
+        let raw = serde_json::json!({ "setupComplete": false, "proxmox": { "ssh": "root@node" } });
+        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!migrate_legacy(&raw, &mut cfg));
+        assert!(!cfg.setup_complete);
+    }
+
+    #[test]
+    fn migrate_scrubs_mac_prefix() {
+        // A legacy macPrefix field triggers a scrubbing rewrite; the parsed cfg is unaffected.
+        let raw = serde_json::json!({ "proxmox": { "ssh": "", "macPrefix": "AA:BB:CC" } });
+        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(migrate_legacy(&raw, &mut cfg));
+
+        // No macPrefix → no rewrite (on this account alone).
+        let raw = serde_json::json!({ "proxmox": { "ssh": "" } });
+        let mut cfg: AppConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!migrate_legacy(&raw, &mut cfg));
+    }
+
+    #[test]
+    fn restart_required_matrix() {
+        let base = AppConfig::default();
+        // No change → no restart.
+        assert!(!restart_required(&base, &base.clone()));
+
+        // Each restart-required trigger flips it true.
+        let mut n = base.clone();
+        n.listen.web = 8080;
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
+        n.listen.video = 8081;
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
+        n.listen.clone_mcp = 8082;
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
+        n.listen.global_mcp = 8083;
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
+        n.clone_socket = "/tmp/other.sock".into();
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
+        n.static_dir = "frontend/build/client".into();
+        assert!(restart_required(&base, &n));
+        let mut n = base.clone();
+        n.chroma = wire::ChromaMode::Yuv444;
+        assert!(restart_required(&base, &n));
+
+        // A non-trigger field (immediate-apply) does NOT require a restart.
+        let mut n = base.clone();
+        n.proxmox.hostname_prefix = "other-".into();
+        assert!(!restart_required(&base, &n));
+    }
 }
 
-/// Resolve the state.json path: `RMNG_STATE_FILE` override else `<data_dir>/state.json`.
+/// Resolve the state.json path: always `<data_dir>/state.json`.
 pub fn state_path(cfg: &AppConfig) -> PathBuf {
-    if let Some(p) = std::env::var_os("RMNG_STATE_FILE") {
-        return PathBuf::from(p);
-    }
     Path::new(&cfg.data_dir).join("state.json")
 }
 
@@ -216,7 +372,48 @@ pub fn merge_update(base: &AppConfig, incoming: serde_json::Value) -> Result<App
     if let Some(serde_json::Value::Array(rows)) = incoming_presets {
         merged.presets = merge_presets(&base.presets, &rows);
     }
+    enforce_categories(base, &merged)?;
     Ok(merged)
+}
+
+/// Guard the effect-category invariants on a merged config. Once first-run setup has
+/// completed (`base.setup_complete`), the **one-time** fields (baked into CTs at
+/// provision) can't change, and the `setupComplete` latch can't be undone. Blank-string
+/// "unchanged" fields are already collapsed by `deep_merge`, so these compare final
+/// values — a client re-sending the current value is a no-op, not an error.
+fn enforce_categories(base: &AppConfig, merged: &AppConfig) -> Result<()> {
+    if base.setup_complete && !merged.setup_complete {
+        bail!("setupComplete cannot be turned off — it is a one-way latch set during first-run setup");
+    }
+    if base.setup_complete {
+        if merged.data_dir != base.data_dir {
+            bail!("dataDir is a one-time setting (set during first-run setup) and cannot be changed after setup");
+        }
+        if merged.proxmox.storage != base.proxmox.storage {
+            bail!("proxmox.storage is a one-time setting (set during first-run setup) and cannot be changed after setup");
+        }
+        if merged.proxmox.bridge != base.proxmox.bridge {
+            bail!("proxmox.bridge is a one-time setting (set during first-run setup) and cannot be changed after setup");
+        }
+    }
+    Ok(())
+}
+
+/// Whether applying `new` over `old` requires a server restart to take effect. The
+/// restart-required settings are the ones wired once at startup: the four listen ports,
+/// the clone-daemon unix socket, the static-file directory, and the chroma mode.
+/// Everything else applies live.
+// Consumed by web.rs's PUT /api/config handler in Task 3 (returns ConfigPutResponse);
+// allow(dead_code) keeps this transitional commit warning-free until then.
+#[allow(dead_code)]
+pub fn restart_required(old: &AppConfig, new: &AppConfig) -> bool {
+    old.listen.web != new.listen.web
+        || old.listen.video != new.listen.video
+        || old.listen.clone_mcp != new.listen.clone_mcp
+        || old.listen.global_mcp != new.listen.global_mcp
+        || old.clone_socket != new.clone_socket
+        || old.static_dir != new.static_dir
+        || old.chroma != new.chroma
 }
 
 /// Merge the UI's preset rows by name: a blank `linearKey` keeps the stored key of
