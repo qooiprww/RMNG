@@ -258,46 +258,70 @@ pub async fn clone_container(
     // The rmng bridge is lazy; make sure it's up before allocating an IP on it.
     docker.ensure_network().await?;
 
-    // Allocate the lowest free clone IP, reserving IPs already claimed in state.json (they
-    // may not yet appear in the live network inspect).
-    on_progress("allocate", "allocating a static clone IP");
-    let reserved: Vec<String> =
-        app.store.get().hosts.iter().map(|h| h.host.clone()).filter(|s| !s.is_empty()).collect();
-    let ip = docker.allocate_ip(&reserved).await?;
-    on_progress("allocate", &format!("clone IP {ip}"));
+    // allocate → create → inject/start, with a bounded retry on the IP-allocation race:
+    // two concurrent clones can both pick the lowest free IP (allocate_ip reads state +
+    // a network inspect, neither of which sees the sibling until it STARTS), and Docker
+    // rejects the loser at container start with 403 "Address already in use" (seen live
+    // in the E2E). On that specific failure re-allocate — the winner is attached by then,
+    // so the next inspect skips its IP — and retry with a fresh container.
+    const IP_RACE_ATTEMPTS: usize = 3;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=IP_RACE_ATTEMPTS {
+        // Allocate the lowest free clone IP, reserving IPs already claimed in state.json
+        // (they may not yet appear in the live network inspect).
+        on_progress("allocate", "allocating a static clone IP");
+        let reserved: Vec<String> =
+            app.store.get().hosts.iter().map(|h| h.host.clone()).filter(|s| !s.is_empty()).collect();
+        let ip = docker.allocate_ip(&reserved).await?;
+        on_progress("allocate", &format!("clone IP {ip}"));
 
-    // Create the container (name == host id) from the CANONICAL reference (equivalent to the
-    // caller's input — same image — but keeps `docker ps`'s Image column readable). A stale
-    // same-named container 409s here — the daemon message is surfaced verbatim (gotcha #7).
-    on_progress("create", &format!("creating container {hostname} at {ip}"));
-    let spec = CreateSpec {
-        name: hostname.to_string(),
-        image: reference.clone(),
-        ip: ip.clone(),
-        hostname: hostname.to_string(),
-        env: env.iter().filter(|v| !v.key.is_empty()).map(|v| (v.key.clone(), v.value.clone())).collect(),
-        cpus: cfg.docker.clone_cpus,
-        memory_mb: cfg.docker.clone_memory_mb,
-        sock_source: sock_source_dir(app).await,
-    };
-    let container = match docker.create_clone_container(&spec).await {
-        Ok(id) => id,
-        Err(e) => bail!("{e}"),
-    };
+        // Create the container (name == host id) from the CANONICAL reference (equivalent
+        // to the caller's input — same image — but keeps `docker ps`'s Image column
+        // readable). A stale same-named container 409s here — the daemon message is
+        // surfaced verbatim (gotcha #7).
+        on_progress("create", &format!("creating container {hostname} at {ip}"));
+        let spec = CreateSpec {
+            name: hostname.to_string(),
+            image: reference.clone(),
+            ip: ip.clone(),
+            hostname: hostname.to_string(),
+            env: env.iter().filter(|v| !v.key.is_empty()).map(|v| (v.key.clone(), v.value.clone())).collect(),
+            cpus: cfg.docker.clone_cpus,
+            memory_mb: cfg.docker.clone_memory_mb,
+            sock_source: sock_source_dir(app).await,
+        };
+        let container = match docker.create_clone_container(&spec).await {
+            Ok(id) => id,
+            Err(e) => bail!("{e}"),
+        };
 
-    // From here on, a failure must tear the half-built clone down. Run the rest under a
-    // guard that removes the container + its dind volume on any early return.
-    let result = clone_container_after_create(app, &container, hostname, env, &mut on_progress).await;
-    match result {
-        Ok(()) => Ok((container, ip, reference)),
-        Err(e) => {
-            tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
-            docker.remove_container(&container).await.ok();
-            docker.remove_volume(&crate::docker::DockerCtl::dind_volume_name(hostname)).await.ok();
-            docker.remove_volume(&crate::docker::DockerCtl::ctd_volume_name(hostname)).await.ok();
-            Err(e)
+        // From here on, a failure must tear the half-built clone down. Run the rest under
+        // a guard that removes the container + its dind volumes on any early return.
+        let result = clone_container_after_create(app, &container, hostname, env, &mut on_progress).await;
+        match result {
+            Ok(()) => return Ok((container, ip, reference)),
+            Err(e) => {
+                tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
+                docker.remove_container(&container).await.ok();
+                docker.remove_volume(&crate::docker::DockerCtl::dind_volume_name(hostname)).await.ok();
+                docker.remove_volume(&crate::docker::DockerCtl::ctd_volume_name(hostname)).await.ok();
+                if attempt < IP_RACE_ATTEMPTS && is_address_in_use(&e) {
+                    tracing::warn!("clone {hostname}: IP {ip} lost to a concurrent clone; retrying (attempt {attempt}/{IP_RACE_ATTEMPTS})");
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("clone {hostname}: out of IP-allocation attempts")))
+}
+
+/// True when a container-start failure is Docker's static-IP collision ("failed to set up
+/// container networking: Address already in use") — the one failure class worth an
+/// allocate-again retry.
+fn is_address_in_use(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("Address already in use")
 }
 
 /// The inject → start → wait-ready tail of [`clone_container`], factored out so the caller
