@@ -895,8 +895,11 @@ impl DockerCtl {
     /// positional args), streaming stdout/stderr through **separate per-stream line
     /// buffers** (bollard `LogOutput` chunks are NOT line-aligned — gotcha #1). The
     /// callback fires once per completed line with the stream tag (`"out"`/`"err"`);
-    /// remainders are flushed at EOF. The real exit code comes from `inspect_exec`
-    /// afterward (the stream ending doesn't carry it). No client-side timeout.
+    /// remainders are flushed at EOF. The stdin write is driven concurrently with the
+    /// output drain — the attach is one multiplexed connection, so writing the whole
+    /// script first could deadlock against early output. The real exit code comes from
+    /// `inspect_exec` afterward (the stream ending doesn't carry it). No client-side
+    /// timeout.
     pub async fn exec_script(
         &self,
         container: &str,
@@ -932,31 +935,56 @@ impl DockerCtl {
             bail!("exec started detached unexpectedly");
         };
 
-        // Feed the script, then EOF so `bash -s` runs.
-        input.write_all(script.as_bytes()).await.context("writing script to exec stdin")?;
-        input.shutdown().await.ok();
-        drop(input);
+        // Feed the script CONCURRENTLY with draining output. The exec attach multiplexes
+        // stdin and stdout/stderr over ONE upgraded connection, so writing the whole
+        // script before reading could deadlock: a script that emits enough output early
+        // fills the socket buffers while later script bytes are still unwritten, and
+        // with no client timeout (by design) that hang would be permanent. `join!` keeps
+        // the drain running while stdin flushes; the shutdown (EOF) is what lets
+        // `bash -s` finish parsing.
+        let write_fut = async {
+            let res = input.write_all(script.as_bytes()).await;
+            // Always signal EOF, even after a failed write — bash may still produce a
+            // useful error line, and the real outcome comes from `inspect_exec` below.
+            input.shutdown().await.ok();
+            res
+        };
 
         let mut out_buf = LineSplitter::default();
         let mut err_buf = LineSplitter::default();
-        while let Some(chunk) = output.next().await {
-            let chunk = chunk?;
-            match chunk {
-                LogOutput::StdOut { message } => {
-                    out_buf.push(&message, |line| on_line("out", line));
+        let read_fut = async {
+            while let Some(chunk) = output.next().await {
+                match chunk? {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        out_buf.push(&message, |line| on_line("out", line));
+                    }
+                    LogOutput::StdErr { message } => {
+                        err_buf.push(&message, |line| on_line("err", line));
+                    }
+                    LogOutput::StdIn { .. } => {}
                 }
-                LogOutput::StdErr { message } => {
-                    err_buf.push(&message, |line| on_line("err", line));
-                }
-                LogOutput::Console { message } => {
-                    out_buf.push(&message, |line| on_line("out", line));
-                }
-                LogOutput::StdIn { .. } => {}
             }
-        }
-        // Flush trailing partials (a script may end without a newline).
+            Ok::<(), BollardError>(())
+        };
+        let (write_res, read_res) = tokio::join!(write_fut, read_fut);
+
+        // Flush trailing partials (a script may end without a newline) BEFORE any error
+        // handling, so already-captured output always reaches the caller.
         out_buf.flush(|line| on_line("out", line));
         err_buf.flush(|line| on_line("err", line));
+
+        read_res.with_context(|| format!("streaming exec output from {container}"))?;
+        if let Err(e) = write_res {
+            if is_benign_stdin_write_error(&e) {
+                // The exec process stopped reading stdin before consuming the whole
+                // script (early `exit`, `set -e` bail, bash parse error): the daemon
+                // tears the stdin stream down and the tail write fails. Not fatal —
+                // `inspect_exec` reports the real exit code.
+                tracing::debug!(target: "docker", "exec stdin closed early: {e}");
+            } else {
+                return Err(anyhow!("writing script to exec stdin: {e}"));
+            }
+        }
 
         let code = self.docker.inspect_exec(&exec.id).await?.exit_code.unwrap_or(-1);
         Ok(code)
@@ -1072,6 +1100,21 @@ fn split_reference(reference: &str) -> (String, String) {
 fn short_id(id: &str) -> String {
     let id = id.strip_prefix("sha256:").unwrap_or(id);
     id.chars().take(12).collect()
+}
+
+/// Whether an exec-stdin write error is the *expected* result of the exec process
+/// exiting before consuming all of its stdin (a script that `exit`s early, a `set -e`
+/// bail, a bash parse error): the daemon tears the stdin stream down and the tail write
+/// fails. These are logged, not fatal — `inspect_exec` still reports the real exit code.
+/// Anything else (a genuine transport failure) is surfaced to the caller.
+fn is_benign_stdin_write_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::WriteZero
+    )
 }
 
 /// Read the container hostname from `/etc/hostname` (Docker writes the short id there).
@@ -1378,6 +1421,24 @@ mod tests {
     fn short_id_strips_sha_prefix() {
         assert_eq!(short_id("sha256:abcdef0123456789"), "abcdef012345");
         assert_eq!(short_id("abcdef0123456789"), "abcdef012345");
+    }
+
+    #[test]
+    fn benign_stdin_write_errors_classified() {
+        use std::io::{Error, ErrorKind};
+        // Early-exit teardown shapes are benign (exit code still comes from inspect_exec).
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::WriteZero,
+        ] {
+            assert!(is_benign_stdin_write_error(&Error::new(kind, "closed")), "{kind:?}");
+        }
+        // Genuine transport failures are not.
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other, ErrorKind::TimedOut] {
+            assert!(!is_benign_stdin_write_error(&Error::new(kind, "boom")), "{kind:?}");
+        }
     }
 
     #[test]
