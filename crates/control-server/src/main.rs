@@ -11,6 +11,7 @@ mod claude;
 mod config;
 mod docker;
 mod files;
+mod homes;
 mod jobs;
 mod linear;
 mod mcp;
@@ -57,11 +58,13 @@ async fn main() -> Result<()> {
     }
 
     // Background loops: Claude usage poller, group-rotation loop, per-host agent-state
-    // poller. (The Proxmox-era sshfs host-mount reconciler is gone with the Docker port —
-    // clone homes live in named volumes on the same daemon, not on a remote SSH node.)
+    // poller, and the clone-home reconciler (the Docker-port successor to the Proxmox-era
+    // sshfs mount loop — it symlinks data/hosts/<id> → /proc/<clone-pid>/root/home/rmng so
+    // every clone's home is browsable in one place; needs the container's `pid: "host"`).
     tokio::spawn(claude::run_poller(app.clone()));
     tokio::spawn(claude::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
+    tokio::spawn(homes::run(app.clone()));
 
     // Port 1 (video) — ingest clone dmabufs, VA-API encode, serve the viewer.
     mediaplane::spawn(app.clone());

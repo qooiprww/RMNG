@@ -21,6 +21,10 @@ services:
     privileged: true
     # PID 1 reaper — the server spawns short-lived exec/tar helpers.
     init: true
+    # Share the Docker host's PID namespace so clone PIDs are visible: the clone-home
+    # reconciler symlinks data/hosts/<id> → /proc/<clone-pid>/root/home/rmng, letting you
+    # browse every clone's home in one place (adds no privilege beyond the docker socket).
+    pid: "host"
     restart: unless-stopped
     volumes:
       # The daemon the control-server drives via bollard (unix socket).

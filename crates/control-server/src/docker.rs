@@ -893,6 +893,19 @@ impl DockerCtl {
         }
     }
 
+    /// The container's host PID (`State.Pid`), or `None` when it isn't running (the daemon
+    /// reports pid 0 for stopped containers) or doesn't exist (404). The clone-home
+    /// reconciler ([`crate::homes`]) turns this into a `/proc/<pid>/root/home/rmng` symlink
+    /// under `data/hosts/`; that only resolves when the control-server shares the host PID
+    /// namespace (`pid: "host"` in compose.yaml). A dead daemon is a real error (retried).
+    pub async fn container_pid(&self, name_or_id: &str) -> Result<Option<i64>> {
+        match self.daemon()?.inspect_container(name_or_id, None::<bollard::query_parameters::InspectContainerOptions>).await {
+            Ok(info) => Ok(info.state.and_then(|s| s.pid).filter(|&p| p > 0)),
+            Err(BollardError::DockerResponseServerError { status_code: 404, .. }) => Ok(None),
+            Err(e) => Err(anyhow!("inspecting container {name_or_id}: {e}")),
+        }
+    }
+
     /// The last `n` combined stdout+stderr log lines of a container, newest at the end,
     /// as one newline-joined string. For the wait-ready death path: a clone whose systemd
     /// PID 1 died before its daemon registered leaves its failure in these logs, which the
