@@ -31,4 +31,11 @@ cloneCpus: number,
 /**
  * Memory limit per clone in MiB (+8 GiB swap), matching LXC parity.
  */
-cloneMemoryMb: number, };
+cloneMemoryMb: number, 
+/**
+ * Registry reference the setup wizard pulls the clone template from, then retags
+ * locally to `rmng/template:<name>`. Short form (`repo:tag`) so it matches what the
+ * pulled image's RepoTags will contain. Immediate-apply (read fresh per pull); no
+ * secret (public image over the local daemon), so it passes through the redacted view.
+ */
+templateReference: string, };

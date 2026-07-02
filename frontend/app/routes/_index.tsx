@@ -171,7 +171,7 @@ function Dashboard({ state }: { state: ControlState }) {
     .filter(
       (o) =>
         o.status === "running" &&
-        (o.kind === "bootstrap" || o.kind === "commit" || o.kind === "delete"),
+        (o.kind === "pull" || o.kind === "commit" || o.kind === "delete"),
     )
     .map((o) => o.id)
     .join(",");
@@ -383,7 +383,7 @@ function Dashboard({ state }: { state: ControlState }) {
             images={images}
             loading={imagesLoading}
             buildBusy={state.operations.some(
-              (o) => o.kind === "bootstrap" && o.status === "running",
+              (o) => o.kind === "pull" && o.status === "running",
             )}
             onBuild={(name) => run(bootstrapBaseImage(name))}
             onDelete={(reference) => run(deleteImage(reference))}

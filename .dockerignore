@@ -4,7 +4,8 @@
 # `include_str!`'d at compile time, MUST be in context).
 #
 # NOT excluded, load-bearing:
-#   - gnome-patch/                     (the gnome-build stage compiles the patched shell)
+#   - gnome-patch/                     (template/Dockerfile's gnome-build stage compiles the
+#                                       patched shell; the root Dockerfile no longer does)
 #   - crates/control-server/scripts/   (include_str!'d guest scripts)
 #   - template/setup/                  (the template Dockerfile's provisioning phase scripts)
 

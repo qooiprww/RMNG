@@ -88,7 +88,7 @@ export interface Host {
   unread?: boolean;
 }
 
-export type OperationKind = "clone" | "delete" | "bootstrap" | "commit";
+export type OperationKind = "clone" | "delete" | "pull" | "commit";
 export type OperationStatus = "running" | "done" | "error";
 
 export interface Operation {

@@ -112,7 +112,7 @@ export function SetupWizard({
   // The bootstrap op is kind "bootstrap" with target === image name (jobs.rs
   // start_bootstrap → make_op(Bootstrap, name, None)).
   const imgOp = buildTarget
-    ? state.operations.find((o) => o.kind === "bootstrap" && o.target === buildTarget)
+    ? state.operations.find((o) => o.kind === "pull" && o.target === buildTarget)
     : undefined;
   const imgRunning = imgOp?.status === "running";
   const imgDone = imgOp?.status === "done";

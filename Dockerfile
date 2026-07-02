@@ -2,31 +2,27 @@
 #
 # RMNG control-server image (BuildKit multi-stage). `docker build -t rmng:latest .` is
 # the canonical build — it replaces the retired build CT. Everything (rust toolchain,
-# gstreamer/libva/libdrm/pipewire dev deps, bun, the patched gnome-shell build) lives in
-# build stages; the runtime stage carries only the GStreamer/VA runtime the server needs
-# to ingest clone dmabufs and VA-API encode. The W6800 GPU is a RUNTIME requirement, not
-# a build one.
+# gstreamer/libva/libdrm/pipewire dev deps, bun) lives in build stages; the runtime stage
+# carries only the GStreamer/VA runtime the server needs to ingest clone dmabufs and
+# VA-API encode. The W6800 GPU is a RUNTIME requirement, not a build one.
 #
 # Nothing is compiled into the server binary (rust-embed is gone): the runtime stage
-# assembles /usr/local/share/rmng/ — the plain clone-daemon + agent-wrapper binaries,
-# gnome-shell.deb, static/ (the frontend) — which assets.rs/web.rs read at runtime.
-# Payloads are stored UNcompressed (no gzip: it only ever existed to keep the rust-embed
-# blob small; registry pushes compress layers anyway). The three build stages are fully
-# independent, so BuildKit runs them in parallel and a source-only rust change rebuilds
-# only the rust layers.
+# assembles /usr/local/share/rmng/ — the plain clone-daemon + agent-wrapper binaries and
+# static/ (the frontend) — which assets.rs/web.rs read at runtime. (The patched
+# gnome-shell .deb is no longer a control-server payload: the retired in-product bootstrap
+# was its only consumer; the clone template — which needs it — is now built by
+# template/Dockerfile.) Payloads are stored UNcompressed (no gzip: it only ever existed to
+# keep the rust-embed blob small; registry pushes compress layers anyway). The two build
+# stages are fully independent, so BuildKit runs them in parallel and a source-only rust
+# change rebuilds only the rust layers.
 #
 # Stages:
 #   1. bun-build   — frontend (react-router → frontend/build/client) + agent-wrapper
 #                    (bun build --compile).
-#   2. gnome-build — patched gnome-shell .deb (shell-01 hide screen-sharing indicator +
-#                    shell-03 enable Shell.Eval) via gnome-patch/build-shell-deb.sh →
-#                    /out/gnome-shell.deb. The build-dep layer is multi-GB but
-#                    build-stage-only and cached until the base image changes; the
-#                    compile layer re-runs only when gnome-patch/ changes.
-#   3. rust-build  — rustup stable; dev deps; cargo build --release clone-daemon
+#   2. rust-build  — rustup stable; dev deps; cargo build --release clone-daemon
 #                    + control-server.
-#   4. runtime     — ubuntu:26.04, runtime libs + /usr/local/share/rmng payloads,
-#                    WORKDIR /data, EXPOSE 9000-9003.
+#   3. runtime     — ubuntu:26.04, runtime libs + /usr/local/share/rmng payloads
+#                    (2 binaries + static/), WORKDIR /data, EXPOSE 9000-9003.
 
 # ---------------------------------------------------------------------------------------
 # 1. bun stage: frontend build + agent-wrapper bun --compile
@@ -50,34 +46,7 @@ RUN cd agent-wrapper \
  && bun build --compile src/server.ts --outfile /tmp/agent-wrapper
 
 # ---------------------------------------------------------------------------------------
-# 2. gnome-build stage: the patched gnome-shell .deb (shell-01 + shell-03), built the
-#    same way the retired build CT did (cs-build-ct.sh → gnome-patch/build-shell-deb.sh).
-#    assets.rs tolerates the deb being absent at runtime (stock-shell fallback), but this
-#    stage makes it always present — no out-of-band artifact step.
-# ---------------------------------------------------------------------------------------
-FROM ubuntu:26.04 AS gnome-build
-ENV DEBIAN_FRONTEND=noninteractive
-# deb-src + gnome-shell build-deps in their OWN layer: multi-GB, but cached until the
-# base image changes — gnome-patch/ edits don't bust it. Apt lists are deliberately kept
-# (build-shell-deb.sh runs `apt-get download/source gnome-shell`). The .deps-done marker
-# makes the script skip its own (redundant) dep install, exactly like cs-build-ct.sh did.
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
- && apt-get update \
- && apt-get build-dep -y gnome-shell \
- && apt-get install -y --no-install-recommends \
-      sassc dpkg-dev meson ninja-build patch ca-certificates \
- && mkdir -p /root/rmng-shell-build && touch /root/rmng-shell-build/.deps-done
-COPY gnome-patch/ /src/gnome-patch/
-# build-shell-deb.sh prints the produced deb path as `DEB=<path>` on stdout; copy it to
-# the fixed path the runtime stage copies from.
-RUN bash /src/gnome-patch/build-shell-deb.sh > /tmp/shell-deb.out \
- && DEB="$(sed -n 's/^DEB=//p' /tmp/shell-deb.out | tail -1)" \
- && test -n "$DEB" && test -f "$DEB" \
- && mkdir -p /out && cp "$DEB" /out/gnome-shell.deb \
- && echo "[gnome-build] gnome-shell.deb: $(du -h /out/gnome-shell.deb | cut -f1)"
-
-# ---------------------------------------------------------------------------------------
-# 3. rust build stage — binaries only (no asset staging; fully parallel with 1 + 2)
+# 2. rust build stage — binaries only (no asset staging; fully parallel with 1)
 # ---------------------------------------------------------------------------------------
 FROM ubuntu:26.04 AS rust-build
 ENV DEBIAN_FRONTEND=noninteractive
@@ -122,7 +91,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/rmng-control-server /out/rmng-control-server
 
 # ---------------------------------------------------------------------------------------
-# 4. runtime stage
+# 3. runtime stage
 # ---------------------------------------------------------------------------------------
 FROM ubuntu:26.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
@@ -143,7 +112,6 @@ COPY --from=rust-build /out/rmng-control-server /usr/local/bin/rmng-control-serv
 # provision-clone.sh installs them — destinations/modes unchanged from the gz era).
 COPY --from=rust-build  /out/clone-daemon               /usr/local/share/rmng/clone-daemon
 COPY --from=bun-build   /tmp/agent-wrapper              /usr/local/share/rmng/agent-wrapper
-COPY --from=gnome-build /out/gnome-shell.deb            /usr/local/share/rmng/gnome-shell.deb
 COPY --from=bun-build   /src/frontend/build/client      /usr/local/share/rmng/static
 
 # CWD-relative config.json + data/ land in the /data volume (config.rs uses relative paths).

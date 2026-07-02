@@ -148,7 +148,12 @@ pub struct Host {
 pub enum OperationKind {
     Clone,
     Delete,
-    Bootstrap,
+    /// Pull the clone template from a registry (replaced the retired in-product
+    /// `Bootstrap` build). The `bootstrap` alias keeps a persisted legacy op loadable:
+    /// `state.rs::read_from_disk` falls back to an EMPTY state on any parse error, so a
+    /// stored `"kind":"bootstrap"` op without this alias would wipe every host.
+    #[serde(alias = "bootstrap")]
+    Pull,
     Commit,
 }
 
@@ -365,6 +370,31 @@ mod tests {
         let d = <Host as ts_rs::TS>::decl();
         assert!(d.contains("gdm_username"), "binding lost gdm_username: {d}");
         assert!(!d.contains("gdmUsername"), "binding camelCased gdm_username: {d}");
+    }
+
+    #[test]
+    fn operation_kind_serde_and_bootstrap_alias() {
+        // Canonical serialization is the lowercase variant name.
+        assert_eq!(serde_json::to_string(&OperationKind::Pull).unwrap(), "\"pull\"");
+        assert_eq!(
+            serde_json::from_str::<OperationKind>("\"pull\"").unwrap(),
+            OperationKind::Pull
+        );
+        // Legacy persisted ops used `"bootstrap"`; the alias keeps them loadable so a
+        // stored op never trips `read_from_disk`'s parse-error → empty-state fallback.
+        assert_eq!(
+            serde_json::from_str::<OperationKind>("\"bootstrap\"").unwrap(),
+            OperationKind::Pull
+        );
+        // A whole Operation carrying the legacy kind deserializes with everything intact.
+        let legacy = r#"{
+            "id": "op_1", "kind": "bootstrap", "target": "my-base",
+            "status": "running", "step": "queued", "pct": 0.0, "message": "queued",
+            "startedAt": 1
+        }"#;
+        let op: Operation = serde_json::from_str(legacy).unwrap();
+        assert_eq!(op.kind, OperationKind::Pull);
+        assert_eq!(op.target, "my-base");
     }
 
     #[test]

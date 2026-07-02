@@ -15,8 +15,8 @@ use wire::{Host, Operation, OperationKind, OperationStatus};
 
 use crate::app::App;
 use crate::provision::{
-    self, bootstrap_base_image, clone_container, commit_clone_image, control_env_vars,
-    delete_clone, is_dns_label,
+    self, clone_container, commit_clone_image, control_env_vars, delete_clone, is_dns_label,
+    pull_template, PullProgress,
 };
 
 const LOG_LIMIT: usize = 200;
@@ -74,7 +74,7 @@ fn new_op_id() -> String {
 fn make_op(kind: OperationKind, target: &str, source: Option<&str>) -> Operation {
     let message = match kind {
         OperationKind::Clone => format!("queued clone of {}", source.unwrap_or("?")),
-        OperationKind::Bootstrap => format!("queued base-image build {target}"),
+        OperationKind::Pull => format!("queued template pull → {target}"),
         OperationKind::Commit => format!("queued commit of {}", source.unwrap_or("?")),
         OperationKind::Delete => format!("queued delete of {target}"),
     };
@@ -141,6 +141,71 @@ fn op_progress(app: &App, op_id: &str, kind: OperationKind) -> impl FnMut(&str, 
                 op.log.drain(0..drop);
             }
         });
+    }
+}
+
+/// The pull-flow analogue of [`op_progress`]: consumes [`PullProgress`] directly (the pull
+/// flow doesn't use the shared `(step, msg)` callback). A `Step` transition sets the
+/// step/message + a log line and raises the pct to the `pull_pct` floor; a `Pct` byte tick
+/// raises the bar (monotonic `max`) + updates the message with NO log line — a single pull
+/// emits up to ~100 byte ticks, which would swamp the op log.
+fn pull_op_progress(app: &App, op_id: &str) -> impl FnMut(PullProgress) {
+    let app = app.clone();
+    let op_id = op_id.to_string();
+    move |ev: PullProgress| match ev {
+        PullProgress::Step { step, msg } => {
+            let pct = provision::step_pct(OperationKind::Pull, &step);
+            patch_op(&app, &op_id, |op| {
+                op.step = step;
+                if let Some(p) = pct {
+                    op.pct = op.pct.max(p);
+                }
+                op.log.push(format!("{}: {msg}", op.step));
+                op.message = msg;
+                if op.log.len() > LOG_LIMIT {
+                    let drop = op.log.len() - LOG_LIMIT;
+                    op.log.drain(0..drop);
+                }
+            });
+        }
+        PullProgress::Pct { pct, msg } => {
+            patch_op(&app, &op_id, |op| {
+                op.pct = op.pct.max(pct);
+                op.message = msg;
+            });
+        }
+    }
+}
+
+/// Mark every persisted `Running` operation as `Error` ("interrupted by server restart") and
+/// schedule it for prune. Called once at boot: an `Operation` lives only while its driving
+/// task runs, so any `Running` op loaded from `state.json` is a corpse from a server that
+/// crashed/was killed mid-op. Left as-is it blocks same-named ops forever (every start_*
+/// guard rejects a target with a Running op). Touches only state, so it's safe with Docker
+/// down.
+pub fn fail_stale_ops(app: &App) {
+    let stale: Vec<String> = app
+        .store
+        .get()
+        .operations
+        .iter()
+        .filter(|o| o.status == OperationStatus::Running)
+        .map(|o| o.id.clone())
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    app.store.mutate(|s| {
+        for op in s.operations.iter_mut().filter(|o| o.status == OperationStatus::Running) {
+            op.status = OperationStatus::Error;
+            op.message = "interrupted by server restart".into();
+            op.log.push("error: interrupted by server restart".into());
+            op.finished_at = Some(now_ms());
+        }
+    });
+    for id in stale {
+        tracing::warn!(op = id.as_str(), "marking stale Running op as Error (interrupted by server restart)");
+        schedule_prune(app.clone(), id, PRUNE_ERROR_MS);
     }
 }
 
@@ -313,10 +378,11 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     }
 }
 
-/// Bootstrap the wizard base image `rmng/template:<name>` from the fixed base OS
-/// (from-zero). Drives a `Bootstrap`-kind Operation with the image name as its target; no
-/// Host is registered (an image is not a host).
-pub fn start_bootstrap(app: &App, name: &str) -> Result<Operation, JobError> {
+/// Pull the clone template from `reference` (a registry `repo:tag`) and retag it locally as
+/// `rmng/template:<name>`. Drives a `Pull`-kind Operation with the image name as its target;
+/// no Host is registered (a template is not a host). Guards (same shape the retired bootstrap
+/// had): `name` is a DNS label + no op is already in flight for the same target.
+pub fn start_pull(app: &App, name: &str, reference: &str) -> Result<Operation, JobError> {
     if !is_dns_label(name) {
         return Err(JobError(
             "image name must be a DNS label (lowercase letters, digits, hyphens)".into(),
@@ -324,19 +390,19 @@ pub fn start_bootstrap(app: &App, name: &str) -> Result<Operation, JobError> {
     }
     let st = app.store.get();
     if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == name) {
-        return Err(JobError(format!("'{name}' is already being built")));
+        return Err(JobError(format!("'{name}' is already being pulled")));
     }
-    let op = make_op(OperationKind::Bootstrap, name, None);
+    let op = make_op(OperationKind::Pull, name, None);
     let (ret, op_id) = (op.clone(), op.id.clone());
     app.store.mutate(|s| s.operations.push(op));
-    let (app2, name) = (app.clone(), name.to_string());
-    tokio::spawn(async move { run_bootstrap(app2, op_id, name).await });
+    let (app2, name, reference) = (app.clone(), name.to_string(), reference.to_string());
+    tokio::spawn(async move { run_pull(app2, op_id, name, reference).await });
     Ok(ret)
 }
 
-async fn run_bootstrap(app: App, op_id: String, name: String) {
-    let progress = op_progress(&app, &op_id, OperationKind::Bootstrap);
-    let reference = match bootstrap_base_image(&app, &name, progress).await {
+async fn run_pull(app: App, op_id: String, name: String, reference: String) {
+    let progress = pull_op_progress(&app, &op_id);
+    let local_ref = match pull_template(&app, &reference, &name, progress).await {
         Ok(r) => r,
         Err(e) => return fail_op(&app, &op_id, e.to_string()),
     };
@@ -344,7 +410,7 @@ async fn run_bootstrap(app: App, op_id: String, name: String) {
         op.status = OperationStatus::Done;
         op.step = "done".into();
         op.pct = 100.0;
-        op.message = format!("base image {reference} ready");
+        op.message = format!("template {local_ref} ready");
         op.finished_at = Some(now_ms());
     });
     schedule_prune(app.clone(), op_id, PRUNE_DONE_MS);
@@ -370,12 +436,12 @@ pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, J
         return Err(JobError(format!("'{host_id}' is not a managed clone — only clones can be committed")));
     }
     let reference = format!("{}:{}", crate::docker::IMAGE_REPO, name);
-    // Reject a tag already targeted by another running commit/bootstrap (a race the pure
+    // Reject a tag already targeted by another running commit/pull (a race the pure
     // `image_exists` check in provision can't see yet). The existing-image check happens in
     // provision (needs the daemon); here we only guard the in-flight duplicate.
     if st.operations.iter().any(|o| {
         o.status == OperationStatus::Running
-            && matches!(o.kind, OperationKind::Commit | OperationKind::Bootstrap)
+            && matches!(o.kind, OperationKind::Commit | OperationKind::Pull)
             && o.target == name
     }) {
         return Err(JobError(format!("an image named '{name}' is already being built")));
@@ -479,4 +545,64 @@ async fn run_delete(app: App, op_id: String, host_id: String, managed: bool) {
     let dd = app.config().data_dir;
     crate::files::delete_notes(&dd, &host_id);
     crate::chat::delete_chat(&dd, &host_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A minimal App backed by a throwaway temp data dir (ClaudeStore/state don't touch the
+    /// repo). Docker is constructed I/O-free — `fail_stale_ops` never touches it.
+    fn test_app() -> App {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rmng-jobs-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
+        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        App::new(store, cfg)
+    }
+
+    fn running_op(id: &str, target: &str) -> Operation {
+        Operation {
+            id: id.into(),
+            kind: OperationKind::Pull,
+            target: target.into(),
+            source: None,
+            status: OperationStatus::Running,
+            step: "pull".into(),
+            pct: 40.0,
+            message: "pulling".into(),
+            log: vec!["pull: pulling".into()],
+            started_at: now_ms(),
+            finished_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_stale_ops_marks_running_as_error() {
+        let app = test_app();
+        app.store.mutate(|s| {
+            s.operations.push(running_op("op_a", "tpl-a"));
+            // A finished op must be left untouched.
+            s.operations.push(Operation { status: OperationStatus::Done, ..running_op("op_b", "tpl-b") });
+        });
+
+        fail_stale_ops(&app);
+
+        let st = app.store.get();
+        let a = st.operations.iter().find(|o| o.id == "op_a").unwrap();
+        assert_eq!(a.status, OperationStatus::Error);
+        assert_eq!(a.message, "interrupted by server restart");
+        assert!(a.finished_at.is_some());
+        assert!(a.log.iter().any(|l| l.contains("interrupted by server restart")));
+        let b = st.operations.iter().find(|o| o.id == "op_b").unwrap();
+        assert_eq!(b.status, OperationStatus::Done); // untouched
+        // No Running op remains, so a same-target op is no longer blocked forever.
+        assert!(!st.operations.iter().any(|o| o.status == OperationStatus::Running));
+    }
 }

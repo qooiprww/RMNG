@@ -153,6 +153,12 @@ pub struct DockerConfig {
     /// Memory limit per clone in MiB (+8 GiB swap), matching LXC parity.
     #[serde(default = "default_clone_memory_mb")]
     pub clone_memory_mb: u32,
+    /// Registry reference the setup wizard pulls the clone template from, then retags
+    /// locally to `rmng/template:<name>`. Short form (`repo:tag`) so it matches what the
+    /// pulled image's RepoTags will contain. Immediate-apply (read fresh per pull); no
+    /// secret (public image over the local daemon), so it passes through the redacted view.
+    #[serde(default = "default_template_reference")]
+    pub template_reference: String,
 }
 
 fn default_docker_socket() -> String {
@@ -170,6 +176,9 @@ fn default_clone_cpus() -> u32 {
 fn default_clone_memory_mb() -> u32 {
     32768
 }
+fn default_template_reference() -> String {
+    "pegasis0/rmng-template:latest".into()
+}
 
 impl Default for DockerConfig {
     fn default() -> Self {
@@ -179,6 +188,7 @@ impl Default for DockerConfig {
             hostname_prefix: default_hostname_prefix(),
             clone_cpus: default_clone_cpus(),
             clone_memory_mb: default_clone_memory_mb(),
+            template_reference: default_template_reference(),
         }
     }
 }
@@ -432,6 +442,7 @@ mod tests {
         assert_eq!(c.docker.hostname_prefix, "pega-");
         assert_eq!(c.docker.clone_cpus, 16);
         assert_eq!(c.docker.clone_memory_mb, 32768);
+        assert_eq!(c.docker.template_reference, "pegasis0/rmng-template:latest");
         // Missing keys fall back to the same defaults (older config.json stays valid).
         let d: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(d.static_dir, "");
@@ -439,6 +450,7 @@ mod tests {
         assert!(!d.setup_complete);
         assert_eq!(d.docker.socket, "/var/run/docker.sock");
         assert_eq!(d.docker.subnet, "10.99.0.0/24");
+        assert_eq!(d.docker.template_reference, "pegasis0/rmng-template:latest");
         let mons = c.effective_monitors();
         assert_eq!(mons.len(), 2);
         assert_eq!((mons[0].width, mons[0].height, mons[0].x), (2560, 1440, 2560));
@@ -495,6 +507,7 @@ mod tests {
             docker: DockerConfig {
                 subnet: "10.42.0.0/24".into(),
                 hostname_prefix: "dev-".into(),
+                template_reference: "pegasis0/rmng-template:v9".into(),
                 ..Default::default()
             },
             presets: vec![
@@ -522,5 +535,7 @@ mod tests {
         assert!(r.setup_complete);
         assert_eq!(r.docker.subnet, "10.42.0.0/24");
         assert_eq!(r.docker.hostname_prefix, "dev-");
+        // template_reference is non-secret — it passes through the redacted view intact.
+        assert_eq!(r.docker.template_reference, "pegasis0/rmng-template:v9");
     }
 }

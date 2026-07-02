@@ -59,9 +59,6 @@ pub const NETWORK: &str = "rmng";
 pub const CONTROL_ALIAS: &str = "rmng-control";
 /// Repository namespace for clone-source images (`rmng/template:<name>`).
 pub const IMAGE_REPO: &str = "rmng/template";
-/// The fixed base OS for the wizard-built base image. Not configurable: the patched
-/// gnome-shell deb is compiled against this GNOME only (see gotcha in the LXC path).
-pub const BASE_DOCKER_IMAGE: &str = "ubuntu:26.04";
 /// The in-clone Linux user the agent + desktop run as (uid 1000).
 pub const CLONE_USER: &str = "rmng";
 /// Stop timeout for systemd-PID-1 clones (with `StopSignal=SIGRTMIN+3` baked in).
@@ -634,9 +631,8 @@ impl DockerCtl {
     }
 
     /// Tag an existing image (`source`, a reference or id) as `repo:tag` — e.g. tagging a
-    /// freshly pulled upstream image into RMNG's own [`IMAGE_REPO`] namespace.
-    // Not yet called: the pull flow that uses this lands in the next task.
-    #[allow(dead_code)]
+    /// freshly pulled upstream template into RMNG's own [`IMAGE_REPO`] namespace
+    /// ([`crate::provision::pull_template`]).
     pub async fn tag_image(&self, source: &str, repo: &str, tag: &str) -> Result<()> {
         let opts = TagImageOptionsBuilder::new().repo(repo).tag(tag).build();
         self.daemon()?
@@ -647,8 +643,7 @@ impl DockerCtl {
     }
 
     /// An image's labels (`ImageInspect.Config.Labels`), or an empty map if it has none.
-    // Not yet called: the pull flow that uses this lands in the next task.
-    #[allow(dead_code)]
+    /// The template-pull verify reads this to require `rmng.image=1` before retagging.
     pub async fn image_labels(&self, reference: &str) -> Result<HashMap<String, String>> {
         let info = self
             .daemon()?
@@ -656,6 +651,18 @@ impl DockerCtl {
             .await
             .with_context(|| format!("inspecting image {reference}"))?;
         Ok(info.config.and_then(|c| c.labels).unwrap_or_default())
+    }
+
+    /// An image's `Config.StopSignal` (e.g. `SIGRTMIN+3`), or `None` when unset. The
+    /// template-pull verify WARNs when a pulled template lacks the clean-stop signal (clones
+    /// off it hang 20 s on stop before SIGKILL — gotcha #5).
+    pub async fn image_stop_signal(&self, reference: &str) -> Result<Option<String>> {
+        let info = self
+            .daemon()?
+            .inspect_image(reference)
+            .await
+            .with_context(|| format!("inspecting image {reference}"))?;
+        Ok(info.config.and_then(|c| c.stop_signal).filter(|s| !s.is_empty()))
     }
 
     /// List clone-source images (label `rmng.image=1`), newest first, projected to the
@@ -870,32 +877,6 @@ impl DockerCtl {
             .create_container(Some(opts), body)
             .await
             .with_context(|| format!("creating clone container {}", spec.name))?;
-        Ok(res.id)
-    }
-
-    /// Create a throwaway build worker: a `sleep infinity` container on the **default
-    /// bridge** (so NAT + apt work during base-image provisioning — no dependency on the
-    /// rmng network existing yet), privileged (systemd unit ops in the build need it),
-    /// from the given base image. Started here so the caller can immediately exec into
-    /// it. Returns the container id.
-    pub async fn create_build_container(&self, name: &str, image: &str) -> Result<String> {
-        let host_config = HostConfig { privileged: Some(true), ..Default::default() };
-        let body = ContainerCreateBody {
-            hostname: Some(name.to_string()),
-            image: Some(image.to_string()),
-            entrypoint: Some(vec!["/bin/sleep".to_string()]),
-            cmd: Some(vec!["infinity".to_string()]),
-            labels: Some(HashMap::from([(LABEL_MANAGED.to_string(), "1".to_string())])),
-            host_config: Some(host_config),
-            ..Default::default()
-        };
-        let opts = CreateContainerOptionsBuilder::new().name(name).build();
-        let res = self
-            .daemon()?
-            .create_container(Some(opts), body)
-            .await
-            .with_context(|| format!("creating build container {name}"))?;
-        self.start_container(&res.id).await?;
         Ok(res.id)
     }
 

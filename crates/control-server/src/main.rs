@@ -42,6 +42,12 @@ async fn main() -> Result<()> {
 
     let app = app::App::new(store, cfg);
 
+    // A persisted `Running` operation is a corpse from a server that crashed/was killed
+    // mid-op (an `Operation` lives only while its driving task runs). Mark such ops `Error`
+    // + prune them, so a same-named clone/pull/commit isn't blocked forever by the in-flight
+    // guards. State-only — safe with Docker down.
+    jobs::fail_stale_ops(&app);
+
     // Probe the Docker environment (daemon reachable, self-container detection, sock mount,
     // render node) and cache the report so `GET /api/setup/env` + the wizard can render it.
     // Non-fatal: a down daemon / failed check must NOT stop the server booting — the wizard

@@ -14,8 +14,11 @@
 //! equals the host id (`Host.managed` rows) — no container id is stored anywhere.
 //!
 //! Guest scripts are embedded (`include_str!`) and streamed over `docker exec bash -s`:
-//! [`crate::docker::DockerCtl::exec_script`]. Binaries (clone-daemon, agent-wrapper, patched
-//! gnome-shell deb) are pushed via `upload_tar`.
+//! [`crate::docker::DockerCtl::exec_script`]. Binaries (clone-daemon, agent-wrapper) are
+//! pushed via `upload_tar`. The clone TEMPLATE itself is no longer built in-product — it is
+//! pulled from a registry by [`pull_template`] (the retired in-product bootstrap ran
+//! `provision-clone.sh` inside a build container; that recipe now lives in
+//! `template/Dockerfile` + `template/setup/`, published as a Docker image).
 
 use anyhow::{Result, bail};
 use std::time::{Duration, Instant};
@@ -25,7 +28,6 @@ use wire::{AppConfig, EnvVar};
 use crate::app::App;
 use crate::docker::{CreateSpec, PullEvent, TarEntry, CLONE_USER};
 
-const PROVISION_SCRIPT: &str = include_str!("../scripts/provision-clone.sh");
 const APPLY_MONITORS_SCRIPT: &str = include_str!("../scripts/apply-monitors.sh");
 const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
 
@@ -418,202 +420,141 @@ async fn clone_container_after_create(
     }
 }
 
-// --- bootstrap base image -------------------------------------------------------------
+// --- template pull --------------------------------------------------------------------
 
-/// Progress step → percentage for a base-image bootstrap. Matches the plan's table (the
-/// `provision` step's 18–88 span is filled by [`bootstrap_base_image`] itself as the guest
-/// script's `[ct]` lines stream in).
-fn bootstrap_pct(step: &str) -> Option<f64> {
+/// A template-pull progress event. Unlike the shared `(step, msg)` callback the clone /
+/// commit / delete flows use, the pull emits either a coarse STEP transition (jobs maps it
+/// to the [`pull_pct`] table) or a fine byte-progress PCT inside the long `pull` step, so
+/// the aggregate download fraction reaches the op bar without a log line per byte tick.
+#[derive(Debug, Clone)]
+pub enum PullProgress {
+    /// A coarse step transition (`queued`/`pull`/`verify`/`tag`/`done`); maps to [`pull_pct`].
+    Step { step: String, msg: String },
+    /// Fine byte progress inside the `pull` step: an absolute pct (2–90) + a message.
+    Pct { pct: f64, msg: String },
+}
+
+/// Progress step → percentage for a template pull. The `pull` step's 2–90 span is filled by
+/// [`pull_template`] itself from aggregate byte progress (`2 + frac·88`), so the table only
+/// pins the coarse floors.
+fn pull_pct(step: &str) -> Option<f64> {
     Some(match step {
         "queued" => 0.0,
-        "pull" => 10.0,
-        "create" => 12.0,
-        "inject" => 15.0,
-        "provision" => 18.0,
-        "cleanup" => 90.0,
-        "stop" => 92.0,
-        "commit" => 94.0,
+        "pull" => 2.0,
+        "verify" => 91.0,
+        "tag" => 94.0,
         "done" => 100.0,
         _ => return None,
     })
 }
 
-/// Build the wizard base image `rmng/template:<name>` from `ubuntu:26.04` (the from-zero
-/// path). Steps (→ pct): `queued` 0, `pull` 2–10, `create` 12, `inject` 15, `provision`
-/// 18–88 (the guest script's `[ct]` lines advance sub-progress + set the op message),
-/// `cleanup` 90, `stop` 92, `commit` 94, `done` 100. Returns the committed image reference.
+/// Pull the clone template from `remote_ref` (a registry `repo:tag`) and retag it locally as
+/// `rmng/template:<name>` — the canonical clone-source reference clones are created FROM.
+/// This REPLACES the retired in-product bootstrap (which provisioned a base from `ubuntu`
+/// inside a build container); the template is now built by `template/Dockerfile` and
+/// published to a registry.
 ///
-/// The build container is a privileged `sleep infinity` on the DEFAULT bridge (so NAT + apt
-/// work — no dependency on the rmng network existing yet). `provision-clone.sh` runs under
-/// `docker exec bash -s` with `DEBIAN_FRONTEND=noninteractive` + `SYSTEMD_OFFLINE=1` (its
-/// `systemctl enable/mask/set-default` are pure symlink ops with no bus). The embedded
-/// clone-daemon / agent-wrapper / patched gnome-shell deb are pushed in first (skip-missing
-/// WARN, as before). Then cleanup (apt clean, truncate machine-id, rm staged files), stop
-/// (t=2 — `sleep` ignores TERM, so KILL is harmless), commit with `set_boot_config` + the
-/// `rmng.image=1`/`rmng.base=1` labels, and finally rm the build container. Rejects an
-/// already-taken `rmng/template:<name>` tag up front (gotcha #8 lineage stays clean).
-pub async fn bootstrap_base_image(
+/// Steps (→ pct): `queued` 0, `pull` 2–90 (aggregate byte progress via [`PullProgress::Pct`]),
+/// `verify` 91, `tag` 94, `done` 100. Returns the canonical local reference.
+///
+/// Order matters: **verify before tag**. The pulled image must carry `rmng.image=1` — else it
+/// isn't an RMNG template and retagging it into `rmng/template:` would poison the image picker
+/// / clone path. A non-standard `StopSignal` only WARNs (clones off it hang 20 s on stop, but
+/// that's no reason to refuse the pull). The remote tag is intentionally KEPT after
+/// retagging: deleting the local `rmng/template:<name>` tag later only *untags* — the image
+/// row re-lists under the remote ref, and a second delete frees the layers (documented in the
+/// docs task).
+pub async fn pull_template(
     app: &App,
+    remote_ref: &str,
     name: &str,
-    mut on_progress: impl FnMut(&str, &str),
+    mut on_progress: impl FnMut(PullProgress),
 ) -> Result<String> {
     if !is_dns_label(name) {
         bail!("image name must be a DNS label (lowercase letters, digits, hyphens)");
     }
-    let cfg = app.config();
+    let remote = remote_ref.trim();
+    if remote.is_empty() {
+        bail!("a template reference is required");
+    }
+    if remote.chars().any(char::is_whitespace) {
+        bail!("template reference '{remote}' must not contain whitespace");
+    }
+    // A `repo@sha256:…` digest ref is mis-split by `split_reference` (it treats the digest's
+    // own `:` as the tag separator), so refuse it — pull a `repo:tag` reference instead.
+    if remote.contains('@') {
+        bail!("digest references ('{remote}') aren't supported — pull a repo:tag reference instead");
+    }
+
     let docker = &app.docker;
     let reference = format!("{}:{}", crate::docker::IMAGE_REPO, name);
 
-    on_progress("queued", &format!("queued base-image build {reference}"));
+    on_progress(PullProgress::Step {
+        step: "queued".into(),
+        msg: format!("queued template pull {remote} → {reference}"),
+    });
 
-    // Reject a taken tag up front — a commit would overwrite an existing image otherwise.
+    // Reject a taken local tag up front — retagging would move the tag off an existing image.
     if docker.image_exists(&reference).await? {
         bail!("an image named '{reference}' already exists; pick another name or delete it first");
     }
 
-    // Pull the fixed base OS (2–10%; the daemon error, e.g. a Docker Hub rate limit, is
-    // surfaced verbatim — gotcha #9).
-    on_progress("pull", &format!("pulling {}", crate::docker::BASE_DOCKER_IMAGE));
-    docker
-        .pull_image(crate::docker::BASE_DOCKER_IMAGE, |event| {
-            // `Bytes` (aggregate byte progress) is ignored here — this bootstrap path is
-            // retired by the next task; only `Status` lines map onto the existing op log.
-            if let PullEvent::Status { layer, status } = event {
-                let msg = if layer.is_empty() { status } else { format!("{layer}: {status}") };
-                on_progress("pull", &msg);
-            }
-        })
-        .await?;
-
-    // Build container: privileged sleep-infinity on the default bridge, started so we can
-    // exec into it. Name it after the image so `docker ps` is readable; if a stale one
-    // exists, tear it down first (a previous failed build).
-    let build_name = format!("rmng-build-{name}");
-    docker.remove_container(&build_name).await.ok();
-    on_progress("create", &format!("creating build container {build_name}"));
-    let build = docker.create_build_container(&build_name, crate::docker::BASE_DOCKER_IMAGE).await?;
-
-    // Everything after create must clean the build container up on any failure.
-    let result = bootstrap_after_create(app, &cfg, &build, name, &reference, &mut on_progress).await;
-    // Always remove the build container (success committed already; failure leaves nothing).
-    docker.remove_container(&build).await.ok();
-    result.map(|_| reference)
-}
-
-/// The inject → provision → commit tail of [`bootstrap_base_image`], factored out so the
-/// caller always removes the build container afterward (success or failure).
-async fn bootstrap_after_create(
-    app: &App,
-    cfg: &AppConfig,
-    build: &str,
-    name: &str,
-    reference: &str,
-    on_progress: &mut impl FnMut(&str, &str),
-) -> Result<()> {
-    let docker = &app.docker;
-
-    // Push the provision script + the payload binaries into the build container. Match
-    // `provision-clone.sh`'s expected paths: /root/rmng-clone-daemon, /root/agent-wrapper,
-    // /root/gnome-shell-patched.deb. Skip-missing WARN behavior (a dev checkout may lack
-    // staged payloads), same as the old `stage_binary`.
-    on_progress("inject", "pushing provision assets into the build container");
-    let mut entries: Vec<TarEntry> = Vec::new();
-    for (payload_name, dest) in [
-        ("clone-daemon", "root/rmng-clone-daemon"),
-        ("agent-wrapper", "root/agent-wrapper"),
-        ("gnome-shell.deb", "root/gnome-shell-patched.deb"),
-    ] {
-        match crate::assets::payload(payload_name) {
-            Some(bytes) => {
-                entries.push(TarEntry { path: dest.into(), data: bytes, mode: 0o755, uid: 0, gid: 0 })
-            }
-            None => tracing::warn!("{payload_name} payload missing; skipping (provision falls back)"),
-        }
-    }
-    if !entries.is_empty() {
-        docker.upload_tar(build, entries).await?;
+    // Pull (2–90%): map the aggregate byte fraction onto `2 + frac·88`. `Status` lines carry
+    // the per-layer detail as the message (pinned to the current pct floor so the bar doesn't
+    // stall); `Bytes` drives the fine pct. A daemon error (e.g. a Docker Hub rate limit) is
+    // surfaced verbatim by `pull_image` (gotcha #9).
+    on_progress(PullProgress::Step { step: "pull".into(), msg: format!("pulling {remote}") });
+    {
+        let on_progress = &mut on_progress;
+        let mut last_pct = 2.0_f64;
+        docker
+            .pull_image(remote, |event| match event {
+                PullEvent::Status { layer, status } => {
+                    let msg = if layer.is_empty() { status } else { format!("{layer}: {status}") };
+                    on_progress(PullProgress::Pct { pct: last_pct, msg });
+                }
+                PullEvent::Bytes { frac } => {
+                    last_pct = 2.0 + frac * 88.0;
+                    on_progress(PullProgress::Pct {
+                        pct: last_pct,
+                        msg: format!("pulling {remote}: {}%", (frac * 100.0) as i64),
+                    });
+                }
+            })
+            .await?;
     }
 
-    // Assert the clone user resolves to uid 1000 once during bootstrap. The user is created
-    // by provision-clone.sh; we assert AFTER provisioning below (it doesn't exist yet here).
-
-    // Provision (18–88%): stream provision-clone.sh with the noninteractive + offline
-    // systemd env. Its `    [ct] …` lines advance sub-progress + set the op message. Args:
-    // <username> <password> <monitors> <clone_socket>.
-    on_progress("provision", "provisioning the base image (headless GNOME + toolbox)");
-    let mons = monitors_csv(cfg);
-    let args: Vec<String> = vec![
-        CLONE_USER.to_string(),
-        CLONE_USER.to_string(), // password == username on the base image
-        mons,
-        cfg.clone_socket.clone(),
-    ];
-    let env = vec![
-        ("DEBIAN_FRONTEND".to_string(), "noninteractive".to_string()),
-        ("SYSTEMD_OFFLINE".to_string(), "1".to_string()),
-    ];
-    // Sub-progress: nudge the pct from 18 toward 88 as `[ct]` lines arrive, so the bar moves
-    // during the long apt/toolbox phase without knowing the step count ahead of time.
-    let mut ct_lines = 0u32;
-    let code = docker
-        .exec_script(build, PROVISION_SCRIPT, &env, &args, |stream, line| {
-            // The guest's step lines look like `    [ct] <message>`; strip the marker for
-            // the op message, keep raw lines on stderr as plain log context.
-            if let Some(msg) = line.trim_start().strip_prefix("[ct] ") {
-                ct_lines += 1;
-                // Asymptotic approach to 88 from 18: never overshoots, always moves.
-                let pct = 18.0 + (88.0 - 18.0) * (1.0 - 0.94_f64.powi(ct_lines as i32));
-                on_progress("provision", &format!("{pct:.0}% {msg}"));
-            } else if stream == "err" && !line.trim().is_empty() {
-                on_progress("provision", line);
-            }
-        })
-        .await?;
-    if code != 0 {
-        bail!("provision-clone.sh failed in the build container (exit {code})");
-    }
-
-    // Assert uid: id -u rmng == 1000 (gotcha #2 — the tar owner mapping relies on it).
-    let (id_code, id_out) = docker.exec_capture(build, &["id", "-u", CLONE_USER]).await?;
-    let uid = id_out.trim();
-    if id_code != 0 || uid != "1000" {
+    // Verify (91%) BEFORE tag: the pulled image must be an RMNG template (`rmng.image=1`).
+    on_progress(PullProgress::Step {
+        step: "verify".into(),
+        msg: format!("verifying {remote} is an RMNG template"),
+    });
+    let labels = docker.image_labels(remote).await?;
+    if labels.get(crate::docker::LABEL_IMAGE).map(String::as_str) != Some("1") {
         bail!(
-            "clone user '{CLONE_USER}' resolved to uid '{uid}' (expected 1000); the tar owner \
-             mapping for home/{CLONE_USER}/** would be wrong"
+            "'{remote}' is not an RMNG template (missing the `{}=1` label) — build one with \
+             template/Dockerfile and push it, then pull that reference",
+            crate::docker::LABEL_IMAGE
         );
     }
-
-    // Cleanup (90%): apt clean, truncate machine-id, rm the staged binaries so they aren't
-    // baked into the image (provision-clone.sh installed them to /opt/rmng/bin already).
-    on_progress("cleanup", "cleaning apt cache + machine-id + staged files");
-    let cleanup = "set -e\n\
-        apt-get clean >/dev/null 2>&1 || true\n\
-        rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* 2>/dev/null || true\n\
-        : > /etc/machine-id 2>/dev/null || true\n\
-        rm -f /root/rmng-clone-daemon /root/agent-wrapper /root/gnome-shell-patched.deb 2>/dev/null || true\n";
-    let clean_code = docker
-        .exec_script(build, cleanup, &[], &[], |_s, line| tracing::debug!(target: "provision", "cleanup: {line}"))
-        .await?;
-    if clean_code != 0 {
-        tracing::warn!("bootstrap cleanup exited {clean_code} (non-fatal)");
+    // A template SHOULD carry StopSignal=SIGRTMIN+3 so clones stop cleanly (gotcha #5); warn
+    // if it doesn't, but don't refuse an otherwise-valid template over it.
+    match docker.image_stop_signal(remote).await? {
+        Some(sig) if sig == "SIGRTMIN+3" => {}
+        other => tracing::warn!(
+            "template {remote} StopSignal is {:?} (expected SIGRTMIN+3); clones off it may hang \
+             20s on stop before SIGKILL",
+            other.as_deref().unwrap_or("<unset>")
+        ),
     }
 
-    // Stop (92%): t=2 — the build container's PID 1 is `sleep`, which ignores SIGTERM, so
-    // the daemon SIGKILLs it after 2s (harmless — nothing to flush).
-    on_progress("stop", "stopping the build container");
-    docker.stop_container(build).await?;
+    // Tag (94%): retag the pulled image into the canonical rmng/template namespace (the
+    // remote tag is kept — see the fn doc).
+    on_progress(PullProgress::Step { step: "tag".into(), msg: format!("tagging {remote} as {reference}") });
+    docker.tag_image(remote, crate::docker::IMAGE_REPO, name).await?;
 
-    // Commit (94%): rmng/template:<name> with the boot config baked (StopSignal etc.) + the
-    // image/base labels.
-    on_progress("commit", &format!("committing {reference}"));
-    let labels = vec![
-        (crate::docker::LABEL_IMAGE.to_string(), "1".to_string()),
-        (crate::docker::LABEL_BASE.to_string(), "1".to_string()),
-    ];
-    docker.commit(build, name, /*set_boot_config=*/ true, /*pause=*/ false, &labels).await?;
-
-    on_progress("done", &format!("base image {reference} ready"));
-    Ok(())
+    on_progress(PullProgress::Step { step: "done".into(), msg: format!("template {reference} ready") });
+    Ok(reference)
 }
 
 // --- commit clone image ---------------------------------------------------------------
@@ -900,14 +841,14 @@ pub async fn run_clone_op(app: &App, container: &str, op: &str, extra: &[&str]) 
 
 // --- op-log pct helpers (exposed for jobs.rs step tables) -----------------------------
 
-/// The clone/bootstrap/commit/delete step→pct tables, exposed so `jobs.rs` maps a streamed
-/// step key to the operation's coarse percentage without re-deriving it. (Monitors-apply is
+/// The clone/pull/commit/delete step→pct tables, exposed so `jobs.rs` maps a streamed step
+/// key to the operation's coarse percentage without re-deriving it. (Monitors-apply is
 /// intentionally NOT an Operation — web.rs streams its `[ct]` lines directly — so there is
 /// no monitors table here.)
 pub fn step_pct(kind: wire::OperationKind, step: &str) -> Option<f64> {
     match kind {
         wire::OperationKind::Clone => clone_pct(step),
-        wire::OperationKind::Bootstrap => bootstrap_pct(step),
+        wire::OperationKind::Pull => pull_pct(step),
         wire::OperationKind::Commit => commit_pct(step),
         wire::OperationKind::Delete => delete_pct(step),
     }
@@ -1073,14 +1014,11 @@ mod tests {
         assert_eq!(step_pct(Clone, "wait-ready"), Some(75.0));
         assert_eq!(step_pct(Clone, "done"), Some(100.0));
 
-        assert_eq!(step_pct(Bootstrap, "pull"), Some(10.0));
-        assert_eq!(step_pct(Bootstrap, "create"), Some(12.0));
-        assert_eq!(step_pct(Bootstrap, "inject"), Some(15.0));
-        assert_eq!(step_pct(Bootstrap, "provision"), Some(18.0));
-        assert_eq!(step_pct(Bootstrap, "cleanup"), Some(90.0));
-        assert_eq!(step_pct(Bootstrap, "stop"), Some(92.0));
-        assert_eq!(step_pct(Bootstrap, "commit"), Some(94.0));
-        assert_eq!(step_pct(Bootstrap, "done"), Some(100.0));
+        assert_eq!(step_pct(Pull, "queued"), Some(0.0));
+        assert_eq!(step_pct(Pull, "pull"), Some(2.0));
+        assert_eq!(step_pct(Pull, "verify"), Some(91.0));
+        assert_eq!(step_pct(Pull, "tag"), Some(94.0));
+        assert_eq!(step_pct(Pull, "done"), Some(100.0));
 
         assert_eq!(step_pct(Commit, "prepare"), Some(15.0));
         assert_eq!(step_pct(Commit, "commit"), Some(40.0));

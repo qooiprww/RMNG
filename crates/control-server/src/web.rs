@@ -59,7 +59,7 @@ pub fn router(app: App) -> Router {
         .route("/api/config/test", post(config_test))
         .route("/api/setup/env", get(setup_env))
         .route("/api/images", get(images_list))
-        .route("/api/images/bootstrap", post(images_bootstrap))
+        .route("/api/images/pull", post(images_pull))
         .route("/api/images/commit", post(images_commit))
         .route("/api/images/delete", post(images_delete))
         .route("/api/claude/import/check", post(claude_import_check))
@@ -372,19 +372,29 @@ fn fill_in_use_by(images: &mut [wire::ImageInfo], containers: &[crate::docker::M
 }
 
 #[derive(Deserialize)]
-struct BootstrapReq {
-    /// DNS-label image name → `rmng/template:<name>`.
+struct PullReq {
+    /// DNS-label image name → local `rmng/template:<name>`.
     name: String,
+    /// Registry reference to pull the template from. Absent/blank ⇒
+    /// `config.docker.templateReference` (the wizard's default).
+    #[serde(default)]
+    reference: Option<String>,
 }
 
-/// `POST /api/images/bootstrap` — build the wizard base image `rmng/template:<name>` from
-/// the fixed base OS (from-zero). Returns the driving Operation (kind `bootstrap`, which the
-/// wizard watches for).
-async fn images_bootstrap(
+/// `POST /api/images/pull` — pull the clone template from a registry (`reference`, default
+/// `config.docker.templateReference`) and retag it locally as `rmng/template:<name>`.
+/// Returns the driving Operation (kind `pull`, which the wizard watches for). Replaces the
+/// retired in-product `/api/images/bootstrap` build.
+async fn images_pull(
     State(app): State<App>,
-    Json(req): Json<BootstrapReq>,
+    Json(req): Json<PullReq>,
 ) -> Result<Json<Operation>, (StatusCode, String)> {
-    jobs::start_bootstrap(&app, &req.name)
+    let reference = req
+        .reference
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| app.config().docker.template_reference);
+    jobs::start_pull(&app, &req.name, &reference)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
 }
@@ -941,5 +951,81 @@ mod tests {
         let containers = vec![container_on("h1", "rmng/template:other")];
         fill_in_use_by(&mut images, &containers);
         assert!(images[0].in_use_by.is_empty());
+    }
+
+    // --- POST /api/images/pull (the endpoint that replaced /api/images/bootstrap) ---
+    //
+    // Handlers are called directly: `State`/`Json` are public tuple structs, so no HTTP
+    // harness is needed. Docker is absent in tests, so a `start_pull` that passes the guards
+    // spawns a background pull that fails later — but the test never yields (current-thread
+    // runtime), so the returned op is observed before that task runs.
+
+    use std::sync::Arc;
+
+    fn test_app() -> App {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rmng-web-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
+        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        App::new(store, cfg)
+    }
+
+    #[tokio::test]
+    async fn images_pull_rejects_bad_name() {
+        let app = test_app();
+        let err = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "Bad Name".into(), reference: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("DNS label"), "msg: {}", err.1);
+        // A rejected request registers no op.
+        assert!(app.store.get().operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn images_pull_registers_pull_op_and_defaults_reference() {
+        let app = test_app();
+        // `reference: None` → defaults to config.docker.template_reference (no panic; op made).
+        let op = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "my-base".into(), reference: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(op.kind, wire::OperationKind::Pull);
+        assert_eq!(op.target, "my-base");
+        assert_eq!(op.status, wire::OperationStatus::Running);
+        // The op is registered in state (the wizard watches it over /events).
+        assert!(app.store.get().operations.iter().any(|o| o.id == op.id));
+    }
+
+    #[tokio::test]
+    async fn images_pull_rejects_duplicate_in_flight() {
+        let app = test_app();
+        // A blank reference also defaults; the first pull registers a Running op.
+        let _first = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "dup".into(), reference: Some("   ".into()) }),
+        )
+        .await
+        .unwrap();
+        // A second pull for the same target is rejected while the first is in flight.
+        let err = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "dup".into(), reference: Some("pegasis0/rmng-template:latest".into()) }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("already being pulled"), "msg: {}", err.1);
     }
 }
