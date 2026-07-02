@@ -37,8 +37,9 @@ Tool result `content` items are either `{ "type":"text", "text":"…" }` or
 
 ## Per-clone MCP (control-server `:9002`)
 
-IP-routed: the calling clone is matched against `hosts[].host`; no `clone` argument. Exposes
-exactly one tool.
+Header-routed: the caller self-identifies with its clone id (== hostname) in the
+`x-rmng-clone` header — the agent-wrapper sets it on its MCP server config; no `clone`
+argument. Exposes exactly one tool.
 
 ### `set_state` — `{ report?: "working"|"idle", note?: string }`
 Record the agent's desktop verdict + note for the calling clone (sets `agentReport` /

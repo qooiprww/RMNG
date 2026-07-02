@@ -23,10 +23,10 @@ struct StatusResp {
 }
 
 /// One probe → the host's derived state.
-async fn probe_host(http: &reqwest::Client, host: &Host, agent_port: u16) -> MonitorState {
-    let url = format!("http://{}:{}/status", host.host, agent_port);
+async fn probe_host(app: &App, host: &Host, agent_port: u16) -> MonitorState {
+    let url = format!("http://{}:{}/status", app.dial_host(host).await, agent_port);
     let busy = async {
-        let resp = http.get(&url).timeout(FETCH_TIMEOUT).send().await.ok()?;
+        let resp = app.http.get(&url).timeout(FETCH_TIMEOUT).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -49,10 +49,9 @@ async fn poll_once(app: &App) {
         return;
     }
     let agent_port = app.config().agent_port;
-    let http = &app.http;
     // Probe concurrently.
     let probes = futures::future::join_all(
-        hosts.iter().map(|h| async move { (h.id.clone(), probe_host(http, h, agent_port).await) }),
+        hosts.iter().map(|h| async move { (h.id.clone(), probe_host(app, h, agent_port).await) }),
     )
     .await;
     let next: HashMap<String, MonitorState> = probes.into_iter().collect();

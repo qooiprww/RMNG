@@ -3,13 +3,12 @@
 //! are ported.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Multipart, Path as AxPath, State},
+    extract::{Multipart, Path as AxPath, State},
     http::{StatusCode, header},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
@@ -109,8 +108,7 @@ pub async fn serve(app: App) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("port 2 (web API + SSE + static) on http://{addr}");
-    // ConnectInfo so /api/detector-feedback can map the caller's source IP → clone.
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -565,23 +563,14 @@ async fn uploads_serve(State(app): State<App>, AxPath(file): AxPath<String>) -> 
 }
 
 /// `POST /api/detector-feedback` — the clone's `clone-daemon report-detection` uploads a
-/// wrong needs-human verdict (multipart) for tuning. The caller is mapped to its clone by
-/// source IP. Mirrors the old Bun route + `computer-use`'s payload.
+/// wrong needs-human verdict (multipart) for tuning. The caller self-identifies with a
+/// `clone` field (its hostname — clone IPs are dynamic Docker IPAM now, so there is no
+/// source-IP mapping). Mirrors the old Bun route + `computer-use`'s payload.
 async fn detector_feedback(
     State(app): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut mp: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let peer_ip = peer.ip().to_string();
-    let host_id = app
-        .store
-        .get()
-        .hosts
-        .into_iter()
-        .find(|h| h.host == peer_ip)
-        .map(|h| h.id)
-        .ok_or((StatusCode::NOT_FOUND, format!("no host matches source ip {peer_ip}")))?;
-
+    let mut clone_field: Option<String> = None;
     let mut fb = files::DetectorFeedback {
         kind: String::new(),
         detector_verdict: "working".into(),
@@ -593,6 +582,7 @@ async fn detector_feedback(
     let mut screenshot: Option<Vec<u8>> = None;
     while let Some(field) = mp.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
         match field.name().unwrap_or("") {
+            "clone" => clone_field = field.text().await.ok().map(|s| s.trim().to_string()),
             "kind" => fb.kind = field.text().await.unwrap_or_default(),
             "detectorVerdict" => fb.detector_verdict = field.text().await.unwrap_or_default(),
             "detectorReason" => fb.detector_reason = field.text().await.unwrap_or_default(),
@@ -612,9 +602,20 @@ async fn detector_feedback(
     if fb.kind != "false-positive" && fb.kind != "false-negative" {
         return Err((StatusCode::BAD_REQUEST, "kind must be false-positive|false-negative".into()));
     }
+    let clone = clone_field
+        .filter(|c| !c.is_empty())
+        .ok_or((StatusCode::BAD_REQUEST, "missing 'clone' field (the caller's clone id)".into()))?;
+    let host_id = app
+        .store
+        .get()
+        .hosts
+        .into_iter()
+        .find(|h| h.id == clone)
+        .map(|h| h.id)
+        .ok_or((StatusCode::NOT_FOUND, format!("no host named '{clone}'")))?;
     let id = files::save_detector_feedback(&app.config().data_dir, &host_id, &fb, screenshot.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tracing::info!("detector-feedback from {host_id} ({peer_ip}): {} (id {id})", fb.kind);
+    tracing::info!("detector-feedback from {host_id}: {} (id {id})", fb.kind);
     Ok(Json(json!({ "ok": true, "id": id, "host": host_id })))
 }
 

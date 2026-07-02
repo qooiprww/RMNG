@@ -62,7 +62,8 @@ pub enum MonitorState {
 pub struct Host {
     /// Stable id; equals the Docker container name for cloneable hosts.
     pub id: String,
-    /// RDP/media server hostname or IP.
+    /// Endpoint hostname/IP for unmanaged rows. Display-only on managed clones (it
+    /// records the container name == `id`; dials resolve via Docker DNS / inspect).
     pub host: String,
     /// Port (defaults to 3389 for the legacy RDP path).
     #[serde(default = "default_rdp_port")]

@@ -2,18 +2,17 @@
 //! `tools/call`), the same simple transport the legacy `/mcp` used (curl-testable;
 //! no rmcp/SSE session machinery).
 //!
-//!   - **Port 3 (per-clone)**: the in-clone agent connects; the target clone is the
-//!     caller (matched by source IP). Tools: `set_state` + the desktop tools
-//!     (screenshot/click/… — those need the `media` build's clone conns; here they
-//!     report "media not enabled" until wired into `mediaplane`).
+//!   - **Port 3 (per-clone)**: the in-clone agent connects; the caller self-identifies
+//!     with its clone id in the `x-rmng-clone` header (clone IPs are dynamic Docker
+//!     IPAM now, so there is nothing to reverse-map a source IP against). Tools:
+//!     `set_state`.
 //!   - **Port 4 (global)**: every web-frontend action as a tool, plus the desktop
 //!     tools with an explicit `clone` argument. Replaces `control-server-ctl`.
 
-use std::net::SocketAddr;
-
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::State,
+    http::HeaderMap,
     routing::post,
 };
 use serde_json::{Value, json};
@@ -23,7 +22,7 @@ use crate::jobs::{self, CloneSpec};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Scope {
-    /// Port 3: the clone is the caller (by source IP); agent-facing desktop tools.
+    /// Port 3: the clone is the caller (self-identified via the `x-rmng-clone` header).
     PerClone,
     /// Port 4: global control; tools take an explicit `clone` + web actions.
     Global,
@@ -41,11 +40,11 @@ pub async fn serve(app: App, port: u16, scope: Scope) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let label = match scope {
-        Scope::PerClone => "port 3 (per-clone MCP, IP-routed)",
+        Scope::PerClone => "port 3 (per-clone MCP, header-routed)",
         Scope::Global => "port 4 (global MCP)",
     };
     tracing::info!("{label} on http://{addr}");
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -92,7 +91,7 @@ fn dtool(name: &str, desc: &str, mut props: Value, extra_required: &[&str]) -> V
 fn tools_for(scope: Scope) -> Value {
     let clone_arg = json!({ "clone": { "type": "string", "description": "target clone id" } });
     let mut tools = vec![];
-    // set_state — both scopes (PerClone derives the clone from the source IP).
+    // set_state — both scopes (PerClone derives the clone from the x-rmng-clone header).
     let set_state_props = if scope == Scope::Global {
         json!({ "clone": { "type": "string" }, "report": { "type": "string", "enum": ["working", "idle"] }, "note": { "type": "string" } })
     } else {
@@ -184,10 +183,16 @@ fn merge(into: &mut Value, extra: &Value) {
     }
 }
 
-async fn rpc(State(st): State<McpState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(req): Json<Value>) -> Json<Value> {
+async fn rpc(State(st): State<McpState>, headers: HeaderMap, Json(req): Json<Value>) -> Json<Value> {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
+    // Per-clone self-identification: the agent-wrapper sends its clone id (hostname)
+    // on every request. Absent on the global port (and on stale in-clone builds).
+    let caller = headers
+        .get("x-rmng-clone")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     let result: Result<Value, String> = match method {
         "initialize" => Ok(json!({
@@ -200,7 +205,7 @@ async fn rpc(State(st): State<McpState>, ConnectInfo(peer): ConnectInfo<SocketAd
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            call_tool(&st, peer.ip().to_string(), name, args)
+            call_tool(&st, caller.as_deref(), name, args)
                 .await
                 .map(|content| json!({ "content": content }))
         }
@@ -213,11 +218,15 @@ async fn rpc(State(st): State<McpState>, ConnectInfo(peer): ConnectInfo<SocketAd
     }
 }
 
-/// Resolve which clone a call targets: per-clone scope → the caller's IP; global → `clone` arg.
-fn target_clone(st: &McpState, peer_ip: &str, args: &Value) -> Option<String> {
+/// Resolve which clone a call targets: per-clone scope → the caller's self-reported id
+/// (`x-rmng-clone` header), validated against the host list; global → `clone` arg.
+fn target_clone(st: &McpState, caller: Option<&str>, args: &Value) -> Option<String> {
     match st.scope {
         Scope::Global => args.get("clone").and_then(Value::as_str).map(str::to_string),
-        Scope::PerClone => st.app.store.get().hosts.into_iter().find(|h| h.host == peer_ip).map(|h| h.id),
+        Scope::PerClone => {
+            let id = caller?;
+            st.app.store.get().hosts.into_iter().find(|h| h.id == id).map(|h| h.id)
+        }
     }
 }
 
@@ -226,7 +235,7 @@ fn text(s: impl Into<String>) -> Value {
     json!([{ "type": "text", "text": s.into() }])
 }
 
-async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> Result<Value, String> {
+async fn call_tool(st: &McpState, caller: Option<&str>, name: &str, args: Value) -> Result<Value, String> {
     let app = &st.app;
     // Desktop + window tools → proxy to the target clone-daemon's MCP. Global only; the
     // in-clone agent calls its own clone-daemon directly (the per-clone MCP is set_state).
@@ -238,11 +247,11 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
         }
         let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
         let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-        return proxy_to_daemon(app, &host.host, name, &args).await;
+        return proxy_to_daemon(app, &host, name, &args).await;
     }
     match name {
         "set_state" => {
-            let clone = target_clone(st, &peer_ip, &args).ok_or("could not resolve target clone")?;
+            let clone = target_clone(st, caller, &args).ok_or("could not resolve target clone")?;
             let report = args.get("report").and_then(Value::as_str).map(str::to_string);
             let note = args.get("note").and_then(Value::as_str).map(str::to_string);
             app.store.mutate(|s| {
@@ -362,12 +371,12 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
     }
 }
 
-/// Proxy a desktop/window `tools/call` to a clone's clone-daemon MCP (`http://{ip}:{daemon_mcp}`)
-/// and return its `result.content`. The full args (incl. `clone`) pass through; the daemon
-/// ignores the `clone` key.
-async fn proxy_to_daemon(app: &App, host_ip: &str, name: &str, args: &Value) -> Result<Value, String> {
+/// Proxy a desktop/window `tools/call` to a clone's clone-daemon MCP (dialed by container
+/// name via Docker DNS — `App::dial_host`) and return its `result.content`. The full args
+/// (incl. `clone`) pass through; the daemon ignores the `clone` key.
+async fn proxy_to_daemon(app: &App, host: &wire::Host, name: &str, args: &Value) -> Result<Value, String> {
     let port = app.config().listen.daemon_mcp;
-    let url = format!("http://{host_ip}:{port}/");
+    let url = format!("http://{}:{port}/", app.dial_host(host).await);
     let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
     let resp = app
         .http

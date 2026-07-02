@@ -41,8 +41,8 @@ fn short_id() -> String {
     format!("{:08x}", (t as u64) & 0xFFFF_FFFF)
 }
 
-fn base_url(app: &App, host: &Host) -> String {
-    format!("http://{}:{}", host.host, app.config().agent_port)
+async fn base_url(app: &App, host: &Host) -> String {
+    format!("http://{}:{}", app.dial_host(host).await, app.config().agent_port)
 }
 
 // --- chat storage (mirrors notes) ------------------------------------------
@@ -200,7 +200,7 @@ pub fn send_chat(app: &App, host: &Host, text: &str) -> Result<(), String> {
 }
 
 async fn run_turn(app: App, host: Host, text: String) {
-    let base = base_url(&app, &host);
+    let base = base_url(&app, &host).await;
     let reply = run_turn_inner(&app, &host.id, &base, &text).await;
     push_message(&app, &host.id, ChatRole::Assistant, reply);
     set_busy(&app, &host.id, false);
@@ -299,7 +299,7 @@ fn extract_data_line(frame: &[u8]) -> Option<String> {
 
 /// Interrupt the host's in-flight turn (best-effort).
 pub async fn abort_chat(app: &App, host: &Host) {
-    post_abort(app, &base_url(app, host)).await;
+    post_abort(app, &base_url(app, host).await).await;
 }
 
 // --- kickoff (post-clone first message) ------------------------------------
@@ -322,7 +322,7 @@ pub async fn kickoff_agent(app: App, host: Host, opts: KickoffOpts) {
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         // probe /status; break when idle
-        let url = format!("{}/status", base_url(&app, &host));
+        let url = format!("{}/status", base_url(&app, &host).await);
         let idle = async {
             let r = app.http.get(&url).timeout(Duration::from_secs(4)).send().await.ok()?;
             let v: serde_json::Value = r.json().await.ok()?;
@@ -369,7 +369,7 @@ pub fn ensure_autonomous_listener(app: &App, host: &Host) {
 }
 
 async fn run_autonomous_listener(app: &App, host: &Host) -> Result<(), ()> {
-    let base = base_url(app, host);
+    let base = base_url(app, host).await;
     let resp = app
         .http
         .get(format!("{base}/events"))

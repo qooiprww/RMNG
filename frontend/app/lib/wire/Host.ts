@@ -8,7 +8,8 @@ export type Host = {
  */
 id: string, 
 /**
- * RDP/media server hostname or IP.
+ * Endpoint hostname/IP for unmanaged rows. Display-only on managed clones (it
+ * records the container name == `id`; dials resolve via Docker DNS / inspect).
  */
 host: string, 
 /**

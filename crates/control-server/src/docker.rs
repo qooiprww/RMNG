@@ -9,18 +9,20 @@
 //! [`EnvReport`] as `GET /api/setup/env`.
 //!
 //! Design notes carried from the port's global context:
-//! - The `rmng` bridge is user-defined with a static IPAM: `.1` gateway, `.2`
-//!   control-server (so recreating it never strands baked URLs), `.10+` clone pool. IPs
-//!   are derived from the network *base* (`addr & mask`), never the raw config string.
+//! - Addressing is Docker DNS, not static IPs: on the user-defined `rmng` bridge the
+//!   embedded resolver serves every container's *name* (== host id), and the
+//!   control-server attaches itself under the [`CONTROL_ALIAS`] network alias (so the
+//!   URLs baked into clones survive it being recreated). Clone IPs are plain Docker
+//!   IPAM — nothing allocates or stores them; dev mode (server on the host) is the one
+//!   consumer of raw IPs, via [`DockerCtl::inspect_ip`] / the subnet gateway.
 //! - bollard exec output is chunk-, not line-aligned — [`LineSplitter`] reassembles
 //!   complete lines per stream before the caller's callback fires (gotcha #1).
 //! - tar uid/gid is applied verbatim by the daemon; callers set uid/gid 1000 on
 //!   `home/rmng/**` entries (gotcha #2).
 //! - Clone images need `StopSignal=SIGRTMIN+3` baked in or every stop is a 20 s hang +
 //!   SIGKILL (gotcha #5); [`DockerCtl::commit`] with `set_boot_config` does this.
-//! - Static IPs survive daemon restarts via endpoint IPAM config (gotcha #6); stale
-//!   same-named containers 409 on create — callers get the daemon message verbatim
-//!   (gotcha #7).
+//! - Stale same-named containers 409 on create — callers get the daemon message
+//!   verbatim (gotcha #7).
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -31,7 +33,7 @@ use bollard::container::LogOutput;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerConfig, ContainerCreateBody, EndpointIpamConfig, EndpointSettings, HostConfig, Ipam,
+    ContainerConfig, ContainerCreateBody, EndpointSettings, HostConfig, Ipam,
     IpamConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountPointTypeEnum,
     MountTypeEnum, NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
     RestartPolicyNameEnum, VolumeCreateOptions,
@@ -51,6 +53,10 @@ use wire::{DockerConfig, EnvCheckRow, ImageInfo, SetupEnv};
 /// The user-defined bridge every clone (and the control-server) attaches to. Created
 /// lazily at wizard finish + before each clone; its subnet is one-time config.
 pub const NETWORK: &str = "rmng";
+/// The control-server's DNS alias on the [`NETWORK`] bridge. Clones dial the baked
+/// `RMNG_CONTROL_URL`/`AGENT_CONTROL_MCP_URL` through this name, so the operator's
+/// container name doesn't matter and recreating the container never strands the URLs.
+pub const CONTROL_ALIAS: &str = "rmng-control";
 /// Repository namespace for clone-source images (`rmng/template:<name>`).
 pub const IMAGE_REPO: &str = "rmng/template";
 /// The fixed base OS for the wizard-built base image. Not configurable: the patched
@@ -100,12 +106,14 @@ pub struct EnvReport {
     /// The control-server's own container id (full 64-hex) when running inside Docker;
     /// `None` = dev mode (running on the host directly).
     pub self_container: Option<String>,
-    /// The control-server's IP on the rmng network (subnet `.2`; dev mode = gateway `.1`).
-    pub control_ip: Option<String>,
+    /// What clones reach the control-server as: the [`CONTROL_ALIAS`] DNS name when the
+    /// server runs as a container on the rmng bridge; the bridge gateway IP (`.1`) in dev
+    /// mode (server on the host — clones can't resolve a host process by name).
+    pub control_host: Option<String>,
     /// Why the `rmng` network setup / self-attach step failed, when it did (only attempted
     /// once `setup_complete`). `None` = succeeded or not attempted. Non-fatal to the report
     /// (it's not in [`required_ok`]); the wizard-finish path surfaces it as a `networkWarning`
-    /// so a fresh deploy learns its clones' baked `.2` control URL won't resolve yet.
+    /// so a fresh deploy learns its clones' baked control URL won't resolve yet.
     pub network_detail: Option<String>,
     /// The shared clone-socket mount is present on our own container (required).
     pub sock_mount_ok: bool,
@@ -197,15 +205,14 @@ pub struct DockerCtl {
 }
 
 /// The set of things needed to create a clone container. `provision.rs` fills this from
-/// config + the chosen image + allocated IP.
+/// config + the chosen image. No IP: the clone joins the rmng bridge under plain Docker
+/// IPAM and is addressed by its name via the embedded DNS.
 #[derive(Debug, Clone)]
 pub struct CreateSpec {
     /// Container name (= host id, DNS-label-safe): e.g. `pega-dev-123`.
     pub name: String,
     /// Source image reference or id.
     pub image: String,
-    /// Static IPv4 on the rmng network (from [`DockerCtl::allocate_ip`]).
-    pub ip: String,
     /// Hostname inside the container (usually == `name`).
     pub hostname: String,
     /// Session env baked at create (`KEY=VALUE` pairs → container `Env`).
@@ -294,12 +301,13 @@ impl DockerCtl {
         self.env.read().await.clone()
     }
 
-    /// The control-server's own IP on the rmng network: `.2` normally, or the gateway
-    /// `.1` in dev mode (server on the host, not a container on the bridge). Reads the
-    /// cached report; falls back to computing from the subnet if `self_setup` hasn't run.
-    pub async fn control_ip(&self) -> Result<String> {
-        if let Some(ip) = self.env.read().await.control_ip.clone() {
-            return Ok(ip);
+    /// What clones reach the control-server as: the [`CONTROL_ALIAS`] DNS name normally,
+    /// or the bridge gateway IP in dev mode (server on the host, not a container on the
+    /// bridge). Reads the cached report; falls back to computing the gateway from the
+    /// subnet if `self_setup` hasn't run.
+    pub async fn control_host(&self) -> Result<String> {
+        if let Some(host) = self.env.read().await.control_host.clone() {
+            return Ok(host);
         }
         // Not yet probed: derive from config (dev-mode gateway is the safe default until
         // a self-container is detected).
@@ -315,8 +323,9 @@ impl DockerCtl {
     /// 2. self-detect our own container id (hostname inspect → `/proc/self/mountinfo`
     ///    fallback → none = dev mode),
     /// 3. `ensure_network()` **only when** `setup_complete` (network is lazy),
-    /// 4. control IP = `.2` (managed) / `.1` (dev mode); connect self at `.2` when both
-    ///    a self-container and the network exist,
+    /// 4. control host = the [`CONTROL_ALIAS`] DNS name (managed) / the gateway IP (dev
+    ///    mode); connect self under the alias when both a self-container and the network
+    ///    exist,
     /// 5. sock-mount discovery from our own mounts (required),
     /// 6. `dri_ok` = `/dev/dri/renderD128` exists.
     ///
@@ -350,7 +359,7 @@ impl DockerCtl {
                 // static bits (control IP from config, DRI from the fs) so the wizard
                 // shows what it can.
                 report.daemon_detail = Some(format!("{e:#}"));
-                report.control_ip = SubnetPlan::parse(&self.subnet).ok().map(|p| p.gateway().to_string());
+                report.control_host = SubnetPlan::parse(&self.subnet).ok().map(|p| p.gateway().to_string());
                 report.dri_ok = std::path::Path::new("/dev/dri/renderD128").exists();
                 report.sock_mount_detail = "Docker daemon unreachable".into();
                 *self.env.write().await = report.clone();
@@ -369,28 +378,27 @@ impl DockerCtl {
             }
         }
 
-        // 4. control IP + connect self at .2 (managed clone-fleet mode).
-        match SubnetPlan::parse(&self.subnet) {
-            Ok(plan) => {
-                if let Some(id) = &report.self_container {
-                    report.control_ip = Some(plan.control_server().to_string());
-                    // Best-effort: attach ourselves to the network at .2 so baked
-                    // RMNG_CONTROL_URLs resolve. Only meaningful once the network exists.
-                    if setup_complete {
-                        if let Err(e) = self.connect_self_to_network(id, &plan.control_server().to_string()).await {
-                            tracing::warn!(target: "docker", "connect self to {NETWORK} at .2 failed: {e}");
-                            // Don't clobber an earlier ensure_network failure (it's the root cause).
-                            report.network_detail.get_or_insert_with(|| {
-                                format!("attaching the control-server to the {NETWORK} network at .2 failed: {e}")
-                            });
-                        }
-                    }
-                } else {
-                    // dev mode: the server is on the host; clones reach it via the gateway.
-                    report.control_ip = Some(plan.gateway().to_string());
+        // 4. control host + connect self under the DNS alias (managed clone-fleet mode).
+        if let Some(id) = &report.self_container {
+            report.control_host = Some(CONTROL_ALIAS.to_string());
+            // Best-effort: attach ourselves to the network under the alias so baked
+            // RMNG_CONTROL_URLs resolve. Only meaningful once the network exists.
+            if setup_complete {
+                if let Err(e) = self.connect_self_to_network(id).await {
+                    tracing::warn!(target: "docker", "connect self to {NETWORK} as {CONTROL_ALIAS} failed: {e}");
+                    // Don't clobber an earlier ensure_network failure (it's the root cause).
+                    report.network_detail.get_or_insert_with(|| {
+                        format!("attaching the control-server to the {NETWORK} network as {CONTROL_ALIAS} failed: {e}")
+                    });
                 }
             }
-            Err(e) => tracing::warn!(target: "docker", "subnet {:?} unparseable: {e}", self.subnet),
+        } else {
+            // dev mode: the server is on the host; clones reach it via the gateway IP
+            // (they can't resolve a host process by name).
+            match SubnetPlan::parse(&self.subnet) {
+                Ok(plan) => report.control_host = Some(plan.gateway().to_string()),
+                Err(e) => tracing::warn!(target: "docker", "subnet {:?} unparseable: {e}", self.subnet),
+            }
         }
 
         // 5. sock-mount discovery from our own container's mounts.
@@ -482,16 +490,15 @@ impl DockerCtl {
         }
     }
 
-    /// Attach our own container to the rmng network at the given static IP (idempotent —
-    /// an already-connected endpoint is fine).
-    async fn connect_self_to_network(&self, self_id: &str, ip: &str) -> Result<()> {
+    /// Attach our own container to the rmng network under the [`CONTROL_ALIAS`] DNS
+    /// alias (idempotent — an already-connected endpoint is fine). NOTE: if the endpoint
+    /// already exists WITHOUT the alias (an attach from an older build), Docker keeps the
+    /// old endpoint; `docker network disconnect rmng <ctr>` once and re-run setup.
+    async fn connect_self_to_network(&self, self_id: &str) -> Result<()> {
         let cfg = NetworkConnectRequest {
             container: Some(self_id.to_string()),
             endpoint_config: Some(EndpointSettings {
-                ipam_config: Some(EndpointIpamConfig {
-                    ipv4_address: Some(ip.to_string()),
-                    ..Default::default()
-                }),
+                aliases: Some(vec![CONTROL_ALIAS.to_string()]),
                 ..Default::default()
             }),
         };
@@ -558,34 +565,6 @@ impl DockerCtl {
         self.daemon()?.create_network(req).await.with_context(|| format!("creating the {NETWORK} network"))?;
         tracing::info!(target: "docker", "created the {NETWORK} bridge with subnet {}", plan.cidr());
         Ok(())
-    }
-
-    /// Allocate the lowest free clone IP: the pool is `.10`..=last-usable, minus the
-    /// reserved `.1`/`.2` and anything already taken (from `state.json` — passed in — and
-    /// live network endpoints). Errors on pool exhaustion.
-    ///
-    /// `reserved` carries IPs the caller already knows are in use (e.g. `state.json`
-    /// hosts) that may not yet appear in the live network inspect.
-    pub async fn allocate_ip(&self, reserved: &[String]) -> Result<String> {
-        let plan = SubnetPlan::parse(&self.subnet)?;
-        let mut taken: std::collections::BTreeSet<Ipv4Addr> = std::collections::BTreeSet::new();
-        // From the live network (endpoints + explicit IPAM allocations).
-        if let Ok(net) = self.daemon()?.inspect_network(NETWORK, None::<bollard::query_parameters::InspectNetworkOptions>).await {
-            for c in net.containers.into_iter().flatten().map(|(_, v)| v) {
-                if let Some(addr) = c.ipv4_address.as_deref().and_then(parse_cidr_ip) {
-                    taken.insert(addr);
-                }
-            }
-        }
-        // From the caller's known set (state.json).
-        for s in reserved {
-            if let Ok(a) = s.parse::<Ipv4Addr>() {
-                taken.insert(a);
-            }
-        }
-        plan.lowest_free(&taken)
-            .map(|a| a.to_string())
-            .ok_or_else(|| anyhow!("the {NETWORK} clone IP pool ({}) is exhausted", plan.cidr()))
     }
 
     // --- images -----------------------------------------------------------------------
@@ -750,8 +729,8 @@ impl DockerCtl {
             .collect())
     }
 
-    /// Create a privileged systemd-PID-1 clone container on the rmng network at a static
-    /// IP. Bakes the stop signal + timeout, mounts the shared clone socket + a per-clone
+    /// Create a privileged systemd-PID-1 clone container on the rmng network (dynamic
+    /// IP; the name is the address). Bakes the stop signal + timeout, mounts the shared clone socket + a per-clone
     /// `rmng-dind-<name>` volume at `/var/lib/docker` (overlay-on-overlay fix), applies
     /// CPU/memory (+8 GiB swap) limits and `restart: unless-stopped`. Returns the new
     /// container id. Does NOT start it (caller decides). A stale same-named container
@@ -826,13 +805,7 @@ impl DockerCtl {
             networking_config: Some(NetworkingConfig {
                 endpoints_config: Some(HashMap::from([(
                     NETWORK.to_string(),
-                    EndpointSettings {
-                        ipam_config: Some(EndpointIpamConfig {
-                            ipv4_address: Some(spec.ip.clone()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
+                    EndpointSettings::default(),
                 )])),
             }),
             ..Default::default()
@@ -943,9 +916,8 @@ impl DockerCtl {
     }
 
     /// The container's IPv4 on the rmng network, or `None` if not attached / not running.
-    /// Public primitive kept for reconciliation flows; `provision` allocates + tracks IPs via
-    /// `state.json` today, so nothing in-crate calls it yet.
-    #[allow(dead_code)]
+    /// Dev mode's dial path: a host process can't use Docker's embedded DNS, so
+    /// `App::dial_host` resolves a clone's bridge IP through this instead.
     pub async fn inspect_ip(&self, id: &str) -> Result<Option<String>> {
         let info = self
             .daemon()?
@@ -1199,9 +1171,10 @@ fn build_client(socket: &str) -> Result<Docker> {
 
 // --- Pure helpers ---------------------------------------------------------------------
 
-/// A parsed subnet with the derived reserved/pool addresses. Everything is computed from
-/// the network *base* (`addr & mask`), so a config like `10.99.0.5/24` still yields the
-/// correct `.1`/`.2`/`.10+` on the `10.99.0.0/24` network (host bits masked off).
+/// A parsed subnet: the canonical CIDR the rmng bridge is created with, plus its `.1`
+/// gateway (dev mode's control host). Computed from the network *base* (`addr & mask`),
+/// so a config like `10.99.0.5/24` still yields `10.99.0.0/24` (host bits masked off).
+/// Nothing reserves or allocates clone IPs anymore — Docker IPAM owns them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubnetPlan {
     /// Network base (host bits zeroed).
@@ -1230,45 +1203,9 @@ impl SubnetPlan {
         format!("{}/{}", Ipv4Addr::from(self.base), self.prefix)
     }
 
-    /// `.1` — the bridge gateway (also the control-server address in dev mode).
+    /// `.1` — the bridge gateway (the control-server address in dev mode).
     pub fn gateway(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.base + 1)
-    }
-
-    /// `.2` — the static control-server address on the bridge.
-    pub fn control_server(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.base + 2)
-    }
-
-    /// First clone-pool address (`.10`).
-    pub fn pool_start(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.base + 10)
-    }
-
-    /// Last usable address of the subnet (broadcast − 1).
-    pub fn pool_end(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.broadcast() - 1)
-    }
-
-    /// The subnet broadcast address (all host bits set).
-    fn broadcast(&self) -> u32 {
-        let mask = prefix_to_mask(self.prefix);
-        self.base | !mask
-    }
-
-    /// Lowest free pool address not in `taken` and not the reserved `.1`/`.2`. `None` on
-    /// exhaustion.
-    pub fn lowest_free(&self, taken: &std::collections::BTreeSet<Ipv4Addr>) -> Option<Ipv4Addr> {
-        let start = u32::from(self.pool_start());
-        let end = u32::from(self.pool_end());
-        let g = u32::from(self.gateway());
-        let c = u32::from(self.control_server());
-        (start..=end)
-            .map(Ipv4Addr::from)
-            .find(|a| {
-                let n = u32::from(*a);
-                n != g && n != c && !taken.contains(a)
-            })
     }
 }
 
@@ -1279,12 +1216,6 @@ fn prefix_to_mask(prefix: u8) -> u32 {
     } else {
         u32::MAX << (32 - prefix as u32)
     }
-}
-
-/// Parse the `10.99.0.5/24` form Docker returns for a container endpoint into just the
-/// address.
-fn parse_cidr_ip(s: &str) -> Option<Ipv4Addr> {
-    s.split('/').next()?.parse().ok()
 }
 
 /// Split an image reference into `(name-without-tag, tag)`, defaulting the tag to
@@ -1426,7 +1357,6 @@ impl LineSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
 
     // --- client construction ----------------------------------------------------------
 
@@ -1447,59 +1377,21 @@ mod tests {
         );
     }
 
-    // --- IP allocator ---------------------------------------------------------------
+    // --- subnet plan ------------------------------------------------------------------
 
     #[test]
     fn subnet_masks_host_bits() {
-        // A config with host bits set still yields the correct network base + reserved.
+        // A config with host bits set still yields the correct network base + gateway.
         let plan = SubnetPlan::parse("10.99.0.5/24").unwrap();
         assert_eq!(plan.cidr(), "10.99.0.0/24");
         assert_eq!(plan.gateway().to_string(), "10.99.0.1");
-        assert_eq!(plan.control_server().to_string(), "10.99.0.2");
-        assert_eq!(plan.pool_start().to_string(), "10.99.0.10");
-        assert_eq!(plan.pool_end().to_string(), "10.99.0.254"); // .255 is broadcast
     }
 
     #[test]
-    fn subnet_16_wide_pool_bounds() {
+    fn subnet_16_wide_gateway() {
         let plan = SubnetPlan::parse("172.30.0.0/16").unwrap();
+        assert_eq!(plan.cidr(), "172.30.0.0/16");
         assert_eq!(plan.gateway().to_string(), "172.30.0.1");
-        assert_eq!(plan.control_server().to_string(), "172.30.0.2");
-        assert_eq!(plan.pool_start().to_string(), "172.30.0.10");
-        assert_eq!(plan.pool_end().to_string(), "172.30.255.254"); // .255.255 broadcast
-    }
-
-    #[test]
-    fn allocate_lowest_free_skips_reserved_and_taken() {
-        let plan = SubnetPlan::parse("10.99.0.0/24").unwrap();
-        // Empty → first pool address.
-        assert_eq!(plan.lowest_free(&BTreeSet::new()).unwrap().to_string(), "10.99.0.10");
-        // .10 and .11 taken → .12.
-        let taken: BTreeSet<Ipv4Addr> =
-            ["10.99.0.10", "10.99.0.11"].iter().map(|s| s.parse().unwrap()).collect();
-        assert_eq!(plan.lowest_free(&taken).unwrap().to_string(), "10.99.0.12");
-    }
-
-    #[test]
-    fn allocate_never_returns_reserved_even_if_freed() {
-        // .1 and .2 are never handed out, even though they're below the pool start,
-        // and even if a stale "taken" set omits them.
-        let plan = SubnetPlan::parse("10.99.0.0/24").unwrap();
-        let chosen = plan.lowest_free(&BTreeSet::new()).unwrap();
-        assert_ne!(chosen, plan.gateway());
-        assert_ne!(chosen, plan.control_server());
-        assert!(u32::from(chosen) >= u32::from(plan.pool_start()));
-    }
-
-    #[test]
-    fn allocate_pool_exhaustion() {
-        // A tiny /30-equivalent isn't reachable via config (min /24), so simulate
-        // exhaustion by taking every pool address in a /24.
-        let plan = SubnetPlan::parse("10.99.0.0/24").unwrap();
-        let start = u32::from(plan.pool_start());
-        let end = u32::from(plan.pool_end());
-        let full: BTreeSet<Ipv4Addr> = (start..=end).map(Ipv4Addr::from).collect();
-        assert!(plan.lowest_free(&full).is_none());
     }
 
     #[test]
@@ -1508,13 +1400,6 @@ mod tests {
         assert_eq!(prefix_to_mask(16), 0xFFFF_0000);
         assert_eq!(prefix_to_mask(20), 0xFFFF_F000);
         assert_eq!(prefix_to_mask(32), 0xFFFF_FFFF);
-    }
-
-    #[test]
-    fn parse_cidr_ip_strips_prefix() {
-        assert_eq!(parse_cidr_ip("10.99.0.5/24"), Some("10.99.0.5".parse().unwrap()));
-        assert_eq!(parse_cidr_ip("10.99.0.5"), Some("10.99.0.5".parse().unwrap()));
-        assert_eq!(parse_cidr_ip(""), None);
     }
 
     // --- line splitter --------------------------------------------------------------
@@ -1687,7 +1572,7 @@ mod tests {
             daemon_version: Some("29.0.1 (API 1.51)".into()),
             daemon_detail: None,
             self_container: None,
-            control_ip: Some("10.99.0.1".into()),
+            control_host: Some("10.99.0.1".into()),
             network_detail: None,
             sock_mount_ok: true,
             sock_mount_detail: "dev".into(),

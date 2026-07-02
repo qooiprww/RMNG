@@ -101,11 +101,12 @@ pub fn b64_encode(bytes: &[u8]) -> String {
 /// of the matching clone-source image. `None` when nothing in the listed clone sources
 /// matches (i.e. the input isn't a labeled `rmng.image=1` image at all).
 ///
-/// This is what keeps `Host.source` canonical regardless of the caller's input form: the
-/// in-use accounting (web.rs `fill_in_use_by`) and the images-delete 409 guard both compare
-/// `Host.source == ImageInfo.reference`, so a host created from an id form must still record
-/// the reference — otherwise its base image would show as unused and be deletable under
-/// live clones.
+/// This is what keeps the created container's `Image` column canonical regardless of the
+/// caller's input form: the in-use accounting (web.rs `fill_in_use_by`) and the
+/// images-delete 409 guard both compare `ManagedContainer.image == ImageInfo.reference`,
+/// so a clone created from an id form must still be created FROM the reference — otherwise
+/// its base image would show as unused and be deletable under live clones. `Host.source`
+/// records it too (commit lineage).
 pub fn resolve_reference(images: &[wire::ImageInfo], input: &str) -> Option<String> {
     images
         .iter()
@@ -116,21 +117,21 @@ pub fn resolve_reference(images: &[wire::ImageInfo], input: &str) -> Option<Stri
 /// The clone→control-server + detector-inference env every clone needs, as
 /// `environment.d`-style `KEY=VALUE` [`EnvVar`]s. Points the detector's feedback + agent
 /// `set_state` MCP at THIS control-server and the detector's vision model at the configured
-/// inference server. Ported from `orchestrate.rs::control_env_vars`, with the Proxmox
-/// UDP-`advertise_ip` trick replaced by `docker.control_ip()` (the static `.2` address on
-/// the rmng bridge — see `docker.rs`). Empty control URLs (with a warning) if the control
-/// IP can't be resolved, so clones fall back to the compiled detector defaults.
+/// inference server. The control host is `docker.control_host()` — the `rmng-control`
+/// DNS alias on the rmng bridge (the gateway IP in dev mode; see `docker.rs`). Empty
+/// control URLs (with a warning) if it can't be resolved, so clones fall back to the
+/// compiled detector defaults.
 pub async fn control_env_vars(app: &App) -> Vec<EnvVar> {
     let cfg = app.config();
     let ev = |key: &str, value: String| EnvVar { key: key.to_string(), value };
     let mut vars = Vec::new();
-    match app.docker.control_ip().await {
-        Ok(ip) => {
-            vars.push(ev("RMNG_CONTROL_URL", format!("http://{ip}:{}", cfg.listen.web)));
-            vars.push(ev("AGENT_CONTROL_MCP_URL", format!("http://{ip}:{}", cfg.listen.clone_mcp)));
+    match app.docker.control_host().await {
+        Ok(control) => {
+            vars.push(ev("RMNG_CONTROL_URL", format!("http://{control}:{}", cfg.listen.web)));
+            vars.push(ev("AGENT_CONTROL_MCP_URL", format!("http://{control}:{}", cfg.listen.clone_mcp)));
         }
         Err(e) => tracing::warn!(
-            "control_env_vars: could not resolve the control-server IP ({e}); \
+            "control_env_vars: could not resolve the control-server host ({e}); \
              clones fall back to the compiled detector defaults"
         ),
     }
@@ -210,11 +211,10 @@ struct PresetPathRc {
 
 // --- clone container ------------------------------------------------------------------
 
-/// Progress step → percentage for a clone-container create. Matches the plan's table.
+/// Progress step → percentage for a clone-container create.
 fn clone_pct(step: &str) -> Option<f64> {
     Some(match step {
         "queued" => 0.0,
-        "allocate" => 8.0,
         "create" => 20.0,
         "inject" => 35.0,
         "start" => 55.0,
@@ -227,14 +227,15 @@ fn clone_pct(step: &str) -> Option<f64> {
 /// Create + start a clone container from an `rmng.image=1` source image, injecting its
 /// identity/preset/PATH files, and wait for its daemon to register.
 ///
-/// Steps (→ pct): `queued` 0, `allocate` 8, `create` 20, `inject` 35, `start` 55,
-/// `wait-ready` 75, `done` 100. Returns `(ip, reference)` on success — the clone's static
-/// IP (`Host.host`) and the **canonical** image reference (`Host.source`; see
+/// Steps (→ pct): `queued` 0, `create` 20, `inject` 35, `start` 55, `wait-ready` 75,
+/// `done` 100. Returns the **canonical** image reference on success (`Host.source`; see
 /// [`resolve_reference`] — the caller may have passed an id form, but state must always
-/// record the reference for in-use accounting). The container *name* is the hostname (==
-/// host id) — that's how every later call addresses it; no id is returned or stored. On any
-/// failure BEFORE readiness, a cleanup trap removes the created container + its per-clone
-/// dind volume so a retry isn't blocked by a stale same-named container (gotcha #7).
+/// record the reference so the commit flow can stamp lineage). The container *name* is the
+/// hostname (== host id) — that's the clone's address (Docker DNS on the rmng bridge; its
+/// IP is plain Docker IPAM, never allocated or stored here). No id is returned or stored.
+/// On any failure BEFORE readiness, a cleanup trap removes the created container + its
+/// per-clone dind volume so a retry isn't blocked by a stale same-named container
+/// (gotcha #7).
 ///
 /// `image` must be a clone source (`rmng.image=1`); `env` is the resolved control + preset
 /// env (control URLs first so a preset can still override). One `upload_tar` injects: a
@@ -251,7 +252,7 @@ pub async fn clone_container(
     hostname: &str,
     env: &[EnvVar],
     mut on_progress: impl FnMut(&str, &str),
-) -> Result<(String, String)> {
+) -> Result<String> {
     if !is_dns_label(hostname) {
         bail!("clone hostname must be a DNS label (lowercase letters, digits, hyphens)");
     }
@@ -273,74 +274,38 @@ pub async fn clone_container(
         bail!("image '{image}' is not a clone source (missing the `rmng.image=1` label)");
     };
 
-    // The rmng bridge is lazy; make sure it's up before allocating an IP on it.
+    // The rmng bridge is lazy; make sure it's up before joining it.
     docker.ensure_network().await?;
 
-    // allocate → create → inject/start, with a bounded retry on the IP-allocation race:
-    // two concurrent clones can both pick the lowest free IP (allocate_ip reads state +
-    // a network inspect, neither of which sees the sibling until it STARTS), and Docker
-    // rejects the loser at container start with 403 "Address already in use" (seen live
-    // in the E2E). On that specific failure re-allocate — the winner is attached by then,
-    // so the next inspect skips its IP — and retry with a fresh container.
-    const IP_RACE_ATTEMPTS: usize = 3;
-    for attempt in 1..=IP_RACE_ATTEMPTS {
-        // Allocate the lowest free clone IP, reserving IPs already claimed in state.json
-        // (they may not yet appear in the live network inspect).
-        on_progress("allocate", "allocating a static clone IP");
-        let reserved: Vec<String> =
-            app.store.get().hosts.iter().map(|h| h.host.clone()).filter(|s| !s.is_empty()).collect();
-        let ip = docker.allocate_ip(&reserved).await?;
-        on_progress("allocate", &format!("clone IP {ip}"));
+    // Create the container (name == host id) from the CANONICAL reference (equivalent
+    // to the caller's input — same image — but keeps `docker ps`'s Image column
+    // readable). Its IP is Docker IPAM's business; the name is the address. A stale
+    // same-named container 409s here — the daemon message is surfaced verbatim
+    // (gotcha #7).
+    on_progress("create", &format!("creating container {hostname}"));
+    let spec = CreateSpec {
+        name: hostname.to_string(),
+        image: reference.clone(),
+        hostname: hostname.to_string(),
+        env: env.iter().filter(|v| !v.key.is_empty()).map(|v| (v.key.clone(), v.value.clone())).collect(),
+        cpus: cfg.docker.clone_cpus,
+        memory_mb: cfg.docker.clone_memory_mb,
+        sock_source: sock_source_dir(app).await,
+    };
+    let container = docker.create_clone_container(&spec).await?;
 
-        // Create the container (name == host id) from the CANONICAL reference (equivalent
-        // to the caller's input — same image — but keeps `docker ps`'s Image column
-        // readable). A stale same-named container 409s here — the daemon message is
-        // surfaced verbatim (gotcha #7).
-        on_progress("create", &format!("creating container {hostname} at {ip}"));
-        let spec = CreateSpec {
-            name: hostname.to_string(),
-            image: reference.clone(),
-            ip: ip.clone(),
-            hostname: hostname.to_string(),
-            env: env.iter().filter(|v| !v.key.is_empty()).map(|v| (v.key.clone(), v.value.clone())).collect(),
-            cpus: cfg.docker.clone_cpus,
-            memory_mb: cfg.docker.clone_memory_mb,
-            sock_source: sock_source_dir(app).await,
-        };
-        let container = match docker.create_clone_container(&spec).await {
-            Ok(id) => id,
-            Err(e) => bail!("{e}"),
-        };
-
-        // From here on, a failure must tear the half-built clone down. Run the rest under
-        // a guard that removes the container + its dind volumes on any early return.
-        let result = clone_container_after_create(app, &container, hostname, env, &mut on_progress).await;
-        match result {
-            Ok(()) => return Ok((ip, reference)),
-            Err(e) => {
-                tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
-                docker.remove_container(&container).await.ok();
-                docker.remove_volume(&crate::docker::DockerCtl::dind_volume_name(hostname)).await.ok();
-                docker.remove_volume(&crate::docker::DockerCtl::ctd_volume_name(hostname)).await.ok();
-                if attempt < IP_RACE_ATTEMPTS && is_address_in_use(&e) {
-                    let note = format!("IP {ip} lost to a concurrent clone; retrying (attempt {attempt}/{IP_RACE_ATTEMPTS})");
-                    tracing::warn!("clone {hostname}: {note}");
-                    on_progress("allocate", &note);
-                    continue;
-                }
-                return Err(e);
-            }
+    // From here on, a failure must tear the half-built clone down. Run the rest under
+    // a guard that removes the container + its dind volumes on any early return.
+    match clone_container_after_create(app, &container, hostname, env, &mut on_progress).await {
+        Ok(()) => Ok(reference),
+        Err(e) => {
+            tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
+            docker.remove_container(&container).await.ok();
+            docker.remove_volume(&crate::docker::DockerCtl::dind_volume_name(hostname)).await.ok();
+            docker.remove_volume(&crate::docker::DockerCtl::ctd_volume_name(hostname)).await.ok();
+            Err(e)
         }
     }
-    // Every loop iteration returns (success, non-race error, or final-attempt error).
-    unreachable!("clone_container retry loop always returns")
-}
-
-/// True when a container-start failure is Docker's static-IP collision ("failed to set up
-/// container networking: Address already in use") — the one failure class worth an
-/// allocate-again retry.
-fn is_address_in_use(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("Address already in use")
 }
 
 /// The inject → start → wait-ready tail of [`clone_container`], factored out so the caller
@@ -1095,7 +1060,6 @@ mod tests {
     fn step_pct_tables_match_plan() {
         use wire::OperationKind::*;
         assert_eq!(step_pct(Clone, "queued"), Some(0.0));
-        assert_eq!(step_pct(Clone, "allocate"), Some(8.0));
         assert_eq!(step_pct(Clone, "create"), Some(20.0));
         assert_eq!(step_pct(Clone, "inject"), Some(35.0));
         assert_eq!(step_pct(Clone, "start"), Some(55.0));

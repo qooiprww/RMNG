@@ -459,7 +459,7 @@ fn enforce_categories(base: &AppConfig, merged: &AppConfig) -> Result<()> {
             bail!("cloneSocket is a one-time setting (set during first-run setup) and cannot be changed after setup");
         }
         if merged.docker.subnet != base.docker.subnet {
-            bail!("docker.subnet is a one-time setting (baked into the rmng network + clone IPs at first-run setup) and cannot be changed after setup");
+            bail!("docker.subnet is a one-time setting (baked into the rmng network at first-run setup) and cannot be changed after setup");
         }
     }
     Ok(())

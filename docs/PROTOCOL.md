@@ -14,7 +14,7 @@ crate's public Rust API. Sources: [crates/wire/src/socket.rs](../crates/wire/src
 |---|---|---|---|---|---|
 | video | `9001` | `listen.video` | control-server mediaplane | native viewer | framed H.264/JSON over TCP |
 | web | `9000` | `listen.web` | control-server web | browser / control-client | HTTP + SSE |
-| per-clone MCP | `9002` | `listen.clone_mcp` | control-server mcp | in-clone agent-wrapper | HTTP JSON-RPC (IP-routed) |
+| per-clone MCP | `9002` | `listen.clone_mcp` | control-server mcp | in-clone agent-wrapper | HTTP JSON-RPC (header-routed) |
 | fleet MCP | `9003` | `listen.global_mcp` | control-server mcp | operator / fleet agents | HTTP JSON-RPC |
 | daemon MCP | `9004` | `RMNG_DAEMON_MCP_PORT` | clone-daemon | agent-wrapper + fleet MCP proxy | HTTP JSON-RPC |
 | agent-wrapper | `4096` | `agent_port` (config) / `AGENT_PORT` | agent-wrapper (in clone) | control-server chat proxy | HTTP + SSE |
@@ -149,9 +149,9 @@ keys, → `linearKeySet: bool`); `PUT /api/config` returns
   whole struct passes through the redacted view): `socket`
   (`"/var/run/docker.sock"` — the daemon the control-server drives, **restart-required**;
   the bollard client is built at startup), `subnet` (`"10.99.0.0/24"` — the CIDR for the
-  user-defined `rmng` bridge: `.1` gateway, `.2` control-server, `.10+` clone pool;
-  validated `/16`–`/24` at merge; **one-time**, baked into the network + clone IPs at
-  first-run setup), `hostname_prefix` (`"pega-"`, editable in Settings → prepended to derived
+  user-defined `rmng` bridge; addressing is Docker DNS — clones resolve by container name,
+  the control-server by its `rmng-control` alias — with clone IPs left to Docker IPAM;
+  validated `/16`–`/24` at merge; **one-time**, baked into the network at first-run setup), `hostname_prefix` (`"pega-"`, editable in Settings → prepended to derived
   clone hostnames; carried from the retired `proxmox.hostname_prefix` on migration),
   `clone_cpus` (`16` — whole cores → `nano_cpus`) and `clone_memory_mb` (`32768` — MiB, +8 GiB
   swap), both editable per-clone limits.
@@ -163,7 +163,7 @@ keys, → `linearKeySet: bool`); `PUT /api/config` returns
   **no grandfather rule**: an old `config.json` re-runs the wizard (new machine, no network /
   base image). A legacy `proxmox` block is scrubbed on load, carrying `hostnamePrefix` into
   `docker.hostname_prefix`; old `state.json` hosts load as plain unmanaged rows
-  (`container: None`, serde drops the stale `ctid`).
+  (`managed: false`; serde drops the stale `ctid`/`container` keys).
 - <a id="preset"></a>**`Preset`**: `name`, `labels` (Linear ticket labels that auto-select
   this preset when cloning from a ticket — case-insensitive, first match in config order
   wins), `linear_key` (personal API key, **secret** — fetches/creates tickets server-side

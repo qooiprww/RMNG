@@ -45,6 +45,20 @@ pub fn default_control_url() -> String {
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
+
+/// This clone's id — `RMNG_CLONE_ID` else the container hostname (the same resolution the
+/// media-plane `Hello` uses in main.rs). Sent with detector feedback so the control-server
+/// knows the caller: clone IPs are dynamic Docker IPAM, so there is no source-IP mapping.
+fn clone_id() -> String {
+    non_empty_env("RMNG_CLONE_ID")
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown-clone".to_string())
+}
 const MODEL_MAX_H: u32 = 1080;
 const TILE_COLS: u32 = 2;
 const TILE_ROWS: u32 = 1;
@@ -408,6 +422,7 @@ pub async fn report_detection(opts: ReportOptions) -> Result<()> {
     let base = opts.control_url.trim_end_matches('/');
     let endpoint = format!("{base}/api/detector-feedback");
     let mut form = reqwest::multipart::Form::new()
+        .text("clone", clone_id())
         .text("kind", kind)
         .text("detectorVerdict", detector_verdict)
         .text("detectorReason", meta.reason.clone())

@@ -206,20 +206,22 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // `image_ref` is the CANONICAL reference of the image actually used (the caller may have
     // passed an id form — MCP/raw API); `Host.source` must record the reference so the
     // commit flow can stamp lineage. The backing container's name is the host id — that's
-    // how every later call (redeploy, credential ops, delete) addresses it.
-    let (ip, image_ref) =
+    // how every later call (dials, redeploy, credential ops, delete) addresses it.
+    let image_ref =
         match clone_container(&app, &spec.source_image, &spec.new_hostname, &env, progress).await {
             Ok(v) => v,
             Err(e) => return fail_op(&app, &op_id, e.to_string()),
         };
 
-    // Register the new managed host. Clones ship with fixed `rmng`/`rmng` credentials baked
-    // into the base image (the old Proxmox credential-inheritance from a source host is gone —
-    // images have no per-host credentials to inherit). RDP port stays 3389 for the media path.
+    // Register the new managed host. `host` is display-only for managed clones (dials go
+    // by container name == id), so it just records the name. Clones ship with fixed
+    // `rmng`/`rmng` credentials baked into the base image (the old Proxmox
+    // credential-inheritance from a source host is gone — images have no per-host
+    // credentials to inherit). RDP port stays 3389 for the media path.
     app.store.mutate(|s| {
         let mut host = Host {
             id: spec.new_hostname.clone(),
-            host: ip.clone(),
+            host: spec.new_hostname.clone(),
             port: 3389,
             username: "rmng".into(),
             password: "rmng".into(),
@@ -240,7 +242,7 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             op.status = OperationStatus::Done;
             op.step = "done".into();
             op.pct = 100.0;
-            op.message = format!("clone {} ready at {ip}", spec.new_hostname);
+            op.message = format!("clone {} ready", spec.new_hostname);
             op.finished_at = Some(now_ms());
         }
     });

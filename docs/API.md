@@ -1,8 +1,7 @@
 # HTTP API reference — web port (default `:9000`)
 
 The control-server's **port 2** serves the React management UI (a static SPA served from
-disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}` with
-`ConnectInfo::<SocketAddr>` (the source IP is used by `/api/detector-feedback`).
+disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}`.
 
 - **No auth.** All endpoints are open; the server is meant to sit behind a tailnet /
   firewall. Path params that hit the filesystem (`notes`, `uploads`) are validated as
@@ -74,13 +73,13 @@ keeps the connection alive. This is what the dashboard subscribes to.
 | `operations` | `Operation[]` | in-flight + recent clone/delete/bootstrap/commit jobs |
 | `claude_accounts` | `ClaudeUsage[]` | per-account 5h/7d usage + spend |
 
-`Host` carries connection info (`id`, `host`, `port`, `username`, …), the Docker `container`
-id (full 64-hex; the container *name* equals the host id — `Some` marks a managed clone,
-`None` a plain unmanaged row), the `source` image reference, the assigned
+`Host` carries connection info (`id`, `host`, `port`, `username`, …), the `managed` flag
+(true = a Docker container named after the host id backs it; false = a plain unmanaged
+row), the `source` image reference, the assigned
 `claude_account_email`, Linear metadata (`linear_workspace`, `linear_ticket`, `linear_branch`,
 …), `agent_report` (working/idle), `state_note`, and `monitor_state` (working/idle/offline).
 `Operation` carries `id`, `kind` (clone/delete/bootstrap/commit), `target`, `source`,
-`status`, `step`, `pct`, a rolling `log`, `container`, and timestamps.
+`status`, `step`, `pct`, a rolling `log`, and timestamps.
 
 ---
 
@@ -208,10 +207,11 @@ Serve an uploaded image by its generated `<16-hex>.<ext>` name, with the right C
 
 ### `POST /api/detector-feedback` (multipart)
 A clone's `clone-daemon report-detection` posts here when the needs-human detector's verdict
-was wrong. The **caller's source IP** is matched against `hosts[].host` to resolve the clone
-(so no auth/clone arg is needed). Fields: `kind` (`false-positive`|`false-negative`,
-required), `detectorVerdict`, `detectorReason`, `actualState`, repeated `ignoreReason`,
-`note`, and an optional `screenshot` file. Persists a JSON record + screenshot under
+was wrong. The caller **self-identifies** with a `clone` field (its hostname == host id —
+clone IPs are dynamic Docker IPAM, so there is no source-IP mapping). Fields: `clone`
+(required), `kind` (`false-positive`|`false-negative`, required), `detectorVerdict`,
+`detectorReason`, `actualState`, repeated `ignoreReason`, `note`, and an optional
+`screenshot` file. Persists a JSON record + screenshot under
 `data/detector-feedback/`. Returns `{ "ok": true, "id": "...", "host": "..." }`.
 
 ---

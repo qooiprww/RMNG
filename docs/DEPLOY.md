@@ -121,8 +121,8 @@ is any image labeled `rmng.image=1`, repo `rmng/template:<name>`:
 - **List images**: `GET /api/images` — each with the ids of live clones running on it.
 - **Clone from an image**: `POST /api/clone` takes `image` (a `rmng/template:<name>`
   reference from the image list) plus a task mode (Linear ticket / new ticket / plain). The
-  clone gets a static IP (`.10+`), fixed `rmng`/`rmng` credentials, its preset env, and a
-  Claude account.
+  clone joins the `rmng` bridge (addressed by container name — Docker DNS; its IP is plain
+  Docker IPAM) with fixed `rmng`/`rmng` credentials, its preset env, and a Claude account.
 - **Commit a clone to a new image**: `POST /api/images/commit {host, name}` — freezes the
   running clone and commits it to `rmng/template:<name>` (`rmng.created-from` records
   lineage). On-disk credentials in the clone's home are baked into the image (logged as a
@@ -256,11 +256,13 @@ daemonOnly?}` (or the fleet MCP `redeploy` tool).
 
 ## Networking & the media socket
 
-- **`rmng` bridge**: a user-defined bridge with static IPAM from `docker.subnet` — `.1`
-  gateway, `.2` control-server (static, so recreating it never strands baked
-  `RMNG_CONTROL_URL`s), `.10+` clone pool (lowest-free allocator). Created lazily at wizard
-  finish and before each clone. If an `rmng` network already exists with a **different**
-  subnet, `ensure_network` errors — delete it with `docker network rm rmng` and re-run setup.
+- **`rmng` bridge**: a user-defined bridge with the subnet from `docker.subnet`, created
+  lazily at wizard finish and before each clone. Addressing is Docker's embedded DNS, not
+  static IPs: every clone resolves by its container name (== host id), and the
+  control-server attaches itself under the `rmng-control` alias (so recreating its container
+  never strands the baked `RMNG_CONTROL_URL`s). Clone IPs are plain Docker IPAM — nothing
+  allocates or stores them. If an `rmng` network already exists with a **different** subnet,
+  `ensure_network` errors — delete it with `docker network rm rmng` and re-run setup.
 - **Clone media socket**: clone-daemon ships dmabuf frames to the control-server over a
   `SOCK_SEQPACKET` unix socket (fds via `SCM_RIGHTS`), *not* the network. The shared
   `rmng-sock` named volume is mounted into the control-server and every clone at the same path

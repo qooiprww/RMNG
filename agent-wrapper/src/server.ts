@@ -28,6 +28,7 @@
 // Session id is in memory only: a CoW clone boots a fresh wrapper and starts a
 // brand-new conversation. Auth = the container's logged-in `claude` subscription.
 import { query, type McpServerConfig, type Options, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { hostname } from "node:os";
 
 // The agent's instructions are embedded at BUILD time via Bun text imports. This
 // wrapper ships as a `bun build --compile` single-exec, so a runtime read
@@ -134,7 +135,14 @@ function mcpServers(): Record<string, McpServerConfig> {
     // sharing its live Mutter session. Registered as "desktop" ("computer-use" is a
     // reserved MCP name); alwaysLoad keeps screenshot/click/… in context every turn.
     desktop: { type: "http", url: CONFIG.daemonMcpUrl, alwaysLoad: true },
-    "control-server": { type: "http", url: CONFIG.controlMcpUrl },
+    // The per-clone control-server MCP routes by the caller's self-reported clone id
+    // (clone IPs are dynamic Docker IPAM — no source-IP mapping). hostname() == the
+    // clone's container name == its host id.
+    "control-server": {
+      type: "http",
+      url: CONFIG.controlMcpUrl,
+      headers: { "x-rmng-clone": hostname() },
+    },
   };
 
   // The clone's preset Linear identity (LINEAR_API_KEY, injected at clone creation).
