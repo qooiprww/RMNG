@@ -41,7 +41,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     CommitContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
     ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder,
-    RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder,
+    RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder, TagImageOptionsBuilder,
 };
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -249,6 +249,20 @@ pub struct TarEntry {
     pub mode: u32,
     pub uid: u64,
     pub gid: u64,
+}
+
+/// One event from [`DockerCtl::pull_image`]'s stream. `info.error` frames are surfaced as
+/// a hard `Err` instead (e.g. Docker Hub rate limits — gotcha #9), never as an event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PullEvent {
+    /// A per-(layer, status) transition — one line per transition (not per byte tick),
+    /// deduped exactly as the pre-rework callback did. `layer` is the daemon's short layer
+    /// id (empty for the odd status line that isn't layer-scoped, e.g. `Pulling from
+    /// library/ubuntu`).
+    Status { layer: String, status: String },
+    /// Aggregate download+extract byte progress across all layers, monotonic and
+    /// throttled to integer-percent changes. See [`PullAggregator`].
+    Bytes { frac: f64 },
 }
 
 impl DockerCtl {
@@ -569,28 +583,42 @@ impl DockerCtl {
 
     // --- images -----------------------------------------------------------------------
 
-    /// Pull an image, streaming progress to the callback (deduped per layer id so the
-    /// Operation log gets one line per layer instead of every byte tick). Surfaces the
-    /// daemon error verbatim (e.g. Docker Hub rate limits on `ubuntu:26.04`, gotcha #9).
-    pub async fn pull_image(&self, reference: &str, mut on_progress: impl FnMut(&str, &str)) -> Result<()> {
+    /// Pull an image, streaming [`PullEvent`]s: `Status` deduped per-(layer, status)
+    /// transition (the Operation log gets one line per transition, not per byte tick) and
+    /// `Bytes` aggregate progress ticks throttled to integer-percent changes by
+    /// [`PullAggregator`]. `info.error` is surfaced as a hard error verbatim (e.g. Docker
+    /// Hub rate limits on `ubuntu:26.04`, gotcha #9).
+    pub async fn pull_image(&self, reference: &str, mut on_event: impl FnMut(PullEvent)) -> Result<()> {
         let (image, tag) = split_reference(reference);
         let opts = CreateImageOptionsBuilder::new().from_image(&image).tag(&tag).build();
         let docker = self.daemon()?;
         let mut stream = docker.create_image(Some(opts), None, None);
         // Track the last status emitted per layer so we don't spam a line per byte.
-        let mut last: HashMap<String, String> = HashMap::new();
+        let mut last_status: HashMap<String, String> = HashMap::new();
+        let mut aggregator = PullAggregator::default();
         while let Some(item) = stream.next().await {
             let info = item.with_context(|| format!("pulling {reference}"))?;
+            if let Some(err) = info.error.filter(|e| !e.is_empty()) {
+                bail!("pulling {reference}: {err}");
+            }
             let id = info.id.clone().unwrap_or_default();
             let status = info.status.clone().unwrap_or_default();
+
+            // Byte-progress ticks happen far more often than status transitions (many
+            // ticks share the same "Downloading"/"Extracting" status), so this runs on
+            // every frame, independent of the status dedup below.
+            let (current, total) = info.progress_detail.map(|p| (p.current, p.total)).unwrap_or_default();
+            if let Some(frac) = aggregator.observe(&id, &status, current, total) {
+                on_event(PullEvent::Bytes { frac });
+            }
+
             if status.is_empty() {
                 continue;
             }
             // Emit once per (layer, status) transition.
-            if last.get(&id).map(|s| s != &status).unwrap_or(true) {
-                last.insert(id.clone(), status.clone());
-                let msg = if id.is_empty() { status.clone() } else { format!("{id}: {status}") };
-                on_progress("pull", &msg);
+            if last_status.get(&id).map(|s| s != &status).unwrap_or(true) {
+                last_status.insert(id.clone(), status.clone());
+                on_event(PullEvent::Status { layer: id, status });
             }
         }
         Ok(())
@@ -603,6 +631,31 @@ impl DockerCtl {
             Err(BollardError::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
             Err(e) => Err(anyhow!("inspecting image {reference}: {e}")),
         }
+    }
+
+    /// Tag an existing image (`source`, a reference or id) as `repo:tag` — e.g. tagging a
+    /// freshly pulled upstream image into RMNG's own [`IMAGE_REPO`] namespace.
+    // Not yet called: the pull flow that uses this lands in the next task.
+    #[allow(dead_code)]
+    pub async fn tag_image(&self, source: &str, repo: &str, tag: &str) -> Result<()> {
+        let opts = TagImageOptionsBuilder::new().repo(repo).tag(tag).build();
+        self.daemon()?
+            .tag_image(source, Some(opts))
+            .await
+            .with_context(|| format!("tagging {source} as {repo}:{tag}"))?;
+        Ok(())
+    }
+
+    /// An image's labels (`ImageInspect.Config.Labels`), or an empty map if it has none.
+    // Not yet called: the pull flow that uses this lands in the next task.
+    #[allow(dead_code)]
+    pub async fn image_labels(&self, reference: &str) -> Result<HashMap<String, String>> {
+        let info = self
+            .daemon()?
+            .inspect_image(reference)
+            .await
+            .with_context(|| format!("inspecting image {reference}"))?;
+        Ok(info.config.and_then(|c| c.labels).unwrap_or_default())
     }
 
     /// List clone-source images (label `rmng.image=1`), newest first, projected to the
@@ -1232,6 +1285,84 @@ fn split_reference(reference: &str) -> (String, String) {
     }
 }
 
+/// Aggregates bollard's per-layer pull progress into one monotonic `0.0..=1.0` fraction,
+/// weighted 70% download / 30% extract (`frac = 0.7·Σdl_cur/Σdl_tot + 0.3·Σex_cur/Σex_tot`)
+/// since download dominates a fresh image pull's wall-clock time. Pure — no daemon I/O —
+/// fed frame-by-frame by [`DockerCtl::pull_image`] via [`Self::observe`]. Two invariants
+/// make it safe to drive a `state.json` write / SSE broadcast per emission:
+/// - **Monotonic**: reports `max(frac, peak)`. Layers register at different times with
+///   different `total`s, so the raw sum can transiently *shrink* as the denominator grows
+///   mid-pull; the reported value never goes backwards.
+/// - **Throttled**: [`Self::observe`] returns `Some` only on an integer-percent change,
+///   capping emissions at ≤100 per pull.
+///
+/// Layers reported `Already exists` (a cache hit — nothing to download or extract) weigh
+/// zero: excluded from both sums rather than counted as "already done", so a pull that's
+/// mostly cache hits still reflects the (small) amount of real work left.
+#[derive(Debug, Default)]
+pub struct PullAggregator {
+    /// Per-layer `(current, total)` download bytes.
+    downloads: HashMap<String, (i64, i64)>,
+    /// Per-layer `(current, total)` extract bytes.
+    extracts: HashMap<String, (i64, i64)>,
+    /// The highest fraction reported so far (the monotonic floor for the next emission).
+    peak: f64,
+    /// The last emitted integer percent (0..=100), so repeated ticks under the same
+    /// whole percent don't re-emit.
+    last_percent: Option<i64>,
+}
+
+impl PullAggregator {
+    /// Feed one pull-stream frame's `id`/`status`/`progress_detail.{current,total}` (off a
+    /// bollard `CreateImageInfo`). Returns the new aggregate fraction only when the integer
+    /// percent changed since the last emission; `None` otherwise (including frames with no
+    /// layer id, or a status this aggregator doesn't track bytes for).
+    pub fn observe(&mut self, id: &str, status: &str, current: Option<i64>, total: Option<i64>) -> Option<f64> {
+        if id.is_empty() {
+            return None;
+        }
+        match status {
+            "Already exists" => {
+                self.downloads.remove(id);
+                self.extracts.remove(id);
+            }
+            "Downloading" => {
+                let (Some(c), Some(t)) = (current, total) else { return None };
+                self.downloads.insert(id.to_string(), (c, t));
+            }
+            "Extracting" => {
+                let (Some(c), Some(t)) = (current, total) else { return None };
+                self.extracts.insert(id.to_string(), (c, t));
+            }
+            // "Pulling fs layer", "Waiting", "Verifying Checksum", "Pull complete", etc. —
+            // no byte counts to fold in.
+            _ => return None,
+        }
+
+        let frac = Self::weighted_frac(&self.downloads, &self.extracts);
+        self.peak = self.peak.max(frac);
+        let percent = (self.peak * 100.0) as i64;
+        if self.last_percent == Some(percent) {
+            None
+        } else {
+            self.last_percent = Some(percent);
+            Some(self.peak)
+        }
+    }
+
+    fn weighted_frac(downloads: &HashMap<String, (i64, i64)>, extracts: &HashMap<String, (i64, i64)>) -> f64 {
+        let (dl_cur, dl_tot) = Self::sum_bytes(downloads);
+        let (ex_cur, ex_tot) = Self::sum_bytes(extracts);
+        let dl_frac = if dl_tot > 0 { dl_cur as f64 / dl_tot as f64 } else { 0.0 };
+        let ex_frac = if ex_tot > 0 { ex_cur as f64 / ex_tot as f64 } else { 0.0 };
+        0.7 * dl_frac + 0.3 * ex_frac
+    }
+
+    fn sum_bytes(layers: &HashMap<String, (i64, i64)>) -> (i64, i64) {
+        layers.values().fold((0, 0), |(cur, tot), &(c, t)| (cur + c, tot + t))
+    }
+}
+
 /// A short (12-hex) form of a full container/image id for log lines. `sha256:` prefixes
 /// are stripped first.
 fn short_id(id: &str) -> String {
@@ -1516,6 +1647,61 @@ mod tests {
             ("registry:5000/img".into(), "v1".into())
         );
         assert_eq!(split_reference("registry:5000/img"), ("registry:5000/img".into(), "latest".into()));
+    }
+
+    // --- pull aggregator --------------------------------------------------------------
+
+    #[test]
+    fn pull_aggregator_monotonic_under_growing_totals() {
+        let mut agg = PullAggregator::default();
+        let mut peak = 0.0_f64;
+        for (cur, tot) in [(50, 100), (60, 100)] {
+            if let Some(f) = agg.observe("a", "Downloading", Some(cur), Some(tot)) {
+                assert!(f >= peak, "fraction regressed: {f} < {peak}");
+                peak = f;
+            }
+        }
+        assert!((peak - 0.42).abs() < 1e-9, "expected 0.7 * 0.60 = 0.42, got {peak}");
+
+        // A much bigger layer registers mid-pull: the raw sum-based fraction would drop
+        // sharply (0.7 * 60/100_060 ≈ 0.00042), but the reported value must never regress
+        // below the prior peak even though the totals grew.
+        let dropped = agg.observe("b", "Downloading", Some(0), Some(100_000));
+        if let Some(f) = dropped {
+            assert!(f >= peak, "peak regressed when a large new layer joined: {f} < {peak}");
+        }
+    }
+
+    #[test]
+    fn pull_aggregator_cached_layers_weigh_zero() {
+        let mut agg = PullAggregator::default();
+        // A fully cached layer (no progress_detail — a real "Already exists" frame never
+        // carries one) must not appear in either sum's denominator.
+        assert!(agg.observe("a", "Already exists", None, None).is_some());
+        let frac = agg.observe("b", "Downloading", Some(50), Some(100)).unwrap();
+        assert!(
+            (frac - 0.35).abs() < 1e-9,
+            "cached layer must not inflate the denominator: expected 0.7 * 0.50 = 0.35, got {frac}"
+        );
+    }
+
+    #[test]
+    fn pull_aggregator_throttles_to_integer_percent_changes() {
+        let mut agg = PullAggregator::default();
+        let mut emissions = 0;
+        let mut last_frac = 0.0_f64;
+        // 501 byte-granular updates — far more ticks than there are percent points to cross.
+        for cur in 0..=500 {
+            if let Some(f) = agg.observe("a", "Downloading", Some(cur), Some(500)) {
+                emissions += 1;
+                last_frac = f;
+            }
+        }
+        // Download-only progress tops out at 0.7·1.0 = 0.7 (30% is reserved for extract),
+        // so at most 71 distinct integer percents (0..=70) can ever be crossed.
+        assert!(emissions <= 71, "expected throttled emissions, got {emissions} (of 501 updates)");
+        assert!(emissions > 1, "expected more than one emission as the percent climbs");
+        assert!((last_frac - 0.7).abs() < 1e-9, "final fraction should reach 0.7, got {last_frac}");
     }
 
     #[test]

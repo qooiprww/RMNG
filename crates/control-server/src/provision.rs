@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use wire::{AppConfig, EnvVar};
 
 use crate::app::App;
-use crate::docker::{CreateSpec, TarEntry, CLONE_USER};
+use crate::docker::{CreateSpec, PullEvent, TarEntry, CLONE_USER};
 
 const PROVISION_SCRIPT: &str = include_str!("../scripts/provision-clone.sh");
 const APPLY_MONITORS_SCRIPT: &str = include_str!("../scripts/apply-monitors.sh");
@@ -475,7 +475,14 @@ pub async fn bootstrap_base_image(
     // surfaced verbatim — gotcha #9).
     on_progress("pull", &format!("pulling {}", crate::docker::BASE_DOCKER_IMAGE));
     docker
-        .pull_image(crate::docker::BASE_DOCKER_IMAGE, |_step, msg| on_progress("pull", msg))
+        .pull_image(crate::docker::BASE_DOCKER_IMAGE, |event| {
+            // `Bytes` (aggregate byte progress) is ignored here — this bootstrap path is
+            // retired by the next task; only `Status` lines map onto the existing op log.
+            if let PullEvent::Status { layer, status } = event {
+                let msg = if layer.is_empty() { status } else { format!("{layer}: {status}") };
+                on_progress("pull", &msg);
+            }
+        })
         .await?;
 
     // Build container: privileged sleep-infinity on the default bridge, started so we can
