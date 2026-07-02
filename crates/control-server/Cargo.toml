@@ -30,9 +30,6 @@ tower.workspace = true
 tower-http.workspace = true
 notify.workspace = true
 reqwest.workspace = true
-# Decompress the gzipped payload binaries (clone-daemon, agent-wrapper, gnome-shell
-# deb) that assets.rs reads from /usr/local/share/rmng (image) or embedded-bin/ (dev).
-flate2 = "1"
 # Docker orchestration substrate (src/docker.rs): the unix-socket daemon client that
 # replaced the retired SSH/pct Proxmox path. `tar` builds the in-memory archives
 # `upload_tar` PUTs into containers.

@@ -502,7 +502,7 @@ async fn bootstrap_after_create(
     for (payload_name, dest) in [
         ("clone-daemon", "root/rmng-clone-daemon"),
         ("agent-wrapper", "root/agent-wrapper"),
-        ("gnome-shell-deb", "root/gnome-shell-patched.deb"),
+        ("gnome-shell.deb", "root/gnome-shell-patched.deb"),
     ] {
         match crate::assets::payload(payload_name) {
             Some(bytes) => {

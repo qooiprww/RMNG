@@ -8,26 +8,28 @@
 # a build one.
 #
 # Nothing is compiled into the server binary (rust-embed is gone): the runtime stage
-# assembles /usr/local/share/rmng/ — clone-daemon.gz, agent-wrapper.gz,
-# gnome-shell-deb.gz, static/ (the frontend) — which assets.rs/web.rs read at runtime.
-# The three build stages are fully independent, so BuildKit runs them in parallel and a
-# source-only rust change rebuilds only the rust layers.
+# assembles /usr/local/share/rmng/ — the plain clone-daemon + agent-wrapper binaries,
+# gnome-shell.deb, static/ (the frontend) — which assets.rs/web.rs read at runtime.
+# Payloads are stored UNcompressed (no gzip: it only ever existed to keep the rust-embed
+# blob small; registry pushes compress layers anyway). The three build stages are fully
+# independent, so BuildKit runs them in parallel and a source-only rust change rebuilds
+# only the rust layers.
 #
 # Stages:
 #   1. bun-build   — frontend (react-router → frontend/build/client) + agent-wrapper
-#                    (bun build --compile → gzipped).
+#                    (bun build --compile).
 #   2. gnome-build — patched gnome-shell .deb (shell-01 hide screen-sharing indicator +
 #                    shell-03 enable Shell.Eval) via gnome-patch/build-shell-deb.sh →
-#                    /out/gnome-shell-deb.gz. The build-dep layer is multi-GB but
+#                    /out/gnome-shell.deb. The build-dep layer is multi-GB but
 #                    build-stage-only and cached until the base image changes; the
 #                    compile layer re-runs only when gnome-patch/ changes.
-#   3. rust-build  — rustup stable; dev deps; cargo build --release clone-daemon (→ gz)
+#   3. rust-build  — rustup stable; dev deps; cargo build --release clone-daemon
 #                    + control-server.
 #   4. runtime     — ubuntu:26.04, runtime libs + /usr/local/share/rmng payloads,
 #                    WORKDIR /data, EXPOSE 9000-9003.
 
 # ---------------------------------------------------------------------------------------
-# 1. bun stage: frontend build + agent-wrapper bun --compile → gzip
+# 1. bun stage: frontend build + agent-wrapper bun --compile
 # ---------------------------------------------------------------------------------------
 FROM oven/bun:1 AS bun-build
 WORKDIR /src
@@ -39,19 +41,18 @@ RUN cd frontend && bun install --frozen-lockfile
 COPY frontend/ ./frontend/
 RUN cd frontend && bun run build
 
-# agent-wrapper: bun build --compile a single self-contained binary, then gzip it (the
-# control-server installs it into each clone during provisioning).
+# agent-wrapper: bun build --compile a single self-contained binary (the control-server
+# installs it into each clone during provisioning).
 COPY agent-wrapper/package.json agent-wrapper/bun.lock ./agent-wrapper/
 RUN cd agent-wrapper && bun install --frozen-lockfile
 COPY agent-wrapper/ ./agent-wrapper/
 RUN cd agent-wrapper \
- && bun build --compile src/server.ts --outfile /tmp/agent-wrapper \
- && gzip -c /tmp/agent-wrapper > /tmp/agent-wrapper.gz
+ && bun build --compile src/server.ts --outfile /tmp/agent-wrapper
 
 # ---------------------------------------------------------------------------------------
 # 2. gnome-build stage: the patched gnome-shell .deb (shell-01 + shell-03), built the
 #    same way the retired build CT did (cs-build-ct.sh → gnome-patch/build-shell-deb.sh).
-#    assets.rs tolerates the .gz being absent at runtime (stock-shell fallback), but this
+#    assets.rs tolerates the deb being absent at runtime (stock-shell fallback), but this
 #    stage makes it always present — no out-of-band artifact step.
 # ---------------------------------------------------------------------------------------
 FROM ubuntu:26.04 AS gnome-build
@@ -67,13 +68,13 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.s
       sassc dpkg-dev meson ninja-build patch ca-certificates \
  && mkdir -p /root/rmng-shell-build && touch /root/rmng-shell-build/.deps-done
 COPY gnome-patch/ /src/gnome-patch/
-# build-shell-deb.sh prints the produced deb path as `DEB=<path>` on stdout; gzip it to
+# build-shell-deb.sh prints the produced deb path as `DEB=<path>` on stdout; copy it to
 # the fixed path the runtime stage copies from.
 RUN bash /src/gnome-patch/build-shell-deb.sh > /tmp/shell-deb.out \
  && DEB="$(sed -n 's/^DEB=//p' /tmp/shell-deb.out | tail -1)" \
  && test -n "$DEB" && test -f "$DEB" \
- && mkdir -p /out && gzip -c "$DEB" > /out/gnome-shell-deb.gz \
- && echo "[gnome-build] gnome-shell-deb.gz: $(du -h /out/gnome-shell-deb.gz | cut -f1)"
+ && mkdir -p /out && cp "$DEB" /out/gnome-shell.deb \
+ && echo "[gnome-build] gnome-shell.deb: $(du -h /out/gnome-shell.deb | cut -f1)"
 
 # ---------------------------------------------------------------------------------------
 # 3. rust build stage — binaries only (no asset staging; fully parallel with 1 + 2)
@@ -111,13 +112,13 @@ COPY . .
 
 # Release-build both binaries in one cache-mounted RUN (shared dep graph compiles once).
 # The `target` cache is a mount, so outputs must be copied OUT in the same RUN (cache
-# mounts don't persist into the image layer). clone-daemon ships gzipped (the server
+# mounts don't persist into the image layer). clone-daemon is a payload (the server
 # pushes it into clones); the control-server binary is the image entrypoint.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p clone-daemon -p control-server \
  && mkdir -p /out \
- && gzip -c target/release/rmng-clone-daemon > /out/clone-daemon.gz \
+ && cp target/release/rmng-clone-daemon /out/clone-daemon \
  && cp target/release/rmng-control-server /out/rmng-control-server
 
 # ---------------------------------------------------------------------------------------
@@ -137,12 +138,12 @@ RUN apt-get update \
 
 COPY --from=rust-build /out/rmng-control-server /usr/local/bin/rmng-control-server
 
-# Payloads + frontend on the image filesystem (assets.rs / web.rs read these; the .gz
-# payload bytes are identical to what used to be rust-embed'ed, so guest scripts and
-# provisioning semantics are unchanged).
-COPY --from=rust-build  /out/clone-daemon.gz            /usr/local/share/rmng/clone-daemon.gz
-COPY --from=bun-build   /tmp/agent-wrapper.gz           /usr/local/share/rmng/agent-wrapper.gz
-COPY --from=gnome-build /out/gnome-shell-deb.gz         /usr/local/share/rmng/gnome-shell-deb.gz
+# Payloads + frontend on the image filesystem, stored PLAIN (assets.rs / web.rs read
+# these; provision.rs pushes the same bytes into clones at /root/… where
+# provision-clone.sh installs them — destinations/modes unchanged from the gz era).
+COPY --from=rust-build  /out/clone-daemon               /usr/local/share/rmng/clone-daemon
+COPY --from=bun-build   /tmp/agent-wrapper              /usr/local/share/rmng/agent-wrapper
+COPY --from=gnome-build /out/gnome-shell.deb            /usr/local/share/rmng/gnome-shell.deb
 COPY --from=bun-build   /src/frontend/build/client      /usr/local/share/rmng/static
 
 # CWD-relative config.json + data/ land in the /data volume (config.rs uses relative paths).

@@ -2,5 +2,7 @@
 **/target/
 node_modules/
 frontend/build/
-crates/control-server/embedded-bin/*.gz
+# dev payload staging dir — its own .gitignore ignores everything but itself
+crates/control-server/embedded-bin/*
+!crates/control-server/embedded-bin/.gitignore
 *.tmp.*

@@ -413,7 +413,6 @@ dependencies = [
  "anyhow",
  "axum",
  "bollard",
- "flate2",
  "futures",
  "media",
  "nix",
