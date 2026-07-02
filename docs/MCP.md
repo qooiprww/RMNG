@@ -66,6 +66,8 @@ clone → `"unknown clone"`; an unreachable daemon → `"clone-daemon MCP unreac
 | `claude_recommended` | — | `{email}` recommended account |
 | `claude_swap` | `clone`, `account?` (email/`auto`) | hot-swap the clone's Claude account |
 | `set_state` | `clone`, `report?`, `note?` | as per-clone, but clone from the arg |
+| `send_message` | `clone`, `text` | send a chat message to the clone's host agent (async — the turn runs detached; `409`-style error if one is already running) → `"message sent to …"` |
+| `read_chat` | `clone` | the host-agent chat history + live working state: `{ busy, activity?, messages[] }` |
 
 ### Proxied desktop/window tools
 
@@ -89,9 +91,9 @@ its per-monitor latest-dmabuf (screenshots via `media::screenshot_png`), and gno
 | `list_monitors` | — | `[{id,width,height}]` |
 | `screenshot` | `monitor?`=0 | PNG of the monitor's latest captured frame (image). Errors if no frame buffered yet |
 | `mouse_move` | `x`, `y`, `monitor?`=0 | clamp to monitor bounds, eased glide (10 steps ≈100 ms); **emits a cursor-warp** to the viewer each step; settle + screenshot |
-| `left_click` / `right_click` / `middle_click` | `x?`, `y?`, `monitor?`=0 | optional jump-move, then press (`0x110`/`0x111`/`0x112`) → 50 ms → release; settle + screenshot |
-| `left_double_click` | `x?`, `y?`, `monitor?`=0 | two left presses 80 ms apart; settle + screenshot |
-| `scroll` | `amount` (clamped ±15), `x?`, `y?`, `monitor?`=0 | optional jump-move, then `amount` discrete vertical notches 25 ms apart; settle + screenshot |
+| `left_click` / `right_click` / `middle_click` | `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then press (`0x110`/`0x111`/`0x112`) → 50 ms → release; settle + screenshot |
+| `left_double_click` | `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then two left presses 80 ms apart; settle + screenshot |
+| `scroll` | `amount` (clamped ±15), `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then `amount` discrete vertical notches 25 ms apart; settle + screenshot |
 | `key` | `keys` (e.g. `"ctrl+c"`, `"alt+Tab"`, `"Return"`) | parse combo → press in order, release in reverse (X11 keysyms); settle + screenshot |
 | `type` | `text` | per-char keysym press/release, 12 ms apart (full Unicode); returns `"typed N chars"` |
 

@@ -88,7 +88,9 @@ struct ChatSnapshot {
     messages: Vec<ChatMessage>,
 }
 
-fn snapshot_json(app: &App, host_id: &str) -> String {
+/// The `{ busy, activity, messages }` snapshot as JSON — the chat history plus the
+/// host agent's live working state. Used by the SSE bus and the fleet MCP `read_chat`.
+pub fn snapshot_json(app: &App, host_id: &str) -> String {
     let snap = ChatSnapshot {
         busy: app.chat.busy.lock().unwrap().contains(host_id),
         activity: app.chat.activity.lock().unwrap().get(host_id).cloned(),

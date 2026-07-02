@@ -157,6 +157,21 @@ fn tools_for(scope: Scope) -> Value {
             }),
             json!(["clone", "account"]),
         ));
+        tools.push(tool(
+            "send_message",
+            "Send a chat message to a clone's host agent. Async: the agent works in the background — poll read_chat for its reply. Errors if a turn is already running for that clone.",
+            json!({
+                "clone": { "type": "string", "description": "target clone id" },
+                "text": { "type": "string", "description": "the message to send to the host agent" },
+            }),
+            json!(["clone", "text"]),
+        ));
+        tools.push(tool(
+            "read_chat",
+            "Read a clone's host-agent chat history + live working state: { busy, activity?, messages[] }. `busy` = a turn is running; `activity` = what it's doing right now.",
+            clone_arg.clone(),
+            json!(["clone"]),
+        ));
     }
     Value::Array(tools)
 }
@@ -324,6 +339,20 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
                 (None, Some(e)) => format!("swapped {clone} → {e}"),
                 _ => format!("swapped {clone} → none (no token)"),
             }))
+        }
+        "send_message" => {
+            let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
+            let msg = args.get("text").and_then(Value::as_str).ok_or("text required")?;
+            let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
+            crate::chat::send_chat(app, &host, msg)?;
+            Ok(text(format!("message sent to {clone}; the host agent is now working — poll read_chat for its reply")))
+        }
+        "read_chat" => {
+            let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
+            if !app.store.get().hosts.iter().any(|h| h.id == clone) {
+                return Err("unknown clone".into());
+            }
+            Ok(text(crate::chat::snapshot_json(app, clone)))
         }
         other => Err(format!("unknown tool '{other}'")),
     }
