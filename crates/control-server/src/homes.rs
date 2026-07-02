@@ -106,21 +106,20 @@ async fn reconcile(app: &App, warned: &mut HashSet<String>) {
     let root = hosts_root(&cfg.data_dir);
     let _ = std::fs::create_dir_all(&root);
 
-    // Only managed clones (container set) with a path-safe id are candidates.
+    // Only managed clones (container name == host id) with a path-safe id are candidates.
     let hosts: Vec<Host> = app
         .store
         .get()
         .hosts
         .into_iter()
-        .filter(|h| h.container.is_some() && is_safe_id(&h.id))
+        .filter(|h| h.managed && is_safe_id(&h.id))
         .collect();
 
     // Ids we maintain a link for this tick; everything else under hosts/ gets pruned.
     let mut desired: HashSet<String> = HashSet::new();
 
     for h in &hosts {
-        let container = h.container.as_deref().unwrap_or_default();
-        let pid = match app.docker.container_pid(container).await {
+        let pid = match app.docker.container_pid(&h.id).await {
             Ok(Some(p)) => p,
             Ok(None) => continue, // stopped / gone → no link (prune removes any stale one)
             Err(e) => {

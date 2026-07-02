@@ -286,9 +286,11 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
             let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
             let daemon_only = args.get("daemonOnly").and_then(Value::as_bool).unwrap_or(false);
             let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-            let container = host.container.as_deref().ok_or("clone has no container")?;
-            crate::provision::redeploy_clone(app, container, daemon_only, |step, msg| {
-                tracing::info!("redeploy {clone} ({container}) {step}: {msg}");
+            if !host.managed {
+                return Err("not a managed clone".into());
+            }
+            crate::provision::redeploy_clone(app, &host.id, daemon_only, |step, msg| {
+                tracing::info!("redeploy {clone} {step}: {msg}");
             })
             .await
             .map_err(|e| e.to_string())?;
@@ -301,25 +303,27 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
             let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
             let account = args.get("account").and_then(Value::as_str).unwrap_or("auto");
             let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-            let container = host.container.clone().ok_or("clone has no container")?;
+            if !host.managed {
+                return Err("not a managed clone".into());
+            }
             let assignment = crate::claude::resolve_assignment(app, Some(account)).ok_or("no imported Claude accounts")?;
             let selection = crate::claude::normalize_selection(Some(account));
             let (group, email) = match assignment {
                 crate::claude::Assignment::None => {
-                    crate::claude::clear_clone_token(app, &container)
+                    crate::claude::clear_clone_token(app, &host.id)
                         .await
                         .map_err(|e| e.to_string())?;
                     app.claude.forget_pushed(&host.id);
                     (None, None)
                 }
                 crate::claude::Assignment::Group { name, initial } => {
-                    crate::claude::push_account_to_clone(app, &host.id, &container, &initial)
+                    crate::claude::push_account_to_clone(app, &host.id, &initial)
                         .await
                         .map_err(|e| e.to_string())?;
                     (Some(name), Some(initial))
                 }
                 crate::claude::Assignment::Account(a) => {
-                    crate::claude::push_account_to_clone(app, &host.id, &container, &a)
+                    crate::claude::push_account_to_clone(app, &host.id, &a)
                         .await
                         .map_err(|e| e.to_string())?;
                     (None, Some(a))

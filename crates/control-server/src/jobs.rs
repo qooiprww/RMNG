@@ -88,7 +88,6 @@ fn make_op(kind: OperationKind, target: &str, source: Option<&str>) -> Operation
         pct: 0.0,
         message,
         log: Vec::new(),
-        container: None,
         started_at: now_ms(),
         finished_at: None,
     }
@@ -205,9 +204,10 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     let mut env = control_env_vars(&app).await;
     env.extend(spec.env.iter().cloned());
     // `image_ref` is the CANONICAL reference of the image actually used (the caller may have
-    // passed an id form — MCP/raw API); `Host.source` must record the reference so the image
-    // shows as in-use (`fill_in_use_by`) and the images-delete 409 guard protects it.
-    let (container, ip, image_ref) =
+    // passed an id form — MCP/raw API); `Host.source` must record the reference so the
+    // commit flow can stamp lineage. The backing container's name is the host id — that's
+    // how every later call (redeploy, credential ops, delete) addresses it.
+    let (ip, image_ref) =
         match clone_container(&app, &spec.source_image, &spec.new_hostname, &env, progress).await {
             Ok(v) => v,
             Err(e) => return fail_op(&app, &op_id, e.to_string()),
@@ -223,7 +223,7 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             port: 3389,
             username: "rmng".into(),
             password: "rmng".into(),
-            container: Some(container.clone()),
+            managed: true,
             source: Some(image_ref.clone()),
             ..Default::default()
         };
@@ -237,7 +237,6 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
         }
         s.hosts.push(host);
         if let Some(op) = s.operations.iter_mut().find(|o| o.id == op_id) {
-            op.container = Some(container.clone());
             op.status = OperationStatus::Done;
             op.step = "done".into();
             op.pct = 100.0;
@@ -278,7 +277,7 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
                     Some(g) => format!("{email} (group {g})"),
                     None => email.clone(),
                 };
-                match crate::claude::push_account_to_clone(&app, &spec.new_hostname, &container, &email).await {
+                match crate::claude::push_account_to_clone(&app, &spec.new_hostname, &email).await {
                     Ok(()) => patch_op(&app, &op_id, |op| op.log.push(format!("account: assigned {label}"))),
                     Err(e) => {
                         tracing::warn!("push_account_to_clone({}) failed: {e}", spec.new_hostname);
@@ -350,8 +349,8 @@ async fn run_bootstrap(app: App, op_id: String, name: String) {
 }
 
 /// Validate + register a commit-from-clone op, then drive it in the background. Guards:
-/// the host is a managed clone (has a container), the target tag is free (no existing image
-/// AND no in-flight commit racing for it), and the host has no operation already in flight.
+/// the host is a managed clone, the target tag is free (no existing image AND no in-flight
+/// commit racing for it), and the host has no operation already in flight.
 pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, JobError> {
     if !is_dns_label(name) {
         return Err(JobError(
@@ -365,9 +364,9 @@ pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, J
         .find(|h| h.id == host_id)
         .cloned()
         .ok_or_else(|| JobError(format!("unknown host '{host_id}'")))?;
-    let Some(container) = host.container.clone() else {
-        return Err(JobError(format!("'{host_id}' has no container — only managed clones can be committed")));
-    };
+    if !host.managed {
+        return Err(JobError(format!("'{host_id}' is not a managed clone — only clones can be committed")));
+    }
     let reference = format!("{}:{}", crate::docker::IMAGE_REPO, name);
     // Reject a tag already targeted by another running commit/bootstrap (a race the pure
     // `image_exists` check in provision can't see yet). The existing-image check happens in
@@ -384,27 +383,27 @@ pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, J
     }
 
     // Target = the image name (what's being produced); source = the host it's committed from.
-    let mut op = make_op(OperationKind::Commit, name, Some(host_id));
-    op.container = Some(container.clone());
+    let op = make_op(OperationKind::Commit, name, Some(host_id));
     let (ret, op_id) = (op.clone(), op.id.clone());
     app.store.mutate(|s| s.operations.push(op));
 
     let app2 = app.clone();
+    let host_id = host_id.to_string();
     let (name, source) = (name.to_string(), host.source.clone().unwrap_or_default());
-    tokio::spawn(async move { run_commit(app2, op_id, container, name, source, reference).await });
+    tokio::spawn(async move { run_commit(app2, op_id, host_id, name, source, reference).await });
     Ok(ret)
 }
 
 async fn run_commit(
     app: App,
     op_id: String,
-    container: String,
+    host_id: String,
     name: String,
     source: String,
     reference: String,
 ) {
     let progress = op_progress(&app, &op_id, OperationKind::Commit);
-    if let Err(e) = commit_clone_image(&app, &container, &name, &source, progress).await {
+    if let Err(e) = commit_clone_image(&app, &host_id, &name, &source, progress).await {
         return fail_op(&app, &op_id, e.to_string());
     }
     patch_op(&app, &op_id, |op| {
@@ -417,9 +416,9 @@ async fn run_commit(
     schedule_prune(app.clone(), op_id, PRUNE_DONE_MS);
 }
 
-/// Validate + register a delete op, then drive it in the background. A managed clone
-/// (`container: Some`) is torn down through `provision::delete_clone`; an unmanaged row
-/// (`container: None` — a legacy/plain host) is simply removed from state.
+/// Validate + register a delete op, then drive it in the background. A managed clone is
+/// torn down through `provision::delete_clone` (container name == host id); an unmanaged
+/// row (a legacy/plain host) is simply removed from state.
 pub fn start_delete(app: &App, host_id: &str) -> Result<Operation, JobError> {
     let st = app.store.get();
     let host = st.hosts.iter().find(|h| h.id == host_id).cloned();
@@ -430,23 +429,22 @@ pub fn start_delete(app: &App, host_id: &str) -> Result<Operation, JobError> {
         return Err(JobError(format!("'{host_id}' already has an operation in flight")));
     }
 
-    let mut op = make_op(OperationKind::Delete, host_id, None);
-    op.container = host.container.clone();
+    let op = make_op(OperationKind::Delete, host_id, None);
     let op_for_return = op.clone();
     let op_id = op.id.clone();
     app.store.mutate(|s| s.operations.push(op));
 
     let app2 = app.clone();
     let host_id = host_id.to_string();
-    let container = host.container.clone();
-    tokio::spawn(async move { run_delete(app2, op_id, host_id, container).await });
+    let managed = host.managed;
+    tokio::spawn(async move { run_delete(app2, op_id, host_id, managed).await });
     Ok(op_for_return)
 }
 
-async fn run_delete(app: App, op_id: String, host_id: String, container: Option<String>) {
-    if let Some(container) = &container {
+async fn run_delete(app: App, op_id: String, host_id: String, managed: bool) {
+    if managed {
         let progress = op_progress(&app, &op_id, OperationKind::Delete);
-        if let Err(e) = delete_clone(&app, container, &host_id, progress).await {
+        if let Err(e) = delete_clone(&app, &host_id, progress).await {
             return fail_op(&app, &op_id, e.to_string());
         }
     } else {
@@ -467,9 +465,10 @@ async fn run_delete(app: App, op_id: String, host_id: String, container: Option<
             op.status = OperationStatus::Done;
             op.step = "done".into();
             op.pct = 100.0;
-            op.message = match &container {
-                Some(_) => format!("clone {host_id} destroyed"),
-                None => "host removed".into(),
+            op.message = if managed {
+                format!("clone {host_id} destroyed")
+            } else {
+                "host removed".into()
             };
             op.finished_at = Some(now_ms());
         }

@@ -70,6 +70,51 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Boot reconciliation: `state.json` is authoritative for host rows, but the daemon is
+    // authoritative for what actually exists — diff them once so drift is visible instead
+    // of silent. Orphan rows (managed host, no container — someone `docker rm`ed it behind
+    // the server) and unknown managed containers (a container with our label but no row —
+    // e.g. a build worker left over from a crashed bootstrap) are LOGGED, not auto-fixed:
+    // deleting either side automatically could destroy something the operator wanted.
+    // Best-effort + bounded — a down/wedged daemon skips this (same posture as self-setup).
+    {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.docker.list_managed_containers(),
+        )
+        .await
+        {
+            Ok(Ok(live)) => {
+                let live_names: std::collections::HashSet<&str> =
+                    live.iter().map(|c| c.name.as_str()).collect();
+                let hosts = app.store.get().hosts;
+                for h in hosts.iter().filter(|h| h.managed) {
+                    if !live_names.contains(h.id.as_str()) {
+                        tracing::warn!(
+                            "reconcile: managed host '{}' has no container on the daemon \
+                             (removed behind the server?) — delete the row in the UI or \
+                             recreate the clone",
+                            h.id
+                        );
+                    }
+                }
+                let known: std::collections::HashSet<&str> =
+                    hosts.iter().map(|h| h.id.as_str()).collect();
+                for c in live.iter().filter(|c| !known.contains(c.name.as_str())) {
+                    tracing::warn!(
+                        "reconcile: managed container '{}' (image {}, {}) has no host row — \
+                         a leftover from a crashed operation? Remove it with `docker rm`",
+                        c.name,
+                        c.image,
+                        if c.running { "running" } else { "stopped" }
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::warn!("reconcile: listing managed containers failed: {e:#}"),
+            Err(_) => tracing::warn!("reconcile: listing managed containers timed out after 10s"),
+        }
+    }
+
     // Background loops: Claude usage poller, group-rotation loop, per-host agent-state
     // poller, and the clone-home reconciler (the Docker-port successor to the Proxmox-era
     // sshfs mount loop — it symlinks data/hosts/<id> → /proc/<clone-pid>/root/home/rmng so

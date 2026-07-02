@@ -43,12 +43,12 @@ impl StateStore {
         }
         let state = read_from_disk(&path);
         let serialized_file = to_file(&state);
-        // Hosts with no `container` are legacy/unmanaged rows (an old Proxmox-era
-        // `state.json` whose `ctid` serde dropped, or hand-added plain hosts): they carry
+        // Non-`managed` hosts are legacy/unmanaged rows (an old `state.json` whose
+        // `ctid`/`container` keys serde dropped, or hand-added plain hosts): they carry
         // no managed Docker clone and are just deletable UI rows. Surface the count so an
-        // operator migrating from the LXC backend sees at a glance how many rows won't have
-        // a live container behind them.
-        let unmanaged = state.hosts.iter().filter(|h| h.container.is_none()).count();
+        // operator migrating from an older backend sees at a glance how many rows won't
+        // have a live container behind them.
+        let unmanaged = state.hosts.iter().filter(|h| !h.managed).count();
         tracing::info!(
             hosts = state.hosts.len(),
             unmanaged,
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn legacy_state_loads_hosts_as_unmanaged() {
         // A Proxmox-era state.json (hosts carry the retired `ctid`, plus a top-level
-        // `templates` list) loads with every host `container: None` — serde drops the
+        // `templates` list) loads with every host `managed: false` — serde drops the
         // stale keys, so these are plain unmanaged rows. Guards the state-store load path
         // (the wire crate covers the serde drop; this covers our fixture-through-load).
         let path = temp_path();
@@ -213,7 +213,7 @@ mod tests {
         let store = StateStore::load(path.clone()).unwrap();
         let st = store.get();
         assert_eq!(st.hosts.len(), 1);
-        assert_eq!(st.hosts[0].container, None); // legacy ctid dropped → unmanaged
+        assert!(!st.hosts[0].managed); // legacy ctid dropped → unmanaged
         let _ = std::fs::remove_file(&path);
     }
 

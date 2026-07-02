@@ -10,8 +10,8 @@
 //! Caller-facing division of responsibility (as with `orchestrate.rs`): `jobs.rs` owns the
 //! `Operation` record + the progress→op-log plumbing and calls the flows here; `claude.rs`
 //! drives credential ops via [`run_clone_op`]; `web.rs`/`mcp.rs` call [`redeploy_clone`] +
-//! [`apply_monitors`]. These functions take the `container` id (the clone's Docker id, from
-//! `Host.container`), not a Proxmox ctid.
+//! [`apply_monitors`]. These functions address a clone by its container *name*, which
+//! equals the host id (`Host.managed` rows) — no container id is stored anywhere.
 //!
 //! Guest scripts are embedded (`include_str!`) and streamed over `docker exec bash -s`:
 //! [`crate::docker::DockerCtl::exec_script`]. Binaries (clone-daemon, agent-wrapper, patched
@@ -228,10 +228,11 @@ fn clone_pct(step: &str) -> Option<f64> {
 /// identity/preset/PATH files, and wait for its daemon to register.
 ///
 /// Steps (→ pct): `queued` 0, `allocate` 8, `create` 20, `inject` 35, `start` 55,
-/// `wait-ready` 75, `done` 100. Returns `(container_id, ip, reference)` on success — the new
-/// container id (`Host.container`), its static IP (`Host.host`), and the **canonical**
-/// image reference (`Host.source`; see [`resolve_reference`] — the caller may have passed an
-/// id form, but state must always record the reference for in-use accounting). On any
+/// `wait-ready` 75, `done` 100. Returns `(ip, reference)` on success — the clone's static
+/// IP (`Host.host`) and the **canonical** image reference (`Host.source`; see
+/// [`resolve_reference`] — the caller may have passed an id form, but state must always
+/// record the reference for in-use accounting). The container *name* is the hostname (==
+/// host id) — that's how every later call addresses it; no id is returned or stored. On any
 /// failure BEFORE readiness, a cleanup trap removes the created container + its per-clone
 /// dind volume so a retry isn't blocked by a stale same-named container (gotcha #7).
 ///
@@ -250,7 +251,7 @@ pub async fn clone_container(
     hostname: &str,
     env: &[EnvVar],
     mut on_progress: impl FnMut(&str, &str),
-) -> Result<(String, String, String)> {
+) -> Result<(String, String)> {
     if !is_dns_label(hostname) {
         bail!("clone hostname must be a DNS label (lowercase letters, digits, hyphens)");
     }
@@ -315,7 +316,7 @@ pub async fn clone_container(
         // a guard that removes the container + its dind volumes on any early return.
         let result = clone_container_after_create(app, &container, hostname, env, &mut on_progress).await;
         match result {
-            Ok(()) => return Ok((container, ip, reference)),
+            Ok(()) => return Ok((ip, reference)),
             Err(e) => {
                 tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
                 docker.remove_container(&container).await.ok();
@@ -737,11 +738,10 @@ fn delete_pct(step: &str) -> Option<f64> {
 /// Destroy a managed clone: `stop` (the image's `StopSignal=SIGRTMIN+3` gives systemd a
 /// clean 20 s shutdown — without it every stop is a 20 s hang + SIGKILL, gotcha #5) →
 /// `remove(force)` → remove the `rmng-dind-<host>` inner-Docker volume. A 404/in-use on the
-/// volume is logged, not fatal (the container removal is what matters). `host_id` names the
-/// dind volume (`rmng-dind-<host_id>`); `container` is the Docker id to stop/remove.
+/// volume is logged, not fatal (the container removal is what matters). `host_id` is both
+/// the container name to stop/remove and the volume-name stem (`rmng-dind-<host_id>`).
 pub async fn delete_clone(
     app: &App,
-    container: &str,
     host_id: &str,
     mut on_progress: impl FnMut(&str, &str),
 ) -> Result<()> {
@@ -749,10 +749,10 @@ pub async fn delete_clone(
     on_progress("queued", &format!("queued delete of {host_id}"));
 
     on_progress("stop", "stopping the clone (SIGRTMIN+3, up to 20s)");
-    docker.stop_container(container).await?;
+    docker.stop_container(host_id).await?;
 
     on_progress("remove", "removing the container");
-    docker.remove_container(container).await?;
+    docker.remove_container(host_id).await?;
 
     // The per-clone inner-Docker volumes are named + not auto-removed with the
     // container; drop them explicitly. In-use / already-gone is logged, not fatal.

@@ -341,29 +341,34 @@ async fn resolve_issue(
 
 // --- images (clone-source templates) ---------------------------------------
 
-/// `GET /api/images` — the clone-source images (`rmng.image=1`), each with the host ids of
-/// live clones currently running on it (`in_use_by`). The Docker layer leaves `in_use_by`
-/// empty (it's control-plane state); we fill it here from `state.json`: any host whose
-/// `source` equals the image reference. A daemon error surfaces as 502.
+/// `GET /api/images` — the clone-source images (`rmng.image=1`), each with the names of
+/// the managed containers created from it (`in_use_by`; container name == host id for
+/// clones). Both halves come from the daemon — Docker, not `state.json`, knows which
+/// containers reference which image. A daemon error surfaces as 502.
 async fn images_list(State(app): State<App>) -> Result<Json<Vec<wire::ImageInfo>>, (StatusCode, String)> {
     let mut images = app
         .docker
         .list_rmng_images()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    fill_in_use_by(&mut images, &app.store.get().hosts);
+    let containers = app
+        .docker
+        .list_managed_containers()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    fill_in_use_by(&mut images, &containers);
     Ok(Json(images))
 }
 
-/// Fill each image's `in_use_by` with the ids of hosts whose `source` equals the image
-/// reference (the Docker layer leaves it empty — it's control-plane state). Pure over
-/// (images, hosts) so it's unit-testable independent of the daemon.
-fn fill_in_use_by(images: &mut [wire::ImageInfo], hosts: &[wire::Host]) {
+/// Fill each image's `in_use_by` with the names of managed containers whose creation
+/// image equals the image reference. Pure over (images, containers) so it's
+/// unit-testable independent of the daemon.
+fn fill_in_use_by(images: &mut [wire::ImageInfo], containers: &[crate::docker::ManagedContainer]) {
     for img in images.iter_mut() {
-        img.in_use_by = hosts
+        img.in_use_by = containers
             .iter()
-            .filter(|h| h.source.as_deref() == Some(img.reference.as_str()))
-            .map(|h| h.id.clone())
+            .filter(|c| c.image == img.reference)
+            .map(|c| c.name.clone())
             .collect();
     }
 }
@@ -412,8 +417,9 @@ struct ImageDeleteReq {
 }
 
 /// `POST /api/images/delete` — remove a clone-source image. 409 (Conflict) when the image is
-/// still referenced: any host's `source` equals it, OR a running op (clone/commit) uses it.
-/// Otherwise the daemon's own "in use by a container" 409 is surfaced as 409 too.
+/// still referenced: a managed container was created from it (per the daemon — the same
+/// dependency that would make the daemon's own no-force removal fail, surfaced with the
+/// container names), OR a running op (clone/commit) uses it.
 async fn images_delete(
     State(app): State<App>,
     Json(req): Json<ImageDeleteReq>,
@@ -422,13 +428,13 @@ async fn images_delete(
     if reference.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "reference is required".into()));
     }
-    let st = app.store.get();
-    let users: Vec<String> = st
-        .hosts
-        .iter()
-        .filter(|h| h.source.as_deref() == Some(reference))
-        .map(|h| h.id.clone())
-        .collect();
+    let containers = app
+        .docker
+        .list_managed_containers()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let users: Vec<String> =
+        containers.iter().filter(|c| c.image == reference).map(|c| c.name.clone()).collect();
     if !users.is_empty() {
         return Err((
             StatusCode::CONFLICT,
@@ -436,7 +442,7 @@ async fn images_delete(
         ));
     }
     // A running clone-from-this-image or commit-to-this-reference also blocks removal.
-    let busy = st.operations.iter().any(|o| {
+    let busy = app.store.get().operations.iter().any(|o| {
         o.status == wire::OperationStatus::Running
             && (o.source.as_deref() == Some(reference) || o.target == reference)
     });
@@ -482,12 +488,11 @@ async fn clone_redeploy(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let host = app.store.get().hosts.iter().find(|h| h.id == req.id).cloned();
     let host = host.ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown host '{}'", req.id)))?;
-    let container = host
-        .container
-        .as_deref()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{}' has no container to redeploy", req.id)))?;
-    crate::provision::redeploy_clone(&app, container, req.daemon_only, |step, msg| {
-        tracing::info!("redeploy {} ({container}) {step}: {msg}", req.id);
+    if !host.managed {
+        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", req.id)));
+    }
+    crate::provision::redeploy_clone(&app, &host.id, req.daemon_only, |step, msg| {
+        tracing::info!("redeploy {} {step}: {msg}", req.id);
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -498,18 +503,13 @@ async fn clone_redeploy(
 /// (rewrites its `RMNG_MONITORS` + restarts its GNOME session + daemon). Restarts the
 /// clones' desktops, so it's an explicit button rather than part of Save.
 async fn monitors_apply(State(app): State<App>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let clones: Vec<(String, String)> = app
-        .store
-        .get()
-        .hosts
-        .iter()
-        .filter_map(|h| h.container.clone().map(|c| (h.id.clone(), c)))
-        .collect();
+    let clones: Vec<String> =
+        app.store.get().hosts.iter().filter(|h| h.managed).map(|h| h.id.clone()).collect();
     let mut applied = Vec::new();
     let mut errors = Vec::new();
-    for (id, container) in clones {
-        match crate::provision::apply_monitors(&app, &container, |step, msg| {
-            tracing::info!("apply-monitors {id} ({container}) {step}: {msg}");
+    for id in clones {
+        match crate::provision::apply_monitors(&app, &id, |step, msg| {
+            tracing::info!("apply-monitors {id} {step}: {msg}");
         })
         .await
         {
@@ -803,29 +803,28 @@ async fn claude_swap(
         .into_iter()
         .find(|h| h.id == req.host)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
-    let container = host
-        .container
-        .clone()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{}' has no container", host.id)))?;
+    if !host.managed {
+        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", host.id)));
+    }
     let assignment = crate::claude::resolve_assignment(&app, Some(&req.account))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "no imported Claude accounts".into()))?;
     let selection = crate::claude::normalize_selection(Some(&req.account));
     let (group, email) = match assignment {
         crate::claude::Assignment::None => {
-            crate::claude::clear_clone_token(&app, &container)
+            crate::claude::clear_clone_token(&app, &host.id)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             app.claude.forget_pushed(&host.id);
             (None, None)
         }
         crate::claude::Assignment::Group { name, initial } => {
-            crate::claude::push_account_to_clone(&app, &host.id, &container, &initial)
+            crate::claude::push_account_to_clone(&app, &host.id, &initial)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             (Some(name), Some(initial))
         }
         crate::claude::Assignment::Account(a) => {
-            crate::claude::push_account_to_clone(&app, &host.id, &container, &a)
+            crate::claude::push_account_to_clone(&app, &host.id, &a)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             (None, Some(a))
@@ -903,7 +902,8 @@ async fn chat_abort(State(app): State<App>, AxPath(id): AxPath<String>) -> Statu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wire::{Host, ImageInfo};
+    use crate::docker::ManagedContainer;
+    use wire::ImageInfo;
 
     fn image(reference: &str) -> ImageInfo {
         ImageInfo {
@@ -916,35 +916,29 @@ mod tests {
             in_use_by: Vec::new(),
         }
     }
-    fn host_on(id: &str, source: Option<&str>) -> Host {
-        Host {
-            id: id.into(),
-            container: Some("c".into()),
-            source: source.map(str::to_string),
-            ..Default::default()
-        }
+    fn container_on(name: &str, image: &str) -> ManagedContainer {
+        ManagedContainer { name: name.into(), image: image.into(), running: true }
     }
 
     #[test]
-    fn in_use_by_maps_hosts_by_source_reference() {
+    fn in_use_by_maps_containers_by_creation_image() {
         let mut images = vec![image("rmng/template:a"), image("rmng/template:b")];
-        let hosts = vec![
-            host_on("h1", Some("rmng/template:a")),
-            host_on("h2", Some("rmng/template:a")),
-            host_on("h3", Some("rmng/template:b")),
-            host_on("h4", None),                    // unmanaged/no source → counted nowhere
-            host_on("h5", Some("rmng/template:z")), // source not in the image list → ignored
+        let containers = vec![
+            container_on("h1", "rmng/template:a"),
+            container_on("h2", "rmng/template:a"),
+            container_on("h3", "rmng/template:b"),
+            container_on("h5", "rmng/template:z"), // image not in the list → ignored
         ];
-        fill_in_use_by(&mut images, &hosts);
+        fill_in_use_by(&mut images, &containers);
         assert_eq!(images[0].in_use_by, vec!["h1", "h2"]);
         assert_eq!(images[1].in_use_by, vec!["h3"]);
     }
 
     #[test]
-    fn in_use_by_empty_when_no_hosts_reference_it() {
+    fn in_use_by_empty_when_no_containers_reference_it() {
         let mut images = vec![image("rmng/template:a")];
-        let hosts = vec![host_on("h1", Some("rmng/template:other")), host_on("h2", None)];
-        fill_in_use_by(&mut images, &hosts);
+        let containers = vec![container_on("h1", "rmng/template:other")];
+        fill_in_use_by(&mut images, &containers);
         assert!(images[0].in_use_by.is_empty());
     }
 }

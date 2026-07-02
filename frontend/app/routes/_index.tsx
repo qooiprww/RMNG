@@ -357,10 +357,9 @@ function Dashboard({ state }: { state: ControlState }) {
                         }}
                         onCommit={() => setCommitHost(host)}
                         onDelete={() => {
-                          const msg =
-                            host.container != null
-                              ? `Delete ${host.id}? This destroys its container.`
-                              : `Remove ${host.id}? This unregisters the host.`;
+                          const msg = host.managed
+                            ? `Delete ${host.id}? This destroys its container.`
+                            : `Remove ${host.id}? This unregisters the host.`;
                           if (confirm(msg)) run(deleteHost(host.id));
                         }}
                         onRedeploy={() => {
@@ -415,9 +414,6 @@ function Dashboard({ state }: { state: ControlState }) {
                 </h2>
                 <span className="shrink-0 text-xs text-slate-400">
                   {selectedHost.host}:{selectedHost.port}
-                  {selectedHost.container
-                    ? ` · ${selectedHost.container.slice(0, 12)}`
-                    : ""}
                 </span>
               </div>
               <div className="flex min-h-0 flex-1">

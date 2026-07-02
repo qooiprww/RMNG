@@ -27,13 +27,12 @@ export interface Host {
 
   // --- server-only extras (ignored by the Rust client) ---
   /**
-   * Docker container id (full 64-hex) of the managed clone backing this host;
-   * the container *name* equals the host id for `docker ps` readability. Present
-   * (`!= null`) marks a managed clone; absent/null is a plain unmanaged row
-   * (deletable in the UI). Old `state.json` rows carrying the legacy `ctid` load
-   * with this unset — serde drops the stale key.
+   * True for a managed clone: a Docker container whose *name equals this host's
+   * id* backs it (no container id is stored anywhere). False/absent is a plain
+   * unmanaged row (deletable in the UI). Old `state.json` rows carrying the
+   * retired `ctid`/`container` keys load unmanaged — serde drops the stale keys.
    */
-  container?: string;
+  managed?: boolean;
   /** The clone-source image reference this host was cloned from (`rmng/template:<name>`). */
   source?: string;
   /**
@@ -109,8 +108,6 @@ export interface Operation {
   message: string;
   /** Rolling log lines for the operation. */
   log: string[];
-  /** Docker container id of the clone this op created/targets, once known. */
-  container?: string;
   startedAt: number;
   finishedAt?: number;
 }

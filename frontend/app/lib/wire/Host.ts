@@ -16,13 +16,13 @@ host: string,
  */
 port: number, username: string, password: string, domain: string | null, gdm_username: string | null, gdm_password: string | null, 
 /**
- * Docker container id (full 64-hex) of the managed clone backing this host; the
- * container *name* equals the host id for `docker ps` readability. `Some` marks a
- * managed clone; `None` is a plain unmanaged row (deletable in the UI). Old
- * `state.json` rows carrying the legacy `ctid` load as `None` — serde drops the
- * stale key.
+ * True for a managed clone: a Docker container whose *name equals this host's id*
+ * backs it (every Docker call addresses it by that name — no stored container id).
+ * False is a plain unmanaged row (legacy/hand-added, deletable in the UI). Old
+ * `state.json` rows carrying the retired `ctid`/`container` keys load as
+ * unmanaged — serde drops the stale keys.
  */
-container: string | null, source: string | null, claudeAccountEmail: string | null, 
+managed: boolean, source: string | null, claudeAccountEmail: string | null, 
 /**
  * Name of the Claude group this clone is balanced within (sticky — it moves only
  * when its account exhausts); `None` when bound to a single fixed account. When

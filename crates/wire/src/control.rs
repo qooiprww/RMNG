@@ -91,13 +91,13 @@ pub struct Host {
     pub gdm_password: Option<String>,
 
     // --- server-only extras (camelCase) ---
-    /// Docker container id (full 64-hex) of the managed clone backing this host; the
-    /// container *name* equals the host id for `docker ps` readability. `Some` marks a
-    /// managed clone; `None` is a plain unmanaged row (deletable in the UI). Old
-    /// `state.json` rows carrying the legacy `ctid` load as `None` — serde drops the
-    /// stale key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container: Option<String>,
+    /// True for a managed clone: a Docker container whose *name equals this host's id*
+    /// backs it (every Docker call addresses it by that name — no stored container id).
+    /// False is a plain unmanaged row (legacy/hand-added, deletable in the UI). Old
+    /// `state.json` rows carrying the retired `ctid`/`container` keys load as
+    /// unmanaged — serde drops the stale keys.
+    #[serde(default)]
+    pub managed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,9 +179,6 @@ pub struct Operation {
     /// Rolling log lines for the operation.
     #[serde(default)]
     pub log: Vec<String>,
-    /// Docker container id of the clone this operation created/targets, once known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container: Option<String>,
     pub started_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
@@ -319,19 +316,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_proxmox_state_loads_unmanaged() {
-        // An old `state.json` from the Proxmox era: hosts carry the retired `ctid`
-        // key and the top-level `templates` list. Both are stale and dropped by serde;
-        // such hosts load as plain unmanaged rows (`container: None`).
+    fn legacy_state_loads_unmanaged() {
+        // Old `state.json` shapes: Proxmox-era hosts carry the retired `ctid` key (plus
+        // the top-level `templates` list); early docker-port hosts carry the retired
+        // `container` id. All are stale and dropped by serde; such hosts load as plain
+        // unmanaged rows (`managed: false`).
         let json = r#"{
             "hosts": [
-                { "id": "pega-old", "host": "10.0.0.9", "username": "u", "password": "p", "ctid": 5 }
+                { "id": "pega-old", "host": "10.0.0.9", "username": "u", "password": "p", "ctid": 5 },
+                { "id": "pega-mid", "host": "10.99.0.10", "username": "u", "password": "p",
+                  "container": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
             ],
             "templates": ["rmng-template"]
         }"#;
         let state: ControlState = serde_json::from_str(json).unwrap();
-        assert_eq!(state.hosts.len(), 1);
-        assert_eq!(state.hosts[0].container, None);
+        assert_eq!(state.hosts.len(), 2);
+        assert!(!state.hosts[0].managed);
+        assert!(!state.hosts[1].managed);
     }
 
     #[test]

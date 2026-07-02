@@ -154,9 +154,9 @@ export function SidebarHost({
   onChangeAccount,
 }: SidebarHostProps) {
   const busy = op?.status === "running";
-  // Managed clones (backed by a live container) get the commit / redeploy / account
-  // actions; plain unmanaged rows only get delete.
-  const managed = host.container != null;
+  // Managed clones (backed by a container named after the host id) get the commit /
+  // redeploy / account actions; plain unmanaged rows only get delete.
+  const managed = host.managed === true;
   const status = effectiveStatus(host);
   const claudeSel = claudeSelection(host);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =

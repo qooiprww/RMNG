@@ -219,6 +219,18 @@ pub struct CreateSpec {
     pub sock_source: String,
 }
 
+/// One RMNG-managed container as the daemon lists it (label `rmng.managed=1`): clones
+/// (name == host id) and `rmng-build-*` workers. See
+/// [`DockerCtl::list_managed_containers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedContainer {
+    /// Container name (`/`-prefix stripped); falls back to the id if nameless.
+    pub name: String,
+    /// The image reference the container was created from, as `docker ps` shows it.
+    pub image: String,
+    pub running: bool,
+}
+
 /// One file to drop into a container via `upload_tar`. `mode` is the raw unix mode
 /// (e.g. `0o644`); `uid`/`gid` are applied verbatim by the daemon (gotcha #2 — callers
 /// pass 1000 for `home/rmng/**`).
@@ -615,9 +627,8 @@ impl DockerCtl {
     }
 
     /// List clone-source images (label `rmng.image=1`), newest first, projected to the
-    /// wire [`ImageInfo`]. `in_use_by` is left empty here — the caller (Task 6) fills it
-    /// from `state.json` (which host runs on which image), since that's control-plane
-    /// state this layer doesn't own.
+    /// wire [`ImageInfo`]. `in_use_by` is left empty here — the caller (web.rs) fills it
+    /// from [`Self::list_managed_containers`] (which containers run on which image).
     pub async fn list_rmng_images(&self) -> Result<Vec<ImageInfo>> {
         let filters: HashMap<String, Vec<String>> =
             HashMap::from([("label".to_string(), vec![format!("{LABEL_IMAGE}=1")])]);
@@ -709,6 +720,35 @@ impl DockerCtl {
     }
 
     // --- containers -------------------------------------------------------------------
+
+    /// List every RMNG-managed container (label `rmng.managed=1`), running or not — the
+    /// daemon-side truth the boot reconciler diffs `state.json` against and the image
+    /// in-use accounting reads (which containers were created from which image).
+    pub async fn list_managed_containers(&self) -> Result<Vec<ManagedContainer>> {
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("label".to_string(), vec![format!("{LABEL_MANAGED}=1")])]);
+        let opts = bollard::query_parameters::ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let list = self.daemon()?.list_containers(Some(opts)).await.context("listing managed containers")?;
+        Ok(list
+            .into_iter()
+            .map(|c| ManagedContainer {
+                // Docker prefixes names with `/` for historic reasons; a nameless summary
+                // (shouldn't happen) degrades to the id.
+                name: c
+                    .names
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .map(|n| n.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| c.id.unwrap_or_default()),
+                image: c.image.unwrap_or_default(),
+                running: matches!(c.state, Some(bollard::models::ContainerSummaryStateEnum::RUNNING)),
+            })
+            .collect())
+    }
 
     /// Create a privileged systemd-PID-1 clone container on the rmng network at a static
     /// IP. Bakes the stop signal + timeout, mounts the shared clone socket + a per-clone
