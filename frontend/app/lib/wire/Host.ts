@@ -16,8 +16,9 @@ host: string,
  */
 port: number, username: string, password: string, domain: string | null, gdm_username: string | null, gdm_password: string | null, ctid: number | null, source: string | null, claudeAccountEmail: string | null, 
 /**
- * Name of the Claude group this clone rotates within; `None` when bound to a
- * single fixed account. When set, `claude_account_email` holds the current pick.
+ * Name of the Claude group this clone is balanced within (sticky — it moves only
+ * when its account exhausts); `None` when bound to a single fixed account. When
+ * set, `claude_account_email` holds the current pick.
  */
 claudeGroup: string | null, 
 /**

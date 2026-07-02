@@ -1,5 +1,6 @@
 // Change a clone's Claude account/group after creation. Mirrors the clone modal's
-// picker (auto / account / group); binding to a group enrolls the clone in rotation.
+// picker (auto / account / group); binding to a group lets the server move the clone
+// to another member account when its current one exhausts (sticky otherwise).
 import { useEffect, useState } from "react";
 
 import { AccountGroupSelect } from "~/components/AccountGroupSelect";
@@ -56,8 +57,8 @@ export function ChangeAccountModal({
           Claude account · <span className="text-emerald-700">{host.displayName ?? host.id}</span>
         </h3>
         <p className="mt-1 text-xs text-slate-500">
-          Pick a single account, a group to rotate within every 10 minutes, or “none”
-          to remove this clone’s token.
+          Pick a single account, a group (stays on one account until it exhausts,
+          then swaps to the least-used member), or “none” to remove this clone’s token.
         </p>
 
         <label className="mt-4 block text-xs font-medium text-slate-600">

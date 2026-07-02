@@ -110,10 +110,11 @@ pub struct PresetRedacted {
     pub vars: Vec<EnvVar>,
 }
 
-/// A named pool of clone accounts (by email). A clone bound to a group has its
-/// account rotated among the group's members every cycle (by 5h usage). Carries no
-/// secrets — just a name + member emails — so it's TS-exported and shown verbatim in
-/// the redacted config.
+/// A named pool of clone accounts (by email). A clone bound to a group sticks to its
+/// account until that account exceeds the 5h usage cap (or leaves the group), then
+/// moves to the group's least-loaded / least-used member — sticky, because an account
+/// switch cold-starts the clone's prompt cache. Carries no secrets — just a name +
+/// member emails — so it's TS-exported and shown verbatim in the redacted config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../frontend/app/lib/wire/")]

@@ -37,7 +37,7 @@ export interface Host {
    * panel this host is spending. Server-only; the Rust client ignores it.
    */
   claudeAccountEmail?: string;
-  /** Name of the Claude group this clone rotates within (null/absent = single account). */
+  /** Name of the Claude group this clone is balanced within, sticky until its account exhausts (null/absent = single account). */
   claudeGroup?: string;
   /**
    * The operator's Claude selection verbatim: "auto" (server picks the best account

@@ -97,8 +97,9 @@ pub struct Host {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_account_email: Option<String>,
-    /// Name of the Claude group this clone rotates within; `None` when bound to a
-    /// single fixed account. When set, `claude_account_email` holds the current pick.
+    /// Name of the Claude group this clone is balanced within (sticky — it moves only
+    /// when its account exhausts); `None` when bound to a single fixed account. When
+    /// set, `claude_account_email` holds the current pick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_group: Option<String>,
     /// The operator's Claude *selection* verbatim: `"auto"`, `"none"`, `"group:<name>"`,

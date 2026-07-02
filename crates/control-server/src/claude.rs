@@ -47,7 +47,10 @@ const SESSION_HEADROOM_PCT: f64 = 40.0;
 const SEVEN_DAY_CAP_PCT: f64 = 95.0;
 /// 5h utilization at/above which an account is filtered out of group rotation.
 const ROTATE_MAX_FIVE_HOUR_PCT: f64 = 90.0;
-/// How often group-bound clones are re-balanced across their group's accounts.
+/// How often group-bound clones are checked against their group's eligible accounts.
+/// Sticky: a pass moves a clone only if its account fell out of eligibility — an
+/// account switch always cold-starts the clone's Anthropic prompt cache, so staying
+/// put is cheaper than perfect spread.
 const ROTATE_SECS: u64 = 600;
 const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
 /// The user every clone runs Claude Code (and everything else) as.
@@ -717,7 +720,7 @@ pub fn resolve_assignment(app: &App, requested: Option<&str>) -> Option<Assignme
     }
     if let Some(name) = want.strip_prefix("group:") {
         let name = name.trim();
-        let initial = pick_group_account(app, name, None)?;
+        let initial = pick_group_account(app, name)?;
         return Some(Assignment::Group { name: name.to_string(), initial });
     }
     resolve_clone_account(app, requested).map(Assignment::Account)
@@ -779,10 +782,11 @@ fn eligible_group_accounts(app: &App, group: &CloneGroup) -> Vec<String> {
         .collect()
 }
 
-/// Pick one account from group `group_name` for an initial assignment: among eligible
-/// members (or any member if none are eligible), least-loaded and preferring `!= exclude`,
-/// random tiebreak. `None` if the group is empty / has no imported members.
-fn pick_group_account(app: &App, group_name: &str, exclude: Option<&str>) -> Option<String> {
+/// Pick one account from group `group_name` for a new assignment: among eligible
+/// members (or any member if none are eligible), fewest assigned clones first, then
+/// lowest 5h usage, random tiebreak. `None` if the group is empty / has no imported
+/// members.
+fn pick_group_account(app: &App, group_name: &str) -> Option<String> {
     let cfg = app.config();
     let group = cfg.clone_groups.iter().find(|g| g.name == group_name)?;
     let counts = clone_counts(app);
@@ -795,39 +799,57 @@ fn pick_group_account(app: &App, group_name: &str, exclude: Option<&str>) -> Opt
     shuffle(&mut pool); // randomize ties
     pool.into_iter().min_by_key(|email| {
         let load = *counts.get(email).unwrap_or(&0);
-        let same = u32::from(Some(email.as_str()) == exclude);
-        (load, same)
+        let pct = five_hour_pct(app, email).round() as u32;
+        (load, pct)
     })
 }
 
-/// Randomized greedy assignment of `clones` to `eligible` account emails, returning
-/// `(clone, email)` pairs. Rules (best-effort): (a) every clone gets a group
-/// account [guaranteed]; (b) spread across distinct accounts [primary `used` term];
-/// (c) prefer an account different from the clone's current one [secondary term].
-fn assign_rotation(clones: &[Host], eligible: &[String]) -> Vec<(Host, String)> {
-    let mut order: Vec<usize> = (0..clones.len()).collect();
-    shuffle(&mut order);
+/// Sticky assignment of `clones` to `eligible` account emails (5h utilization in
+/// `usage`), returning `(clone, email)` pairs. A clone whose current account is
+/// still eligible **keeps it** — switching cold-starts the clone's Anthropic prompt
+/// cache, so a clone is never moved just to even out spread. Only clones without an
+/// eligible account (over the 5h cap, removed from the group, or unassigned) are
+/// placed: fewest assigned clones first (keepers counted), then lowest 5h usage,
+/// random tiebreak.
+fn assign_rotation(
+    clones: &[Host],
+    eligible: &[String],
+    usage: &HashMap<String, f64>,
+) -> Vec<(Host, String)> {
     let mut used: HashMap<String, u32> = HashMap::new();
     let mut out: Vec<(Host, String)> = Vec::with_capacity(clones.len());
-    for &i in &order {
-        let prev = clones[i].claude_account_email.clone();
+    let mut homeless: Vec<Host> = Vec::new();
+    for c in clones {
+        match &c.claude_account_email {
+            Some(e) if eligible.contains(e) => {
+                *used.entry(e.clone()).or_insert(0) += 1;
+                out.push((c.clone(), e.clone()));
+            }
+            _ => homeless.push(c.clone()),
+        }
+    }
+    shuffle(&mut homeless);
+    for host in homeless {
         let pick = eligible
             .iter()
             .min_by_key(|email| {
-                let u = *used.get(*email).unwrap_or(&0);
-                let same = u32::from(Some(*email) == prev.as_ref());
-                (u, same, rand_u64() as u32)
+                let load = *used.get(*email).unwrap_or(&0);
+                let pct = usage.get(*email).copied().unwrap_or(0.0).round() as u32;
+                (load, pct, rand_u64() as u32)
             })
             .expect("eligible is non-empty")
             .clone();
         *used.entry(pick.clone()).or_insert(0) += 1;
-        out.push((clones[i].clone(), pick));
+        out.push((host, pick));
     }
     out
 }
 
-/// One rotation pass: for each group with bound clones, re-balance them across the
-/// group's eligible accounts and write the new credentials (no agent-wrapper restart).
+/// One rotation pass: for each group with bound clones, move **only** the clones
+/// whose current account fell out of the group's eligible set (over the 5h cap,
+/// removed from the group, or never assigned) onto the least-loaded / least-used
+/// eligible account, and write the new credentials (no agent-wrapper restart).
+/// Clones on a still-eligible account are left alone (see [`assign_rotation`]).
 pub async fn rotate_once(app: &App) {
     let cfg = app.config();
     if cfg.clone_groups.is_empty() {
@@ -852,9 +874,11 @@ pub async fn rotate_once(app: &App) {
             );
             continue;
         }
-        for (host, email) in assign_rotation(&clones, &eligible) {
+        let usage: HashMap<String, f64> =
+            eligible.iter().map(|e| (e.clone(), five_hour_pct(app, e))).collect();
+        for (host, email) in assign_rotation(&clones, &eligible, &usage) {
             if host.claude_account_email.as_deref() == Some(email.as_str()) {
-                continue; // unchanged → no rewrite
+                continue; // unchanged (sticky keep) → no rewrite
             }
             let ctid = host.ctid.expect("filtered to Some(ctid)");
             match push_account_to_clone(app, &host.id, ctid, &email).await {
@@ -1139,19 +1163,19 @@ mod tests {
         // Every clone is assigned an account from the eligible set, never outside it.
         let eligible = [acct("a@x"), acct("b@x")];
         let clones = [clone_host("c1", Some("z@outside")), clone_host("c2", None)];
-        for (_h, picked) in assign_rotation(&clones, &eligible) {
+        for (_h, picked) in assign_rotation(&clones, &eligible, &HashMap::new()) {
             assert!(eligible.contains(&picked), "{picked} not in group");
         }
     }
 
     #[test]
     fn assignment_rule_b_distinct_when_enough_accounts() {
-        // |eligible| >= |clones| ⇒ all clones land on distinct accounts (run repeatedly:
-        // randomized, but the spread term forces distinctness here).
+        // |eligible| >= |unassigned clones| ⇒ they land on distinct accounts (run
+        // repeatedly: randomized, but the load term forces distinctness here).
         let eligible = [acct("a@x"), acct("b@x"), acct("c@x")];
         let clones = [clone_host("c1", None), clone_host("c2", None), clone_host("c3", None)];
         for _ in 0..50 {
-            let got = assign_rotation(&clones, &eligible);
+            let got = assign_rotation(&clones, &eligible, &HashMap::new());
             let mut emails: Vec<_> = got.iter().map(|(_, e)| e.clone()).collect();
             emails.sort();
             emails.dedup();
@@ -1160,22 +1184,49 @@ mod tests {
     }
 
     #[test]
-    fn assignment_rule_c_prefers_a_different_account() {
-        // One clone on A, two eligible {A,B} ⇒ always rotates to B (different from prev).
+    fn assignment_rule_c_sticks_to_an_eligible_account() {
+        // One clone on A, two eligible {A,B} ⇒ always stays on A: a switch would
+        // cold-start the clone's prompt cache for zero gain.
         let eligible = [acct("a@x"), acct("b@x")];
         let clones = [clone_host("c1", Some("a@x"))];
         for _ in 0..50 {
-            let got = assign_rotation(&clones, &eligible);
-            assert_eq!(got[0].1, "b@x");
+            let got = assign_rotation(&clones, &eligible, &HashMap::new());
+            assert_eq!(got[0].1, "a@x");
+        }
+    }
+
+    #[test]
+    fn assignment_moves_only_ineligible_and_avoids_keepers() {
+        // c1 keeps its eligible account A; c2 (account dropped from the group) must
+        // move, and lands on B — the keeper on A counts toward A's load.
+        let eligible = [acct("a@x"), acct("b@x")];
+        let clones = [clone_host("c1", Some("a@x")), clone_host("c2", Some("z@gone"))];
+        for _ in 0..50 {
+            let got = assign_rotation(&clones, &eligible, &HashMap::new());
+            let by_id: HashMap<_, _> = got.iter().map(|(h, e)| (h.id.clone(), e.clone())).collect();
+            assert_eq!(by_id["c1"], "a@x");
+            assert_eq!(by_id["c2"], "b@x");
+        }
+    }
+
+    #[test]
+    fn assignment_prefers_less_used_account_on_load_tie() {
+        // A fresh clone with two equally-loaded accounts picks the lower 5h usage.
+        let eligible = [acct("hot@x"), acct("cold@x")];
+        let clones = [clone_host("c1", None)];
+        let usage = HashMap::from([(acct("hot@x"), 72.0), (acct("cold@x"), 5.0)]);
+        for _ in 0..50 {
+            let got = assign_rotation(&clones, &eligible, &usage);
+            assert_eq!(got[0].1, "cold@x");
         }
     }
 
     #[test]
     fn assignment_degrades_with_single_eligible() {
-        // Only one usable account ⇒ all clones get it even though (b)/(c) can't hold.
+        // Only one usable account ⇒ all clones get it even though spread can't hold.
         let eligible = [acct("only@x")];
         let clones = [clone_host("c1", Some("only@x")), clone_host("c2", Some("old@x"))];
-        let got = assign_rotation(&clones, &eligible);
+        let got = assign_rotation(&clones, &eligible, &HashMap::new());
         assert!(got.iter().all(|(_, e)| e == "only@x"));
     }
 }
