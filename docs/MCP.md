@@ -60,7 +60,7 @@ clone → `"unknown clone"`; an unreachable daemon → `"clone-daemon MCP unreac
 |---|---|---|
 | `list_hosts` | — | JSON of `hosts[]` + state |
 | `select` | `clone` | set the viewer's selected host |
-| `clone` | `source`, `hostname` | start a CoW clone → `"clone started: op …"` |
+| `clone` | `image`, `hostname` | clone from a source image (`rmng/template:<name>`) → `"clone started: op …"` |
 | `delete` | `clone` | delete a host → `"delete started: op …"` |
 | `redeploy` | `clone`, `daemonOnly?` | hot-swap daemon (+agent) binaries |
 | `claude_recommended` | — | `{email}` recommended account |

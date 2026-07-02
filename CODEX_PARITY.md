@@ -49,7 +49,7 @@ As designed above; `mod clone_ops;` in main.rs; claude.rs drops its private copi
 
 ### 5. Scripts + provisioning
 - New `crates/control-server/scripts/codex-import.sh` (sibling of claude-import.sh): `status` (cat auth.json, never fails), `read`, `clear`, `apply <b64>` (writes full auth.json 0600).
-- `crates/control-server/scripts/provision-clone.sh`: after the claude install (~:344), install codex via the standalone installer (`CODEX_NON_INTERACTIVE=1`, warn-only on failure). Existing templates/clones need a template rebuild (`/api/template/bootstrap` re-provisions) or manual install — call out in docs; `/api/clone/redeploy` does NOT re-provision.
+- `crates/control-server/scripts/provision-clone.sh`: after the claude install (~:344), install codex via the standalone installer (`CODEX_NON_INTERACTIVE=1`, warn-only on failure). Existing images/clones need a base-image rebuild (`/api/images/bootstrap`) or manual install — call out in docs; `/api/clone/redeploy` only swaps binaries, it does NOT re-provision.
 
 ### 6. Frontend
 - Regenerate ts-rs (`cargo test -p wire`): `Host.ts` (+codex fields), new `CodexConfig.ts`, `AppConfigRedacted.ts`. Add codex fields to the hand-written `Host` in `frontend/app/lib/types.ts`.

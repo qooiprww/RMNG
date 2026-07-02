@@ -1,9 +1,10 @@
 # control-server
 
 The backend binary — one tokio service that is the **control plane**, the **media plane**,
-and the **fleet-automation plane**. It exposes **four ports** and is a single self-contained
-artifact (the frontend, the `clone-daemon`/`agent-wrapper` binaries, and the patched
-gnome-shell `.deb` are all embedded). Full references: [API](../../docs/API.md) ·
+and the **fleet-automation plane**. It exposes **four ports** and ships as a Docker image; the
+frontend, the `clone-daemon`/`agent-wrapper` binaries, and the patched gnome-shell `.deb` are
+plain on-disk payloads under `/usr/local/share/rmng/` (read at runtime, pushed into clones) —
+nothing is compiled into the binary. Full references: [API](../../docs/API.md) ·
 [MCP](../../docs/MCP.md) · [PROTOCOL](../../docs/PROTOCOL.md) · [DEPLOY](../../docs/DEPLOY.md).
 
 | Port | Default | Transport | Serves |
@@ -18,11 +19,13 @@ gnome-shell `.deb` are all embedded). Full references: [API](../../docs/API.md) 
 `app` (shared state holder) · `state` (in-memory `ControlState` + atomic `state.json` persist
 + file-watch + SSE bus) · `config` (load/merge/redact `config.json` at 0600) · `web` (port 2
 routes + SSE + SPA) · `mediaplane` (port 1: clone-socket ingest → `media` encode → viewer;
-input routing; clipboard broker) · `mcp` (ports 3 + 4) · `orchestrate` (SSH `pct`/`lvcreate`
-scripts + Operation parse) · `jobs` (clone/delete/bootstrap Operation machine) · `linear` ·
-`claude` (usage poll + token refresh/push + assign/swap) · `chat` (agent-wrapper proxy + per-host SSE) ·
-`monitor` (host poller) · `mounts` (sshfs) · `files` (notes/uploads/detector-feedback) ·
-`embed` (the gzipped clone-daemon/agent-wrapper/gnome-shell-deb).
+input routing; clipboard broker) · `mcp` (ports 3 + 4) · `docker` (bollard primitives against
+the local daemon) · `provision` (clone/bootstrap/commit/delete flows over those primitives) ·
+`jobs` (the clone/delete/bootstrap/commit Operation machine) · `linear` · `claude` (usage poll
++ token refresh/push + assign/swap) · `chat` (agent-wrapper proxy + per-host SSE) · `monitor`
+(host poller) · `homes` (clone-home symlinks under `data/hosts/`) · `files`
+(notes/uploads/detector-feedback) · `assets` (on-disk clone-daemon/agent-wrapper/gnome-shell.deb
+payloads + the served frontend).
 
 ## Port 1 — media plane (`mediaplane` → [media](../media/README.md))
 
@@ -37,11 +40,12 @@ the owner and bytes back to the requester, re-binding as `selected` changes.
 
 ## Port 2 — web API
 
-State store + SSE, all `/api/*` routes, the embedded SPA, and `/uploads`. Orchestration
-(clone/delete/bootstrap over Proxmox SSH, Linear, Claude, chat proxy, monitor poller, sshfs
-mounts). Every endpoint is documented in [API.md](../../docs/API.md). Config is edited via the
-Settings UI: `GET /api/config` returns a redacted view, `PUT` merges + persists 0600 +
-applies live, `POST /api/config/test` checks Proxmox SSH.
+State store + SSE, all `/api/*` routes, the served SPA, and `/uploads`. Orchestration
+(clone/delete/bootstrap/commit + images over the local Docker daemon, Linear, Claude, chat
+proxy, monitor poller, clone-home reconciler). Every endpoint is documented in
+[API.md](../../docs/API.md). Config is edited via the Settings UI: `GET /api/config` returns a
+redacted view, `PUT` merges + persists 0600 + applies live, `POST /api/config/test {docker}`
+checks the Docker environment (mirrored row-by-row at `GET /api/setup/env`).
 
 ## Ports 3 & 4 — MCP (`mcp`)
 
@@ -67,34 +71,39 @@ it) — read at request time, so a **running** clone hot-swaps with no restart. 
 at clone time by usage+load score; **hot-swap** from the UI/`/api/claude/swap`/fleet MCP;
 **auto-swap** to the next-best account on exhaustion (`claude.auto_swap_on_exhaustion`).
 
-## Orchestration & self-bootstrap (`orchestrate`, `jobs`)
+## Orchestration & self-bootstrap (`docker`, `provision`, `jobs`)
 
-Clone/delete/bootstrap run the embedded shell scripts over `ssh … bash -s` and parse the
-`P step msg` / `RESULT …` line protocol into an `Operation` streamed over `/events`. Two clone
-paths: **CoW** (`clone.sh`, fast, the default) and **from-zero bootstrap** (`bootstrap.sh` +
-`provision-clone.sh`, used to build the golden template). The deployment promise: give the
-control-server Proxmox SSH and it builds the template + provisions clones — distributing the
-embedded `clone-daemon`, `agent-wrapper`, and patched gnome-shell deb. See
+`docker` holds the bollard client + dumb primitives (create/start/stop/commit/exec/tar/network);
+`provision` stitches them into clone-create, base-image bootstrap, commit-from-clone, redeploy,
+and delete flows, streaming progress through a `FnMut(&str, &str)` callback (the old
+`P step msg` / `RESULT` bash protocol is gone); `jobs` wraps each in an `Operation` streamed
+over `/events`. Clone sources are **images** (`rmng.image=1`, `rmng/template:<name>`) — no
+golden-CT / CoW model: a base image is built from-zero (`provision-clone.sh` in a build
+container, then `docker commit`), clones are `docker run` off an image, and any clone commits
+to a new image. In-container guest scripts run over `docker exec bash -s`; payloads
+(`clone-daemon`, `agent-wrapper`, gnome-shell deb) are pushed via tar. See
 [DEPLOY.md](../../docs/DEPLOY.md) and [SCRIPTS.md](../../docs/SCRIPTS.md).
 
 ## Networking
 
-Only the control-server needs external reachability (tailscale, manual). Clones sit on an
-internal bridge reachable only *from* the control-server (SSH + the agent-wrapper chat proxy +
-the fleet-MCP→daemon-MCP proxy); media/input cross a host-bind-mounted unix socket
-(`/srv/rmng-sock`, SCM_RIGHTS), not the network. Exposure split: ports 1+2 operator-facing;
-port 3 internal bridge only (needs real peer IPs); port 4 most-privileged (localhost/token).
+Only the control-server needs external reachability (tailscale, manual). Clones sit on the
+user-defined `rmng` Docker bridge (static IPs: `.1` gateway, `.2` control-server, `.10+`
+clones), reachable *from* the control-server (the agent-wrapper chat proxy + the
+fleet-MCP→daemon-MCP proxy); media/input cross the shared `/srv/rmng-sock` named-volume unix
+socket (SCM_RIGHTS), not the network. Exposure split: ports 1+2 operator-facing; port 3
+internal bridge only (needs real peer IPs); port 4 most-privileged (localhost/token).
 
 ## Dependencies
 
 `axum`/`tokio`/`tower-http` (port 2 + the MCP HTTP servers + static files), `reqwest` (Linear,
-Claude, agent-wrapper, the daemon-MCP proxy — plain HTTP, no rustls/native-tls), `rust-embed`
-+ `flate2` (embedded frontend + binaries + deb), `notify` (file watch), `serde_json`,
-`tokio::process` (ssh), `wire`, `media`.
+Claude, agent-wrapper, the daemon-MCP proxy — plain HTTP, no rustls/native-tls), `bollard` +
+`tar` (Docker orchestration over the unix socket), `notify` (file watch), `serde_json`,
+`wire`, `media`.
 
 ## Tests
 
-`cargo test -p control-server` (run on the build CT — the crate links GStreamer): Operation
-state machine from canned `P…`/`RESULT…`, account scoring, config defaults/merge/redaction,
-source-IP→clone mapping, and the embed round-trip (the patched deb decompresses to a valid
-`.deb`).
+`cargo test -p control-server` (run where GStreamer links — the crate pulls in `media`): the
+subnet/IP allocator + image-reference canonicalization + step→percentage tables (`provision`/`docker`),
+account scoring, config defaults/merge/redaction + one-time/restart-required categories,
+source-IP→clone mapping, `in_use_by` accounting, and the payload check (a staged `gnome-shell.deb`
+is a valid `.deb`).

@@ -24,18 +24,18 @@ The two-pane layout stays Notes/Chat (`pane: "notes" | "chat"`) — the planned 
 
 ## What's new
 
-- **`Settings.tsx`** — per-section forms for **all** configuration (Proxmox SSH, presets
-  — Linear key + auto-select labels + env vars, Claude polling/groups, template build
-  parameters, monitor defaults, the four listen ports), replacing hand-edited
-  `config.json`. Secret fields are
+- **`Settings.tsx`** — per-section forms for **all** configuration (the Docker backend —
+  daemon socket / `rmng`-network subnet / hostname prefix / per-clone limits, presets —
+  Linear key + auto-select labels + env vars, Claude polling/groups, monitor defaults, the
+  four listen ports), replacing hand-edited `config.json`. Secret fields are
   masked/write-only with **Test connection** buttons (`POST /api/config/test`); saves go to
   `PUT /api/config` and apply live. Claude accounts are imported from a signed-in clone
   (`ClaudeAccountsPanel`), not entered here. Reads the redacted `GET /api/config` —
   plaintext secrets never reach the browser.
-- A **"Build/Update template"** affordance (`POST /api/template/bootstrap` / `/rebuild`),
-  with progress shown via the existing `OperationProgress`.
-- **Clone-from-zero** option in `CloneModal`: choose **CoW** (fast, from the golden template)
-  or **from-zero bootstrap** (full install + configure) — both stream as an `Operation`.
+- A **"New base image"** affordance (`POST /api/images/bootstrap`), plus commit-a-clone
+  (`POST /api/images/commit`), with progress shown via the existing `OperationProgress`.
+- **Image picker** in `CloneModal`: pick a clone-source image (from `GET /api/images`) to
+  clone from — the clone streams as an `Operation`.
 - **Claude account controls** (extending `ClaudeAccountsPanel` + the per-host card): show the
   assigned account, **hot-swap** a running clone's token to another account (`POST
   /api/claude/swap`), and a per-host/global **auto-swap** toggle (swap when usage is
@@ -59,8 +59,8 @@ from the Rust backend.
 - `GET /events` → full `ControlState` JSON, `data: …\n\n` frames, `: ping` heartbeats.
 - `POST /api/{activate,reorder,clone,delete}`, `/api/claude/{import,refresh,recommended}`,
   `/api/notes/:id`, `/api/upload`, `/api/chat/:id` (+ `/events`, `/abort`).
-- **New**: `/api/config` (GET/PUT), `/api/config/test`, `/api/template/*`,
-  `/api/claude/swap` (hot-swap a clone's token); `/api/clone` takes a CoW-vs-from-zero mode.
+- **New**: `/api/config` (GET/PUT), `/api/config/test`, `/api/setup/env`, `/api/images/*`,
+  `/api/claude/swap` (hot-swap a clone's token); `/api/clone` takes an `image` reference.
 
 ## Tests
 

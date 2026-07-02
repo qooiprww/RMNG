@@ -43,20 +43,24 @@ ClaudeUsage { id, email, provider, active, assignable?, error?, stale?,
 MonitorSpec { width, height }
 
 # configuration (edited via the Settings UI, not hand-edited files)
-AppConfig { proxmox{ssh},
+AppConfig { docker{socket, subnet, hostname_prefix, clone_cpus, clone_memory_mb},
             presets: [{name, labels: [label], linear_key, vars: [{key, value}]}],
             claude{poll, pinnedEmail, swap..., auto_swap_on_exhaustion: bool},
             clone_groups: [{name, accounts: [email]}],
-            template{base_image, cores, memory, disk, devstack...},
+            clone_socket, data_dir, static_dir, chroma, setup_complete, detector_inference_url,
             monitors: [MonitorSpec], listen{video, web, clone_mcp, global_mcp}, agent{port} }
+# Clone sources are images (rmng/template:<name>), not a config template block — built via
+# POST /api/images/bootstrap; see ImageInfo below + docs/API.md.
 # A preset's `labels` auto-select it when cloning from a Linear ticket; `linear_key`
 # fetches/creates tickets server-side and is injected into the clone as LINEAR_API_KEY.
 # Claude account tokens are NOT config: each account's OAuth pair lives in the server's
 # 0600 `claude-accounts.json`; the server refreshes it and pushes the current short-lived
 # access token into assigned clones' ~/.claude/.credentials.json (see control-server).
-AppConfigRedacted   # GET /api/config shape: secrets → set/unset or last-4, never plaintext
-# Secret fields (preset linear keys, proxmox ssh) are write-only: redacted on read,
-# omitted-keeps-stored on write, and NEVER placed in ControlState/SSE.
+AppConfigRedacted   # GET /api/config shape: the one secret → set/unset, never plaintext
+ImageInfo   # GET /api/images row: {id, reference, size_bytes, created_at, base, created_from?, in_use_by}
+SetupEnv / EnvCheckRow   # GET /api/setup/env: the wizard's environment preflight rows
+# The only secret is the preset linear key (the Docker backend has none — local unix socket):
+# write-only, redacted on read, omitted-keeps-stored on write, NEVER placed in ControlState/SSE.
 
 # socket protocol (clone-daemon ⇄ control-server, SOCK_SEQPACKET + SCM_RIGHTS)
 FrameMsg { monitor_id, fourcc, modifier, width, height, planes: [{stride, offset}], seq }

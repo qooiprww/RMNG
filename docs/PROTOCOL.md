@@ -68,10 +68,11 @@ doesn't fight the agent.
 A unix `SOCK_SEQPACKET` socket (one JSON message per datagram). dmabuf file descriptors ride
 out-of-band via `SCM_RIGHTS` in the same datagram, in plane order — never in the JSON. The
 daemon connects to `RMNG_SOCKET`; the server listens on the `cloneSocket` config path
-(default `/srv/rmng-sock/clones.sock`, one-time — set in the setup wizard, baked into the
-template at provision; a pre-latch edit is restart-required). The path
-is a **host-bind-mounted** dir (`/srv/rmng-sock`, *not* under `/run` — the CT tmpfs would
-shadow it), `chmod 0777` so cross-uid clones connect.
+(default `/srv/rmng-sock/clones.sock`, one-time — set in the setup wizard, baked into every
+clone's `RMNG_SOCKET` at bootstrap; a pre-latch edit is restart-required). The socket lives in
+the shared **`rmng-sock` named volume**, mounted at the same path `/srv/rmng-sock` into the
+control-server **and** every clone (a named volume, not a bind, so siblings can share it);
+`chmod 0777` so cross-uid clones connect.
 
 **Handshake:** the daemon's first message is `DaemonMsg::Hello { clone_id }`.
 
@@ -119,10 +120,12 @@ the requester. The clone-daemon bridges via Mutter `RemoteDesktop` selection
 
 ## Config schema
 
-`AppConfig` loads from `./config.json` in the working directory (no env override — the
-systemd unit sets `WorkingDirectory=/var/lib/rmng`); written at `0600`. The web API
-returns `AppConfigRedacted` (secrets → `*_set: bool`); `PUT /api/config` returns
-`{ config: AppConfigRedacted, restartRequired: bool }`. Source: [config.rs](../crates/wire/src/config.rs).
+`AppConfig` loads from `./config.json` in the working directory (no env override — the Docker
+image sets `WORKDIR /data`, so `config.json` + `data/` land in the `rmng-data` volume);
+written at `0600`. The web API returns `AppConfigRedacted` (the only secret, preset Linear
+keys, → `linearKeySet: bool`); `PUT /api/config` returns
+`{ config: AppConfigRedacted, restartRequired: bool, networkWarning?: string }`. Source:
+[config.rs](../crates/wire/src/config.rs).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -134,7 +137,7 @@ returns `AppConfigRedacted` (secrets → `*_set: bool`); `PUT /api/config` retur
 | `chroma` | `ChromaMode` | `4:2:0` | viewer video chroma subsampling. Settings → Video. **Restart-required** |
 | `setup_complete` | bool | `false` | latched `true` by the first-run setup wizard; gates the frontend to the wizard until then |
 | `monitors` | `MonitorSpec[]` | `[]` → dual 1440p | desired global layout |
-| `proxmox` | `ProxmoxConfig` | — | node SSH + storage/bridge + hostname prefix |
+| `docker` | `DockerConfig` | see below | daemon socket + `rmng`-network subnet + hostname prefix + per-clone limits |
 | `presets` | `Preset[]` | `[]` | clone presets: env vars + Linear key + auto-select labels (**key secret**) |
 | `claude` | `ClaudeConfig` | — | usage polling config |
 | `clone_groups` | `CloneGroup[]` | `[]` | named account pools for rotation (not secret) |
@@ -142,21 +145,25 @@ returns `AppConfigRedacted` (secrets → `*_set: bool`); `PUT /api/config` retur
 
 - **`ListenConfig`**: `web 9000`, `video 9001`, `clone_mcp 9002`, `global_mcp 9003`,
   `daemon_mcp 9004`.
-- **`ProxmoxConfig`**: `ssh` (e.g. `root@10.0.0.100`, **secret**), `storage`
-  (`"local-lvm"` — storage pool backing new CT volumes) and `bridge` (`"vmbr0"` — network
-  bridge clone NICs attach to), both **one-time** (baked in at provision, set only in the
-  first-run setup wizard), `hostname_prefix` (`"pega-"`, editable in Settings → prepended
-  to derived clone hostnames). The CoW clone MAC OUI is no longer configurable — it's the
-  compiled-in const `BC:24:11` (clone.sh regenerates a clone's MAC with it to avoid
-  colliding with the template's).
+- **`DockerConfig`** (no secret — the local daemon is reached over a unix socket, so the
+  whole struct passes through the redacted view): `socket`
+  (`"/var/run/docker.sock"` — the daemon the control-server drives, **restart-required**;
+  the bollard client is built at startup), `subnet` (`"10.99.0.0/24"` — the CIDR for the
+  user-defined `rmng` bridge: `.1` gateway, `.2` control-server, `.10+` clone pool;
+  validated `/16`–`/24` at merge; **one-time**, baked into the network + clone IPs at
+  first-run setup), `hostname_prefix` (`"pega-"`, editable in Settings → prepended to derived
+  clone hostnames; carried from the retired `proxmox.hostname_prefix` on migration),
+  `clone_cpus` (`16` — whole cores → `nano_cpus`) and `clone_memory_mb` (`32768` — MiB, +8 GiB
+  swap), both editable per-clone limits.
 - **First-run setup wizard**: a fresh deploy ships `config.json` with `"setupComplete":
-  false`, so the web UI shows a 4-step wizard (Proxmox + connection test → server settings
-  + monitors → first template provision → finish) instead of the dashboard; finishing
-  latches `setupComplete: true`, after which the one-time fields (`data_dir`,
-  `proxmox.storage`, `proxmox.bridge`, `clone_socket`) are locked. Pre-wizard installs are
-  grandfathered:
-  a `config.json` with no `setupComplete` key but a `proxmox.ssh` already set is treated as
-  complete on first load and the file is rewritten.
+  false`, so the web UI shows the wizard (environment checklist → server settings + monitors
+  → build the base image → finish) instead of the dashboard; finishing latches
+  `setupComplete: true` (a one-way latch) and materializes the lazy `rmng` network, after
+  which the one-time fields (`data_dir`, `clone_socket`, `docker.subnet`) are locked. There is
+  **no grandfather rule**: an old `config.json` re-runs the wizard (new machine, no network /
+  base image). A legacy `proxmox` block is scrubbed on load, carrying `hostnamePrefix` into
+  `docker.hostname_prefix`; old `state.json` hosts load as plain unmanaged rows
+  (`container: None`, serde drops the stale `ctid`).
 - <a id="preset"></a>**`Preset`**: `name`, `labels` (Linear ticket labels that auto-select
   this preset when cloning from a ticket — case-insensitive, first match in config order
   wins), `linear_key` (personal API key, **secret** — fetches/creates tickets server-side
@@ -173,28 +180,32 @@ returns `AppConfigRedacted` (secrets → `*_set: bool`); `PUT /api/config` retur
   The server owns the whole refresh lifecycle; a clone gets **only the current short-lived
   access token** written into its `~/.claude/.credentials.json` (refresh emptied, far-future
   expiry), re-pushed to every assigned clone whenever a refresh rotates it — so a *running*
-  clone hot-swaps without restart (written via the Proxmox node's `pct exec`).
+  clone hot-swaps without restart (written via `docker exec` into the clone).
 - **`CloneGroup`**: `name`, `accounts` (member emails). A clone bound to a group
   (`Host.claude_group`) sticks to its account (preserving its prompt cache) until that
   account passes 90% 5h usage or leaves the group; the 10-min rotator then moves it to
   the least-loaded / least-used member. Selected at clone/swap time as `group:<name>`.
 - **`MonitorSpec`**: `width`, `height`, `x`, `y`, `primary`.
 
-Template build params are not config: the base image is fixed in code
-(`local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst` — the patched gnome-shell is
-compiled against Ubuntu 26.04's GNOME only) and CT resources (cores/memory/disk) are chosen
-per bootstrap in the "New template" modal (`POST /api/template/bootstrap`).
+Base-image build params are not config: the base OS is fixed in code (`ubuntu:26.04` — the
+patched gnome-shell is compiled against 26.04's GNOME only), and the wizard/API build takes
+only a name (`POST /api/images/bootstrap {name}` → `rmng/template:<name>`). Per-clone CPU /
+memory limits come from `docker.clone_cpus` / `docker.clone_memory_mb`, applied at clone
+create — not per image.
 
 ---
 
 ## Environment variables
 
 **control-server:** reads **no `RMNG_*` env vars** — all config is `./config.json` in the
-working directory (the systemd unit sets `WorkingDirectory=/var/lib/rmng`). The disk-frontend
-path and chroma are the `staticDir` / `chroma` config fields (restart-required, along with
-the four listen ports); the clone socket is the `cloneSocket` config field (**one-time** —
-baked into the template at provision — but a pre-latch edit is still restart-required, since
-the old path is bound at startup). Only `RUST_LOG` (`info,tower_http=warn`) is read.
+working directory (the Docker image sets `WORKDIR /data`, the `rmng-data` volume). The
+disk-frontend path, chroma, and Docker daemon socket are the `staticDir` / `chroma` /
+`docker.socket` config fields (restart-required, along with the four listen ports); the clone
+socket is the `cloneSocket` config field (**one-time** — baked into every clone's
+`/srv/rmng-sock` bind + clone-daemon `RMNG_SOCKET` at bootstrap — but a pre-latch edit is
+still restart-required, since the old path is bound at startup). Only `RUST_LOG`
+(`info,tower_http=warn,clip=debug`) is read (a logging default baked into the image, not a
+setting).
 
 **clone-daemon:** `RMNG_SOCKET` (media socket; **absent → capture self-test mode**),
 `RMNG_CLONE_ID` (id; default hostname), `RMNG_MONITORS` (layout CSV, below),

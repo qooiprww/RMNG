@@ -16,21 +16,19 @@ relevant — and both patch **gnome-shell**:
 
 ## How it ships
 
-`build-shell-deb.sh` runs **in the build CT** and produces a patched
-`gnome-shell_<ver>+ngshell1_amd64.deb`. It rebuilds only `libshell-<N>.so` (both
-patches are JS compiled into the gresource baked into that one library) and swaps it
-into the stock gnome-shell `.deb`, bumping the version so it installs cleanly over
-stock.
+`build-shell-deb.sh` runs in the **`gnome-build` Dockerfile stage** (`docker build`) and
+produces a patched `gnome-shell_<ver>+ngshell1_amd64.deb`. It rebuilds only `libshell-<N>.so`
+(both patches are JS compiled into the gresource baked into that one library) and swaps it
+into the stock gnome-shell `.deb`, bumping the version so it installs cleanly over stock. It
+prints the produced path as `DEB=<path>`.
 
-`scripts/cs-build-ct.sh` calls this and gzips the result into
-`crates/control-server/embedded-bin/gnome-shell-deb.gz`, so the **control-server is a
-single self-contained artifact** carrying the patched shell. At template-bootstrap
-time the control-server stages the deb on the Proxmox node (`orchestrate.rs` →
-`bootstrap.sh`), which `pct push`es it into the new CT, and `provision-clone.sh`
-installs it on top of the stock shell. CoW clones inherit the patched shell from the
-template automatically.
+The Dockerfile copies that deb to **`/usr/local/share/rmng/gnome-shell.deb`** in the runtime
+image (a plain payload — no gzip, no embedding). When the control-server builds a base image,
+`provision.rs` pushes the payload into the build container and `provision-clone.sh` installs
+it over the stock shell; every clone off that image inherits the patched shell. `assets.rs`
+tolerates the payload being absent (clones fall back to the stock shell).
 
-Build standalone (in the build CT):
+Build standalone (needs the gnome-shell build-deps, i.e. `apt build-dep gnome-shell`):
 
 ```sh
 bash gnome-patch/build-shell-deb.sh   # prints DEB=<path>; FORCE=1 to rebuild
