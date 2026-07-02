@@ -23,8 +23,10 @@ impl Listener {
         let addr = UnixAddr::new(path).context("UnixAddr")?;
         bind(fd.as_raw_fd(), &addr).with_context(|| format!("bind {path}"))?;
         listen(&fd, Backlog::new(4).unwrap()).context("listen")?;
-        // World-accessible so clone-daemons in *other* (uid-mapped) CTs can connect
-        // over the bind-mounted host socket — connecting needs write perm on the node.
+        // World-writable: the control-server binds this as root in its container, and
+        // each clone-daemon connects as the uid-1000 clone user from a sibling container
+        // over the shared sock volume. No Docker idmapping is involved, but that
+        // root-vs-1000 split still needs write perm for the non-root uid.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777));
         Ok(Self { fd })

@@ -443,7 +443,7 @@ fn validate_docker_subnet(subnet: &str) -> Result<()> {
 }
 
 /// Guard the effect-category invariants on a merged config. Once first-run setup has
-/// completed (`base.setup_complete`), the **one-time** fields (baked into CTs at
+/// completed (`base.setup_complete`), the **one-time** fields (baked into clones at
 /// provision) can't change, and the `setupComplete` latch can't be undone. Blank-string
 /// "unchanged" fields are already collapsed by `deep_merge`, so these compare final
 /// values — a client re-sending the current value is a no-op, not an error.
