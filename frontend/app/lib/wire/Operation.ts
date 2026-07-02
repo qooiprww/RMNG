@@ -18,4 +18,8 @@ pct: number, message: string,
 /**
  * Rolling log lines for the operation.
  */
-log: Array<string>, ctid: number | null, startedAt: bigint, finishedAt: bigint | null, };
+log: Array<string>, 
+/**
+ * Docker container id of the clone this operation created/targets, once known.
+ */
+container: string | null, startedAt: bigint, finishedAt: bigint | null, };

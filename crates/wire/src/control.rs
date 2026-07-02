@@ -60,7 +60,7 @@ pub enum MonitorState {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../frontend/app/lib/wire/")]
 pub struct Host {
-    /// Stable id; equals the Proxmox container hostname for cloneable hosts.
+    /// Stable id; equals the Docker container name for cloneable hosts.
     pub id: String,
     /// RDP/media server hostname or IP.
     pub host: String,
@@ -91,8 +91,13 @@ pub struct Host {
     pub gdm_password: Option<String>,
 
     // --- server-only extras (camelCase) ---
+    /// Docker container id (full 64-hex) of the managed clone backing this host; the
+    /// container *name* equals the host id for `docker ps` readability. `Some` marks a
+    /// managed clone; `None` is a plain unmanaged row (deletable in the UI). Old
+    /// `state.json` rows carrying the legacy `ctid` load as `None` — serde drops the
+    /// stale key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ctid: Option<u32>,
+    pub container: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +147,8 @@ pub struct Host {
 pub enum OperationKind {
     Clone,
     Delete,
+    Bootstrap,
+    Commit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -172,8 +179,9 @@ pub struct Operation {
     /// Rolling log lines for the operation.
     #[serde(default)]
     pub log: Vec<String>,
+    /// Docker container id of the clone this operation created/targets, once known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ctid: Option<u32>,
+    pub container: Option<String>,
     pub started_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
@@ -243,9 +251,6 @@ pub struct ControlState {
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub operations: Vec<Operation>,
-    /// Host ids that are templates: not deletable; cloned instead.
-    #[serde(default)]
-    pub templates: Vec<String>,
     /// Per-Claude-account usage view (no tokens).
     #[serde(default)]
     pub claude_accounts: Vec<ClaudeUsage>,
@@ -310,8 +315,23 @@ mod tests {
         assert_eq!(state.hosts[0].port, 3389); // default
         assert_eq!(state.hosts[1].port, 3390);
         assert!(state.operations.is_empty());
-        assert!(state.templates.is_empty());
         assert!(state.claude_accounts.is_empty());
+    }
+
+    #[test]
+    fn legacy_proxmox_state_loads_unmanaged() {
+        // An old `state.json` from the Proxmox era: hosts carry the retired `ctid`
+        // key and the top-level `templates` list. Both are stale and dropped by serde;
+        // such hosts load as plain unmanaged rows (`container: None`).
+        let json = r#"{
+            "hosts": [
+                { "id": "pega-old", "host": "10.0.0.9", "username": "u", "password": "p", "ctid": 5 }
+            ],
+            "templates": ["rmng-template"]
+        }"#;
+        let state: ControlState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.hosts.len(), 1);
+        assert_eq!(state.hosts[0].container, None);
     }
 
     #[test]
