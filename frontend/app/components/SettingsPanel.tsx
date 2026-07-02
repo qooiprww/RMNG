@@ -10,8 +10,9 @@ const input =
 
 /** When a changed setting takes effect. Placed on section headers / fields to set
  *  expectations: `immediate` applies on save, `restart` needs a control-server
- *  restart (ports, staticDir, chroma), `one-time` is baked in at first-run provision
- *  and can't change afterwards (dataDir, storage, bridge, cloneSocket). */
+ *  restart (ports, staticDir, chroma, docker socket), `one-time` is baked in at
+ *  first-run setup and can't change afterwards (subnet; dataDir/cloneSocket are
+ *  fixed by the container image). */
 function EffectBadge({ effect }: { effect: "immediate" | "restart" | "one-time" }) {
   const style =
     effect === "immediate"
@@ -111,7 +112,7 @@ export function SettingsPanel({
   // staticDir / chroma) — surfaces a persistent banner until a later save clears it.
   const [restartRequired, setRestartRequired] = useState(false);
 
-  // Editable form state. Secrets (proxmoxSsh, preset linearKey) start blank = "unchanged".
+  // Editable form state. Secrets (preset linearKey) start blank = "unchanged".
   const [monitors, setMonitors] = useState<Mon[]>([]);
   // Presets: labels edited as a comma-separated string; linearKey is write-only
   // (blank = keep stored), keySet mirrors whether the server holds one.
@@ -125,10 +126,10 @@ export function SettingsPanel({
     }[]
   >([]);
   const [claudeGroups, setClaudeGroups] = useState<{ name: string; accounts: string[] }[]>([]);
-  const [proxmoxSsh, setProxmoxSsh] = useState("");
   const [hostnamePrefix, setHostnamePrefix] = useState("");
-  const [proxmoxStorage, setProxmoxStorage] = useState("");
-  const [proxmoxBridge, setProxmoxBridge] = useState("");
+  const [subnet, setSubnet] = useState("");
+  const [cloneCpus, setCloneCpus] = useState(16);
+  const [cloneMemoryMb, setCloneMemoryMb] = useState(32768);
   const [claude, setClaude] = useState({
     pollSecs: 600,
     pinnedEmail: "",
@@ -149,9 +150,10 @@ export function SettingsPanel({
         ? c.monitors.map((m) => ({ ...m }))
         : [{ width: 1920, height: 1080, x: 0, y: 0, primary: true }],
     );
-    setHostnamePrefix(c.proxmoxHostnamePrefix);
-    setProxmoxStorage(c.proxmoxStorage);
-    setProxmoxBridge(c.proxmoxBridge);
+    setHostnamePrefix(c.docker.hostnamePrefix);
+    setSubnet(c.docker.subnet);
+    setCloneCpus(c.docker.cloneCpus);
+    setCloneMemoryMb(c.docker.cloneMemoryMb);
     setClaude({
       ...c.claude,
       pollSecs: Number(c.claude.pollSecs),
@@ -235,7 +237,14 @@ export function SettingsPanel({
           y: Math.max(0, m.y),
           primary: m.primary,
         })),
-        proxmox: { ssh: proxmoxSsh, hostnamePrefix, storage: proxmoxStorage, bridge: proxmoxBridge },
+        // subnet is one-time: only sent (non-empty) pre-setup; after setup it's read-only,
+        // and the server rejects a change anyway. Blank = unchanged.
+        docker: {
+          hostnamePrefix,
+          cloneCpus,
+          cloneMemoryMb,
+          ...(cfg?.setupComplete ? {} : { subnet }),
+        },
         claude: { ...claude, pinnedEmail: claude.pinnedEmail || null },
         listen,
         agentPort,
@@ -259,7 +268,6 @@ export function SettingsPanel({
       const res = await putConfig(patch);
       load(res.config); // re-seed from the server's redacted view; clears write-only inputs
       setRestartRequired(res.restartRequired); // shows/clears the restart banner
-      setProxmoxSsh("");
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } catch (e) {
@@ -272,7 +280,7 @@ export function SettingsPanel({
   async function runTest() {
     setTestMsg("testing…");
     try {
-      const r = await testConfig("proxmox");
+      const r = await testConfig("docker");
       setTestMsg(`${r.ok ? "✓" : "✗"} ${r.message}`);
     } catch (e) {
       setTestMsg(`✗ ${(e as Error).message}`);
@@ -340,7 +348,7 @@ export function SettingsPanel({
 
         {restartRequired ? (
           <div className="mb-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-            Restart the control-server to apply the changed port/socket/video settings.
+            Run <code>docker restart rmng</code> to apply the changed port/socket/video settings.
           </div>
         ) : null}
 
@@ -454,27 +462,19 @@ export function SettingsPanel({
               </div>
             </Section>
 
-            {/* Proxmox. */}
-            <Section title="Proxmox">
+            {/* Docker / Clones. */}
+            <Section title="Docker / Clones">
               <div className="space-y-3">
-                <div className="flex items-end gap-2">
-                  <div className="flex-1">
-                    <Secret
-                      label="SSH target (e.g. root@10.0.0.100)"
-                      set={cfg.proxmoxSshSet}
-                      value={proxmoxSsh}
-                      onChange={setProxmoxSsh}
-                    />
-                  </div>
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
                     onClick={runTest}
                     className="rounded border border-slate-300 px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
                   >
-                    Test
+                    Test Docker
                   </button>
+                  {testMsg ? <p className="text-xs text-slate-500">{testMsg}</p> : null}
                 </div>
-                {testMsg ? <p className="text-xs text-slate-500">{testMsg}</p> : null}
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-medium text-slate-500">Clone hostname prefix</span>
@@ -492,41 +492,59 @@ export function SettingsPanel({
                     the current value.
                   </p>
                 </div>
-                {/* Storage pool + bridge are baked into CT volumes/NICs at provision, so
-                    they're one-time: editable only during first-run setup. */}
+                {/* Subnet is baked into the rmng bridge + every clone's static IP at first-run
+                    setup, so it's one-time: editable only during first-run setup. */}
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-slate-500">Clone network subnet</span>
+                    <EffectBadge effect="one-time" />
+                  </div>
+                  <input
+                    value={subnet}
+                    onChange={(e) => setSubnet(e.target.value)}
+                    disabled={cfg.setupComplete}
+                    placeholder="10.99.0.0/24"
+                    spellCheck={false}
+                    className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                  />
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {cfg.setupComplete
+                      ? "Set during first-run setup — baked into the rmng network + clone IPs, cannot be changed."
+                      : "IPv4 CIDR (/16–/24) for the rmng bridge — .1 gateway, .2 control-server, .10+ clone pool."}
+                  </p>
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Storage pool</span>
-                      <EffectBadge effect="one-time" />
+                      <span className="text-xs font-medium text-slate-500">CPU limit per clone (cores)</span>
+                      <EffectBadge effect="immediate" />
                     </div>
                     <input
-                      value={proxmoxStorage}
-                      onChange={(e) => setProxmoxStorage(e.target.value)}
-                      disabled={cfg.setupComplete}
-                      placeholder="local-lvm"
-                      className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                      type="number"
+                      min={1}
+                      value={cloneCpus}
+                      onChange={(e) => setCloneCpus(Number(e.target.value) || 0)}
+                      className={`mt-0.5 ${input}`}
                     />
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Bridge</span>
-                      <EffectBadge effect="one-time" />
+                      <span className="text-xs font-medium text-slate-500">Memory limit per clone (MB)</span>
+                      <EffectBadge effect="immediate" />
                     </div>
                     <input
-                      value={proxmoxBridge}
-                      onChange={(e) => setProxmoxBridge(e.target.value)}
-                      disabled={cfg.setupComplete}
-                      placeholder="vmbr0"
-                      className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                      type="number"
+                      min={1024}
+                      value={cloneMemoryMb}
+                      onChange={(e) => setCloneMemoryMb(Number(e.target.value) || 0)}
+                      className={`mt-0.5 ${input}`}
                     />
                   </div>
                 </div>
-                {cfg.setupComplete ? (
-                  <p className="text-xs text-slate-400">
-                    Storage pool + bridge were set during first-run setup — cannot be changed.
-                  </p>
-                ) : null}
+                <p className="text-xs text-slate-400">
+                  Limits apply to newly created clones (existing clones keep the limits they were
+                  created with).
+                </p>
               </div>
             </Section>
 
@@ -658,7 +676,7 @@ export function SettingsPanel({
               {advanced ? (
                 <div className="mt-2 grid grid-cols-2 gap-3">
                   {/* web/video/cloneMcp/globalMcp are wired once at startup → restart-required.
-                      daemonMcp applies live, but must match what templates bake in. */}
+                      daemonMcp applies live, but must match what clones bake in. */}
                   {(["web", "video", "cloneMcp", "globalMcp"] as const).map((k) => (
                     <div key={k}>
                       <div className="flex items-center gap-2">
@@ -684,7 +702,7 @@ export function SettingsPanel({
                       onChange={(e) => setListen({ ...listen, daemonMcp: Number(e.target.value) || 0 })}
                       className={`mt-0.5 ${input}`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">must match what templates bake in: 9004</p>
+                    <p className="mt-0.5 text-xs text-slate-400">must match what clones bake in: 9004</p>
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
@@ -697,9 +715,10 @@ export function SettingsPanel({
                       onChange={(e) => setAgentPort(Number(e.target.value) || 0)}
                       className={`mt-0.5 ${input}`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">must match what templates bake in: 4096</p>
+                    <p className="mt-0.5 text-xs text-slate-400">must match what clones bake in: 4096</p>
                   </div>
-                  {/* Data dir is baked into the on-disk layout at first-run setup → one-time. */}
+                  {/* Data dir is the control-server's WORKDIR inside its container: fixed at
+                      /data (the mounted volume). Shown read-only for reference. */}
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-slate-500">Data dir</span>
@@ -707,19 +726,16 @@ export function SettingsPanel({
                     </div>
                     <input
                       value={dataDir}
-                      onChange={(e) => setDataDir(e.target.value)}
-                      disabled={cfg.setupComplete}
+                      readOnly
+                      disabled
                       className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
                     />
-                    {cfg.setupComplete ? (
-                      <p className="mt-0.5 text-xs text-slate-400">
-                        set during first-run setup — cannot be changed
-                      </p>
-                    ) : null}
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      fixed at <code>/data</code> in the container (the mounted volume)
+                    </p>
                   </div>
-                  {/* The unix socket clone-daemons connect to → baked into the template at
-                      provision → one-time (editable only during first-run setup; a pre-latch
-                      edit is restart-required because the old path is bound at startup). */}
+                  {/* The shared unix socket clone-daemons connect to. Fixed by the container's
+                      mounted sock volume; shown read-only. */}
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-slate-500">Clone socket</span>
@@ -727,17 +743,15 @@ export function SettingsPanel({
                     </div>
                     <input
                       value={cloneSocket}
-                      onChange={(e) => setCloneSocket(e.target.value)}
-                      disabled={cfg.setupComplete}
+                      readOnly
+                      disabled
                       placeholder="/srv/rmng-sock/clones.sock"
                       spellCheck={false}
                       className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
                     />
-                    {cfg.setupComplete ? (
-                      <p className="mt-0.5 text-xs text-slate-400">
-                        set during first-run setup — cannot be changed
-                      </p>
-                    ) : null}
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      fixed by the container's shared sock volume
+                    </p>
                   </div>
                   <div className="col-span-2">
                     <div className="flex items-center gap-2">

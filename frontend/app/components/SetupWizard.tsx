@@ -1,14 +1,16 @@
 // First-run setup wizard. Replaces the dashboard while `!setupComplete` — a
 // full-page centered card (NOT a dismissable modal: no Escape/overlay-click
 // close, no ✕). Each step persists via `putConfig` on Next; a failed PUT blocks
-// the advance and surfaces the standard red banner. Storage/bridge/dataDir are
-// freely editable here because the server only latches the one-time fields once
-// `setupComplete` flips (via the Finish step's `putConfig({ setupComplete: true })`).
-import { useState } from "react";
+// the advance and surfaces the standard red banner. The one-time fields (subnet)
+// stay editable here because the server only latches them once `setupComplete`
+// flips (via the Finish step's `putConfig({ setupComplete: true })`, which also
+// ensures the `rmng` bridge network).
+import { useCallback, useState } from "react";
 
+import { EnvChecklist } from "~/components/EnvChecklist";
 import { MonitorsEditor, type Mon } from "~/components/MonitorsEditor";
 import { OperationProgress } from "~/components/OperationProgress";
-import { bootstrapTemplate, putConfig, testConfig } from "~/lib/api";
+import { bootstrapBaseImage, putConfig } from "~/lib/api";
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
 import type { ChromaMode } from "~/lib/wire/ChromaMode";
 import type { ControlState } from "~/lib/types";
@@ -16,15 +18,28 @@ import type { ControlState } from "~/lib/types";
 const input =
   "w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-slate-400 focus:outline-none";
 
-/** Template resource defaults — mirror NewTemplateModal / what the template is built with. */
-const DEFAULT_RESOURCES = { cores: 16, memoryMb: 32768, diskGb: 128 };
+/** Default name for the wizard-built base image (tagged `rmng/template:rmng/base`). */
+const DEFAULT_IMAGE_NAME = "rmng/base";
 
-/** Mirrors the server's `is_dns_label` (same rule NewTemplateModal enforces). */
+/** Mirror of the server's `is_dns_label` (base-image name → `rmng/template:<name>`). */
 function isDnsLabel(s: string): boolean {
   return s.length <= 63 && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(s);
 }
 
-const STEPS = ["Proxmox", "Server", "Template", "Finish"] as const;
+/** Mirror of the server's `validate_docker_subnet`: an IPv4 CIDR with a /16–/24 prefix. */
+function isValidSubnet(s: string): boolean {
+  const [ip, prefix, ...rest] = s.split("/");
+  if (rest.length > 0 || prefix === undefined) return false;
+  const p = Number(prefix);
+  if (!Number.isInteger(p) || p < 16 || p > 24) return false;
+  const octets = ip.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((o) => /^\d+$/.test(o) && Number(o) >= 0 && Number(o) <= 255)
+  );
+}
+
+const STEPS = ["Environment", "Server", "Base image", "Finish"] as const;
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -58,18 +73,14 @@ export function SetupWizard({
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  // --- Step 1: Proxmox ---
-  const [proxmoxSsh, setProxmoxSsh] = useState("");
-  const [proxmoxSshSet, setProxmoxSshSet] = useState(initialConfig.proxmoxSshSet);
-  const [storage, setStorage] = useState(initialConfig.proxmoxStorage);
-  const [bridge, setBridge] = useState(initialConfig.proxmoxBridge);
-  const [testMsg, setTestMsg] = useState<string | null>(null);
-  const [testing, setTesting] = useState(false);
+  // --- Step 1: Environment ---
+  const [envOk, setEnvOk] = useState(false);
+  const [subnet, setSubnet] = useState(initialConfig.docker.subnet);
 
   // --- Step 2: Server ---
-  const [dataDir, setDataDir] = useState(initialConfig.dataDir);
-  const [cloneSocket, setCloneSocket] = useState(initialConfig.cloneSocket);
-  const [hostnamePrefix, setHostnamePrefix] = useState(initialConfig.proxmoxHostnamePrefix);
+  const [hostnamePrefix, setHostnamePrefix] = useState(initialConfig.docker.hostnamePrefix);
+  const [cloneCpus, setCloneCpus] = useState(initialConfig.docker.cloneCpus);
+  const [cloneMemoryMb, setCloneMemoryMb] = useState(initialConfig.docker.cloneMemoryMb);
   const [monitors, setMonitors] = useState<Mon[]>(
     initialConfig.monitors.length
       ? initialConfig.monitors.map((m) => ({ ...m }))
@@ -83,11 +94,10 @@ export function SetupWizard({
   const [listen, setListen] = useState({ ...initialConfig.listen });
   const [agentPort, setAgentPort] = useState(initialConfig.agentPort);
 
-  // --- Step 3: Template ---
-  const [tplHostname, setTplHostname] = useState("");
-  const [resources, setResources] = useState(DEFAULT_RESOURCES);
-  const [provisioning, setProvisioning] = useState(false);
-  const [provisionTarget, setProvisionTarget] = useState<string | null>(null);
+  // --- Step 3: Base image ---
+  const [imageName, setImageName] = useState(DEFAULT_IMAGE_NAME);
+  const [building, setBuilding] = useState(false);
+  const [buildTarget, setBuildTarget] = useState<string | null>(null);
 
   const monitorsPatch = () =>
     monitors.map((m) => ({
@@ -98,13 +108,15 @@ export function SetupWizard({
       primary: m.primary,
     }));
 
-  // The bootstrap operation is created with kind "clone" and target === hostname
-  // (verified in control-server jobs.rs `start_bootstrap` → make_op(Clone, …)).
-  const tplOp = provisionTarget
-    ? state.operations.find((o) => o.kind === "clone" && o.target === provisionTarget)
+  // The bootstrap op is kind "bootstrap" with target === image name (jobs.rs
+  // start_bootstrap → make_op(Bootstrap, name, None)).
+  const imgOp = buildTarget
+    ? state.operations.find((o) => o.kind === "bootstrap" && o.target === buildTarget)
     : undefined;
-  const tplRunning = tplOp?.status === "running";
-  const tplDone = tplOp?.status === "done";
+  const imgRunning = imgOp?.status === "running";
+  const imgDone = imgOp?.status === "done";
+
+  const onEnvChange = useCallback((ok: boolean) => setEnvOk(ok), []);
 
   /** Persist this step's fields; resolves true on success, false (banner shown) on failure. */
   async function persist(patch: Record<string, unknown>): Promise<boolean> {
@@ -121,42 +133,19 @@ export function SetupWizard({
     }
   }
 
-  async function runTest() {
-    setTesting(true);
-    setTestMsg("testing…");
-    setError(null);
-    // Save the SSH target first so the server tests what's on screen.
-    const ok = await persist({
-      proxmox: { ssh: proxmoxSsh, storage, bridge },
-    });
-    if (!ok) {
-      setTestMsg(null);
-      setTesting(false);
-      return;
-    }
-    if (proxmoxSsh.trim()) setProxmoxSshSet(true);
-    setProxmoxSsh("");
-    try {
-      const r = await testConfig("proxmox");
-      setTestMsg(`${r.ok ? "✓" : "✗"} ${r.message}`);
-    } catch (e) {
-      setTestMsg(`✗ ${(e as Error).message}`);
-    } finally {
-      setTesting(false);
-    }
-  }
+  const subnetOk = subnet.trim().length > 0 && isValidSubnet(subnet.trim());
 
   async function next() {
     if (saving) return;
     if (step === 0) {
-      if (!(await persist({ proxmox: { ssh: proxmoxSsh, storage, bridge } }))) return;
-      if (proxmoxSsh.trim()) setProxmoxSshSet(true);
-      setProxmoxSsh("");
+      if (!subnetOk) {
+        setError("Enter a valid IPv4 CIDR subnet (/16–/24), e.g. 10.99.0.0/24.");
+        return;
+      }
+      if (!(await persist({ docker: { subnet: subnet.trim() } }))) return;
     } else if (step === 1) {
       const ok = await persist({
-        dataDir,
-        cloneSocket,
-        proxmox: { hostnamePrefix },
+        docker: { hostnamePrefix, cloneCpus, cloneMemoryMb },
         monitors: monitorsPatch(),
         chroma,
         detectorInferenceUrl,
@@ -164,9 +153,8 @@ export function SetupWizard({
         agentPort,
       });
       if (!ok) return;
-    } else if (step === 2) {
-      // Nothing to persist here — provisioning happens via bootstrapTemplate.
     }
+    // Step 2 (base image) has nothing to persist — the build happens via bootstrapBaseImage.
     setStep((s) => Math.min(STEPS.length - 1, s + 1));
     setError(null);
   }
@@ -177,35 +165,57 @@ export function SetupWizard({
     setStep((s) => Math.max(0, s - 1));
   }
 
-  async function provision() {
-    const name = tplHostname.trim();
-    if (!isDnsLabel(name) || provisioning || tplRunning) return;
-    setProvisioning(true);
+  async function build() {
+    const name = imageName.trim();
+    if (!isDnsLabel(name) || building || imgRunning) return;
+    setBuilding(true);
     setError(null);
     try {
-      await bootstrapTemplate(name, resources);
-      setProvisionTarget(name);
+      await bootstrapBaseImage(name);
+      setBuildTarget(name);
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setProvisioning(false);
+      setBuilding(false);
     }
   }
 
   async function finish() {
     if (saving) return;
-    if (!(await persist({ setupComplete: true }))) return;
-    onDone();
+    setSaving(true);
+    setError(null);
+    try {
+      const res = (await putConfig({ setupComplete: true })) as unknown as {
+        networkWarning?: string;
+      };
+      // Non-fatal: setup is already latched server-side. Surface the network warning
+      // (the operator may need to `docker network rm rmng`) but don't leave the wizard —
+      // the `rmng` network is also created lazily on the first clone. Clicking Finish
+      // again is idempotent (setupComplete already true → no re-check) and proceeds.
+      if (res.networkWarning) {
+        setError(
+          `Setup saved, but the rmng network could not be ensured: ${res.networkWarning}. ` +
+            "It will be created on the first clone. Click Finish again to continue.",
+        );
+        return;
+      }
+      onDone();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
   }
 
-  const setRes = (k: keyof typeof DEFAULT_RESOURCES, v: number) =>
-    setResources((r) => ({ ...r, [k]: v }));
-
-  const tplName = tplHostname.trim();
-  const tplLabelOk = tplName.length === 0 || isDnsLabel(tplName);
-  const canProvision = isDnsLabel(tplName) && !provisioning && !tplRunning && !tplDone;
-  // On the Template step, a running provision blocks Next (mid-provision).
-  const nextDisabled = saving || (step === 2 && tplRunning);
+  const imageNameTrim = imageName.trim();
+  const imageLabelOk = imageNameTrim.length === 0 || isDnsLabel(imageNameTrim);
+  const canBuild = isDnsLabel(imageNameTrim) && !building && !imgRunning && !imgDone;
+  // Env step blocks Next until required checks pass + a valid subnet; base-image step
+  // blocks Next while a build is running (mid-build).
+  const nextDisabled =
+    saving ||
+    (step === 0 && (!envOk || !subnetOk)) ||
+    (step === 2 && imgRunning);
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
@@ -255,73 +265,39 @@ export function SetupWizard({
             </div>
           ) : null}
 
-          {/* Step 1: Proxmox. */}
+          {/* Step 1: Environment. */}
           {step === 0 ? (
             <div className="space-y-4">
               <p className="text-sm text-slate-600">
-                Connect to your Proxmox host. rmng SSHes in to provision and manage containers.
+                rmng drives your local Docker daemon over its unix socket. Confirm the environment
+                is ready, then pick the private subnet for the clone network.
               </p>
-              <div className="flex items-end gap-2">
-                <div className="flex-1">
-                  <Field label="SSH target (e.g. root@10.0.0.100)">
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="password"
-                        value={proxmoxSsh}
-                        placeholder={
-                          proxmoxSshSet ? "•••••••• (set — leave blank to keep)" : "root@…"
-                        }
-                        onChange={(e) => setProxmoxSsh(e.target.value)}
-                        spellCheck={false}
-                        className={input}
-                      />
-                      <span
-                        className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-                          proxmoxSshSet
-                            ? "bg-emerald-100 text-emerald-700"
-                            : "bg-slate-100 text-slate-400"
-                        }`}
-                      >
-                        {proxmoxSshSet ? "set" : "unset"}
-                      </span>
-                    </div>
-                  </Field>
-                </div>
-                <button
-                  type="button"
-                  onClick={runTest}
-                  disabled={testing || saving}
-                  className="rounded border border-slate-300 px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                >
-                  Test connection
-                </button>
-              </div>
-              {testMsg ? <p className="text-xs text-slate-500">{testMsg}</p> : null}
+              <EnvChecklist onChange={onEnvChange} />
 
               <OneTimeWarning>
-                Storage pool + bridge are baked into every container's disk and NIC at provision
-                time — they <strong>cannot be changed after setup</strong>.
+                The clone network subnet is baked into the <code>rmng</code> bridge and every
+                clone's static IP at first-run setup — it{" "}
+                <strong>cannot be changed after setup</strong>.
               </OneTimeWarning>
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="Storage pool">
-                  <input
-                    value={storage}
-                    onChange={(e) => setStorage(e.target.value)}
-                    placeholder="local-lvm"
-                    spellCheck={false}
-                    className={input}
-                  />
-                </Field>
-                <Field label="Bridge">
-                  <input
-                    value={bridge}
-                    onChange={(e) => setBridge(e.target.value)}
-                    placeholder="vmbr0"
-                    spellCheck={false}
-                    className={input}
-                  />
-                </Field>
-              </div>
+              <Field label="Clone network subnet (IPv4 CIDR, /16–/24)">
+                <input
+                  value={subnet}
+                  onChange={(e) => setSubnet(e.target.value)}
+                  placeholder="10.99.0.0/24"
+                  spellCheck={false}
+                  className={input}
+                />
+                {subnet.trim() && !subnetOk ? (
+                  <span className="mt-1 block text-[11px] text-red-600">
+                    must be an IPv4 CIDR with a /16–/24 prefix, e.g. 10.99.0.0/24
+                  </span>
+                ) : (
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    <code>.1</code> gateway, <code>.2</code> control-server, <code>.10+</code>{" "}
+                    clone pool.
+                  </span>
+                )}
+              </Field>
             </div>
           ) : null}
 
@@ -331,33 +307,6 @@ export function SetupWizard({
               <p className="text-sm text-slate-600">
                 Server-side layout and defaults for the fleet.
               </p>
-              <OneTimeWarning>
-                The data directory is baked into the on-disk layout at first-run setup — it{" "}
-                <strong>cannot be changed after setup</strong>.
-              </OneTimeWarning>
-              <Field label="Data dir">
-                <input
-                  value={dataDir}
-                  onChange={(e) => setDataDir(e.target.value)}
-                  spellCheck={false}
-                  className={input}
-                />
-              </Field>
-
-              <OneTimeWarning>
-                The clone media socket is baked into the template at provision time — it{" "}
-                <strong>cannot be changed after setup</strong>. Changing it here requires restarting
-                the control-server before provisioning the template.
-              </OneTimeWarning>
-              <Field label="Clone media socket">
-                <input
-                  value={cloneSocket}
-                  onChange={(e) => setCloneSocket(e.target.value)}
-                  placeholder="/srv/rmng-sock/clones.sock"
-                  spellCheck={false}
-                  className={input}
-                />
-              </Field>
 
               <Field label="Clone hostname prefix">
                 <input
@@ -372,6 +321,27 @@ export function SetupWizard({
                   <code>{hostnamePrefix || "pega-"}</code>dev-123.
                 </span>
               </Field>
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="CPU limit per clone (cores)">
+                  <input
+                    type="number"
+                    min={1}
+                    value={cloneCpus}
+                    onChange={(e) => setCloneCpus(Number(e.target.value) || 0)}
+                    className={input}
+                  />
+                </Field>
+                <Field label="Memory limit per clone (MB)">
+                  <input
+                    type="number"
+                    min={1024}
+                    value={cloneMemoryMb}
+                    onChange={(e) => setCloneMemoryMb(Number(e.target.value) || 0)}
+                    className={input}
+                  />
+                </Field>
+              </div>
 
               <div>
                 <span className="mb-1 block text-xs font-medium text-slate-500">Monitors</span>
@@ -436,67 +406,52 @@ export function SetupWizard({
             </div>
           ) : null}
 
-          {/* Step 3: Template. */}
+          {/* Step 3: Base image. */}
           {step === 2 ? (
             <div className="space-y-4">
               <p className="text-sm text-slate-600">
-                Provision your first template container (Ubuntu 26.04, the base our patched GNOME
-                is built for). Clones are made from it. You can skip this and do it later.
+                Build the base image clones are made from (Ubuntu 26.04, the base our patched
+                GNOME is built for). It's tagged under <code>rmng/template</code>. You can skip
+                this and build it later from the Images panel.
               </p>
-              <Field label="Hostname">
+              <Field label="Base image name">
                 <input
-                  value={tplHostname}
-                  onChange={(e) => setTplHostname(e.target.value)}
-                  placeholder="e.g. rmng-template"
+                  value={imageName}
+                  onChange={(e) => setImageName(e.target.value)}
+                  placeholder={DEFAULT_IMAGE_NAME}
                   spellCheck={false}
-                  disabled={tplRunning || tplDone}
+                  disabled={imgRunning || imgDone}
                   className={`${input} disabled:bg-slate-50 disabled:text-slate-400`}
                 />
-                {!tplLabelOk ? (
+                {!imageLabelOk ? (
                   <span className="mt-1 block text-[11px] text-red-600">
                     lowercase letters, digits and hyphens only (no leading/trailing hyphen, ≤63
                     chars)
                   </span>
-                ) : null}
+                ) : (
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    → <code>rmng/template:{imageNameTrim || DEFAULT_IMAGE_NAME}</code>
+                  </span>
+                )}
               </Field>
-              <div className="grid grid-cols-3 gap-3">
-                {(
-                  [
-                    { key: "cores", label: "Cores", min: 1 },
-                    { key: "memoryMb", label: "Memory (MB)", min: 1024 },
-                    { key: "diskGb", label: "Disk (GB)", min: 8 },
-                  ] as const
-                ).map((f) => (
-                  <Field key={f.key} label={f.label}>
-                    <input
-                      type="number"
-                      min={f.min}
-                      value={resources[f.key]}
-                      onChange={(e) => setRes(f.key, Number(e.target.value) || 0)}
-                      disabled={tplRunning || tplDone}
-                      className={`${input} disabled:bg-slate-50 disabled:text-slate-400`}
-                    />
-                  </Field>
-                ))}
-              </div>
 
-              {tplOp ? <OperationProgress op={tplOp} /> : null}
-              {tplDone ? (
+              {imgOp ? <OperationProgress op={imgOp} /> : null}
+              {imgDone ? (
                 <p className="text-xs font-medium text-emerald-600">
-                  ✓ Template “{provisionTarget}” provisioned.
+                  ✓ Base image “{buildTarget}” built.
                 </p>
               ) : null}
 
               <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={provision}
-                  disabled={!canProvision}
+                  onClick={build}
+                  disabled={!canBuild}
                   className="rounded bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-40"
                 >
-                  {provisioning || tplRunning ? "Provisioning…" : "Provision"}
+                  {building || imgRunning ? "Building…" : "Build base image"}
                 </button>
-                {!tplRunning && !tplDone ? (
+                {!imgRunning && !imgDone ? (
                   <button
                     type="button"
                     onClick={next}
@@ -513,24 +468,22 @@ export function SetupWizard({
           {step === 3 ? (
             <div className="space-y-4">
               <p className="text-sm text-slate-600">
-                Review your configuration, then finish setup. The one-time settings latch when you
-                click Finish.
+                Review your configuration, then finish setup. The one-time subnet latches and the{" "}
+                <code>rmng</code> network is ensured when you click Finish.
               </p>
               <dl className="divide-y divide-slate-100 rounded border border-slate-200 text-sm">
                 {(
                   [
-                    ["Proxmox SSH", proxmoxSshSet ? "set" : "not set"],
-                    ["Storage pool", storage || "—"],
-                    ["Bridge", bridge || "—"],
-                    ["Data dir", dataDir || "—"],
-                    ["Clone media socket", cloneSocket || "—"],
+                    ["Clone network subnet", subnet || "—"],
                     ["Clone hostname prefix", hostnamePrefix || "(none)"],
+                    ["CPU limit per clone", `${cloneCpus} cores`],
+                    ["Memory limit per clone", `${cloneMemoryMb} MB`],
                     ["Monitors", `${monitors.length} monitor(s)`],
                     ["Chroma", chroma],
                     ["Detector URL", detectorInferenceUrl || "(none)"],
                     [
-                      "Template",
-                      tplDone ? `${provisionTarget} ✓` : "not provisioned (add one later)",
+                      "Base image",
+                      imgDone ? `${buildTarget} ✓` : "not built (build one later)",
                     ],
                   ] as const
                 ).map(([k, v]) => (

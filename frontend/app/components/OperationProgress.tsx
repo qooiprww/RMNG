@@ -8,9 +8,16 @@ const STATUS_COLOR: Record<Operation["status"], string> = {
   error: "bg-red-500",
 };
 
+const VERB: Record<Operation["kind"], string> = {
+  clone: "Cloning",
+  delete: "Deleting",
+  bootstrap: "Building",
+  commit: "Committing",
+};
+
 export function OperationProgress({ op }: { op: Operation }) {
   const [open, setOpen] = useState(false);
-  const verb = op.kind === "clone" ? "Cloning" : "Deleting";
+  const verb = VERB[op.kind];
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
       <div className="flex items-center justify-between gap-3 text-sm">

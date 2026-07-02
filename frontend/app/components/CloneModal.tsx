@@ -1,34 +1,42 @@
 import { useEffect, useState } from "react";
 
 import { AccountGroupSelect } from "~/components/AccountGroupSelect";
+import { ImagePicker } from "~/components/ImagePicker";
 import { getConfig, recommendedClaudeAccount, type ClonePayload } from "~/lib/api";
 import type { ClaudeUsage } from "~/lib/types";
 import type { CloneGroup } from "~/lib/wire/CloneGroup";
+import type { ImageInfo } from "~/lib/wire/ImageInfo";
 import type { PresetRedacted } from "~/lib/wire/PresetRedacted";
 import { parseTicketInput, workspaceBadge } from "~/lib/workspace";
 
 /**
- * Clone dialog. Three modes: paste an existing Linear ticket (link or `WE-142`) —
- * the preset is auto-selected from the ticket's labels unless overridden; create a
- * new ticket (preset + team + title + description — the preset's Linear key creates
- * it); or a plain no-ticket clone (title + optional first message; a preset must be
- * picked when any are configured). The hostname derives from the ticket id
- * (`WE-142` → `pega-we-142`) or the title slug. All resolved server-side.
+ * Clone dialog. Pick a clone-source image, then one of three ticket modes: paste an
+ * existing Linear ticket (link or `WE-142`) — the preset is auto-selected from the
+ * ticket's labels unless overridden; create a new ticket (preset + team + title +
+ * description — the preset's Linear key creates it); or a plain no-ticket clone
+ * (title + optional first message; a preset must be picked when any are configured).
+ * The hostname derives from the ticket id (`WE-142` → `pega-we-142`) or the title
+ * slug. All resolved server-side.
  */
 export function CloneModal({
-  source,
+  images,
+  imagesLoading,
   busy,
   accounts,
   onClose,
   onClone,
 }: {
-  source: string;
+  /** Clone-source images to pick from (from `listImages`). */
+  images: ImageInfo[];
+  imagesLoading: boolean;
   busy: boolean;
   /** Assignable Claude accounts (imported accounts), for the picker. */
   accounts: ClaudeUsage[];
   onClose: () => void;
-  onClone: (payload: ClonePayload) => void;
+  /** `image` = the chosen clone-source image reference. */
+  onClone: (image: string, payload: ClonePayload) => void;
 }) {
+  const [image, setImage] = useState<string | null>(null);
   const [mode, setMode] = useState<"existing" | "create" | "plain">("existing");
   const [ticket, setTicket] = useState("");
   // Linear team key for created tickets (e.g. "we" → WE-…).
@@ -93,20 +101,22 @@ export function CloneModal({
   }, []);
 
   const parsed = parseTicketInput(ticket);
-  // `existing` needs a parseable ticket; `create` a preset (its key creates the
-  // ticket) + team + title; `plain` a title + a preset whenever any are configured.
-  const valid =
+  // A source image is always required; then: `existing` needs a parseable ticket;
+  // `create` a preset (its key creates the ticket) + team + title; `plain` a title +
+  // a preset whenever any are configured.
+  const modeValid =
     mode === "existing"
       ? !!parsed
       : mode === "create"
         ? title.trim().length > 0 && team.trim().length > 0 && !!preset
         : title.trim().length > 0 && (presets.length === 0 || !!preset);
+  const valid = !!image && modeValid;
 
   function submit() {
-    if (!valid || busy) return;
+    if (!valid || busy || !image) return;
     if (mode === "plain") {
       // No ticket: just a title and an optional first message (empty ⇒ no auto-send).
-      onClone({
+      onClone(image, {
         plain: { title: title.trim(), message: message.trim() },
         claudeAccount: account,
         preset: preset || undefined,
@@ -120,14 +130,14 @@ export function CloneModal({
     if (claudeInstructions.trim())
       extra.claudeInstructions = claudeInstructions.trim();
     if (mode === "existing")
-      onClone({
+      onClone(image, {
         ticket: ticket.trim(),
         ...extra,
         claudeAccount: account,
         preset: preset || undefined, // "" ⇒ auto-select by ticket labels
       });
     else
-      onClone({
+      onClone(image, {
         create: { team: team.trim().toLowerCase(), title: title.trim(), description },
         ...extra,
         claudeAccount: account,
@@ -161,9 +171,17 @@ export function CloneModal({
           if (e.key === "Escape") onClose();
         }}
       >
-        <h3 className="text-sm font-semibold text-slate-900">
-          Clone <span className="text-emerald-700">{source}</span>
-        </h3>
+        <h3 className="text-sm font-semibold text-slate-900">New clone</h3>
+
+        <div className="mt-3 text-xs font-medium text-slate-500">
+          Source image
+          <ImagePicker
+            images={images}
+            loading={imagesLoading}
+            value={image}
+            onChange={setImage}
+          />
+        </div>
 
         <div className="mt-3 flex gap-0.5 rounded-md bg-slate-100 p-0.5 text-xs font-medium">
           {tab("existing", "Existing ticket")}

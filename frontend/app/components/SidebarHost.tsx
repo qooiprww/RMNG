@@ -64,13 +64,10 @@ export interface SidebarHostProps {
   /** A running operation targeting this host (delete, or a clone finishing its
    *  post-add `wait-swap` step), if any. */
   op?: Operation;
-  /** Template hosts are not deletable; they get a clone button instead. */
-  isTemplate: boolean;
-  /** Disable the clone button while a clone is already running. */
-  cloneBusy: boolean;
   onSelect: () => void;
   onDelete: () => void;
-  onClone: () => void;
+  /** Commit this managed clone to a new clone-source image. */
+  onCommit: () => void;
   /** Hot-swap this clone's clone-daemon + agent-wrapper binaries (no reprovision). */
   onRedeploy: () => void;
   /** Change this clone's Claude account/group. */
@@ -90,7 +87,7 @@ function GripIcon() {
   );
 }
 
-function CloneIcon() {
+function CameraIcon() {
   return (
     <svg
       width="13"
@@ -102,8 +99,8 @@ function CloneIcon() {
       strokeLinejoin="round"
       aria-hidden
     >
-      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
-      <path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5" />
+      <path d="M2 5.5A1.5 1.5 0 0 1 3.5 4h1l.9-1.2A1 1 0 0 1 6.2 2.4h3.6a1 1 0 0 1 .8.4L11.5 4h1A1.5 1.5 0 0 1 14 5.5v6A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z" />
+      <circle cx="8" cy="8.2" r="2.3" />
     </svg>
   );
 }
@@ -150,15 +147,16 @@ export function SidebarHost({
   host,
   selected,
   op,
-  isTemplate,
-  cloneBusy,
   onSelect,
   onDelete,
-  onClone,
+  onCommit,
   onRedeploy,
   onChangeAccount,
 }: SidebarHostProps) {
   const busy = op?.status === "running";
+  // Managed clones (backed by a live container) get the commit / redeploy / account
+  // actions; plain unmanaged rows only get delete.
+  const managed = host.container != null;
   const status = effectiveStatus(host);
   const claudeSel = claudeSelection(host);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
@@ -268,8 +266,21 @@ export function SidebarHost({
         ) : null}
       </div>
 
-      {host.ctid != null ? (
+      {managed ? (
         <>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onCommit();
+            }}
+            disabled={busy}
+            aria-label={`commit ${host.id} to an image`}
+            title="commit to a clone-source image"
+            className="rounded p-1 text-slate-400 opacity-0 hover:bg-emerald-50 hover:text-emerald-600 group-hover:opacity-100 disabled:opacity-0"
+          >
+            <CameraIcon />
+          </button>
           <button
             type="button"
             onClick={(e) => {
@@ -299,34 +310,20 @@ export function SidebarHost({
         </>
       ) : null}
 
-      {isTemplate ? (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onClone();
-          }}
-          disabled={cloneBusy}
-          aria-label={`clone ${host.id}`}
-          title="clone"
-          className="rounded p-1 text-slate-400 hover:bg-emerald-50 hover:text-emerald-600 disabled:opacity-30"
-        >
-          <CloneIcon />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          disabled={busy}
-          aria-label={`delete ${host.id}`}
-          className="rounded px-1 text-base leading-none text-slate-400 opacity-0 hover:text-red-600 group-hover:opacity-100 disabled:opacity-0"
-        >
-          ×
-        </button>
-      )}
+      {/* Every host is deletable (managed clones destroy the container; plain rows
+          just unregister). */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDelete();
+        }}
+        disabled={busy}
+        aria-label={`delete ${host.id}`}
+        className="rounded px-1 text-base leading-none text-slate-400 opacity-0 hover:text-red-600 group-hover:opacity-100 disabled:opacity-0"
+      >
+        ×
+      </button>
     </div>
   );
 }

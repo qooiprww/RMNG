@@ -23,7 +23,7 @@ export function ImportAccountModal({
   onImported: (email: string) => void;
 }) {
   // Only managed containers (clones) can be imported from.
-  const clones = hosts.filter((h) => h.ctid != null);
+  const clones = hosts.filter((h) => h.container != null);
   const [hostId, setHostId] = useState(() => clones[0]?.id ?? "");
   const [account, setAccount] = useState<Account | null>(null);
   const [checking, setChecking] = useState(false);

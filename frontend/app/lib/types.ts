@@ -3,7 +3,7 @@
 // `ControlState` is a superset of the legacy Rust `ControlState`
 // (`{selected, hosts, monitors}`). The native RDP client deserializes the SSE
 // payload as that Rust struct, and serde ignores unknown fields — so the extra
-// `operations` field (and the per-host `ctid`/`source` extras) ride along
+// `operations` field (and the per-host `container`/`source` extras) ride along
 // invisibly. In-progress clones are kept OUT of `hosts` until they are fully
 // provisioned, so the client never tries to connect to a half-built container.
 
@@ -13,7 +13,7 @@ export interface MonitorSpec {
 }
 
 export interface Host {
-  /** Stable id; equals the Proxmox container hostname for cloneable hosts. */
+  /** Stable id; equals the Docker container name for cloneable hosts. */
   id: string;
   /** RDP server hostname or IP. */
   host: string;
@@ -26,9 +26,15 @@ export interface Host {
   gdm_password?: string;
 
   // --- server-only extras (ignored by the Rust client) ---
-  /** Proxmox container id, when this host is a managed container. */
-  ctid?: number;
-  /** Id of the host this one was cloned from. */
+  /**
+   * Docker container id (full 64-hex) of the managed clone backing this host;
+   * the container *name* equals the host id for `docker ps` readability. Present
+   * (`!= null`) marks a managed clone; absent/null is a plain unmanaged row
+   * (deletable in the UI). Old `state.json` rows carrying the legacy `ctid` load
+   * with this unset — serde drops the stale key.
+   */
+  container?: string;
+  /** The clone-source image reference this host was cloned from (`rmng/template:<name>`). */
   source?: string;
   /**
    * Email of the Claude account assigned to this host at clone time (its
@@ -83,15 +89,17 @@ export interface Host {
   unread?: boolean;
 }
 
-export type OperationKind = "clone" | "delete";
+export type OperationKind = "clone" | "delete" | "bootstrap" | "commit";
 export type OperationStatus = "running" | "done" | "error";
 
 export interface Operation {
   id: string;
   kind: OperationKind;
-  /** Host id being created (clone) or removed (delete). */
+  /**
+   * What the op acts on: host id (clone/delete) or image name (bootstrap/commit).
+   */
   target: string;
-  /** Clone source id (clone only). */
+  /** Clone source image reference (clone), or source host id (commit). */
   source?: string;
   status: OperationStatus;
   /** Current step key (maps to a coarse percentage in the UI). */
@@ -101,7 +109,8 @@ export interface Operation {
   message: string;
   /** Rolling log lines for the operation. */
   log: string[];
-  ctid?: number;
+  /** Docker container id of the clone this op created/targets, once known. */
+  container?: string;
   startedAt: number;
   finishedAt?: number;
 }
@@ -159,8 +168,6 @@ export interface ControlState {
   monitors: MonitorSpec[];
   hosts: Host[];
   operations: Operation[];
-  /** Host ids that are templates: not deletable; cloned instead. */
-  templates: string[];
   /** Per-Claude-account usage view (no tokens). Refreshed by the usage poller. */
   claudeAccounts: ClaudeUsage[];
 }
@@ -171,7 +178,6 @@ export function emptyState(): ControlState {
     monitors: [],
     hosts: [],
     operations: [],
-    templates: [],
     claudeAccounts: [],
   };
 }

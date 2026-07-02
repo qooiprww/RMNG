@@ -18,18 +18,22 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { ChangeAccountModal } from "~/components/ChangeAccountModal";
 import { ClaudeAccountsPanel } from "~/components/ClaudeAccountsPanel";
 import { CloneModal } from "~/components/CloneModal";
+import { CommitImageModal } from "~/components/CommitImageModal";
+import { ImagesSection } from "~/components/ImagesSection";
 import { ImportAccountModal } from "~/components/ImportAccountModal";
-import { NewTemplateModal } from "~/components/NewTemplateModal";
 import { OperationProgress } from "~/components/OperationProgress";
 import { SettingsPanel } from "~/components/SettingsPanel";
 import { SetupWizard } from "~/components/SetupWizard";
 import { SidebarHost } from "~/components/SidebarHost";
 import {
   activate,
-  bootstrapTemplate,
+  bootstrapBaseImage,
   cloneHost,
+  commitImage,
   deleteHost,
+  deleteImage,
   getConfig,
+  listImages,
   redeployClone,
   refreshClaudeUsage,
   reorder,
@@ -37,6 +41,7 @@ import {
 } from "~/lib/api";
 import { type ControlState, type Host, emptyState } from "~/lib/types";
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
+import type { ImageInfo } from "~/lib/wire/ImageInfo";
 
 import type { Route } from "./+types/_index";
 
@@ -111,13 +116,31 @@ export default function Home({ loaderData }: Route.ComponentProps) {
 
 function Dashboard({ state }: { state: ControlState }) {
   const [error, setError] = useState<string | null>(null);
-  const [cloneSource, setCloneSource] = useState<string | null>(null);
+  const [cloneOpen, setCloneOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [newTemplateOpen, setNewTemplateOpen] = useState(false);
-  const [bootstrapping, setBootstrapping] = useState(false);
+  const [commitHost, setCommitHost] = useState<Host | null>(null);
+  const [committing, setCommitting] = useState(false);
   const [changeHost, setChangeHost] = useState<Host | null>(null);
   const [changing, setChanging] = useState(false);
+
+  // Clone-source images (from /api/images) — fetched on mount and refetched
+  // whenever a bootstrap/commit/delete op leaves `running` (the image set changed).
+  const [images, setImages] = useState<ImageInfo[]>([]);
+  const [imagesLoading, setImagesLoading] = useState(true);
+  const refreshImages = () => {
+    setImagesLoading(true);
+    listImages()
+      .then(setImages)
+      .catch(() => {
+        /* keep the last-known list on a transient error */
+      })
+      .finally(() => setImagesLoading(false));
+  };
+  useEffect(() => {
+    refreshImages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Responsive state. Below `lg` the sidebar is an off-canvas drawer; below `xl`
   // the notes editor and agent chat share the main pane via this tab toggle.
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -140,7 +163,22 @@ function Dashboard({ state }: { state: ControlState }) {
     return h ? [h] : [];
   });
   const selectedHost = state.selected ? hostsById.get(state.selected) ?? null : null;
-  const templates = new Set(state.templates);
+
+  // Refetch images when an image-mutating op (bootstrap/commit/delete) leaves the
+  // running set — that's when the image list changed. Keyed on the set of running
+  // op ids so it fires on each transition, not on every SSE frame.
+  const imgOpsRunning = state.operations
+    .filter(
+      (o) =>
+        o.status === "running" &&
+        (o.kind === "bootstrap" || o.kind === "commit" || o.kind === "delete"),
+    )
+    .map((o) => o.id)
+    .join(",");
+  useEffect(() => {
+    refreshImages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imgOpsRunning]);
 
   const run = (p: Promise<unknown>) =>
     p.then(() => setError(null)).catch((e: Error) => setError(e.message));
@@ -284,11 +322,12 @@ function Dashboard({ state }: { state: ControlState }) {
               </h2>
               <button
                 type="button"
-                onClick={() => setNewTemplateOpen(true)}
-                title="Provision a new template container (Ubuntu 26.04)"
-                className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600"
+                onClick={() => setCloneOpen(true)}
+                disabled={runningClone}
+                title="Create a new clone from a source image"
+                className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40"
               >
-                + Template
+                + Clone
               </button>
             </div>
             {orderedHosts.length === 0 ? (
@@ -312,16 +351,17 @@ function Dashboard({ state }: { state: ControlState }) {
                         host={host}
                         selected={state.selected === host.id}
                         op={opForHost(host.id)}
-                        isTemplate={templates.has(host.id)}
-                        cloneBusy={runningClone}
                         onSelect={() => {
                           run(activate(host.id));
                           setSidebarOpen(false);
                         }}
-                        onClone={() => setCloneSource(host.id)}
+                        onCommit={() => setCommitHost(host)}
                         onDelete={() => {
-                          if (confirm(`Delete ${host.id}? This destroys its container.`))
-                            run(deleteHost(host.id));
+                          const msg =
+                            host.container != null
+                              ? `Delete ${host.id}? This destroys its container.`
+                              : `Remove ${host.id}? This unregisters the host.`;
+                          if (confirm(msg)) run(deleteHost(host.id));
                         }}
                         onRedeploy={() => {
                           if (
@@ -339,6 +379,16 @@ function Dashboard({ state }: { state: ControlState }) {
               </DndContext>
             )}
           </div>
+
+          <ImagesSection
+            images={images}
+            loading={imagesLoading}
+            buildBusy={state.operations.some(
+              (o) => o.kind === "bootstrap" && o.status === "running",
+            )}
+            onBuild={(name) => run(bootstrapBaseImage(name))}
+            onDelete={(reference) => run(deleteImage(reference))}
+          />
 
           {state.operations.length > 0 ? (
             <div className="space-y-2">
@@ -365,7 +415,9 @@ function Dashboard({ state }: { state: ControlState }) {
                 </h2>
                 <span className="shrink-0 text-xs text-slate-400">
                   {selectedHost.host}:{selectedHost.port}
-                  {selectedHost.ctid != null ? ` · ct ${selectedHost.ctid}` : ""}
+                  {selectedHost.container
+                    ? ` · ${selectedHost.container.slice(0, 12)}`
+                    : ""}
                 </span>
               </div>
               <div className="flex min-h-0 flex-1">
@@ -412,17 +464,18 @@ function Dashboard({ state }: { state: ControlState }) {
         </main>
       </div>
 
-      {cloneSource ? (
+      {cloneOpen ? (
         <CloneModal
-          source={cloneSource}
+          images={images}
+          imagesLoading={imagesLoading}
           busy={runningClone}
           accounts={(state.claudeAccounts ?? []).filter(
             (a) => a.assignable && a.provider !== "codex",
           )}
-          onClose={() => setCloneSource(null)}
-          onClone={(payload) => {
-            run(cloneHost(cloneSource, payload));
-            setCloneSource(null);
+          onClose={() => setCloneOpen(false)}
+          onClone={(image, payload) => {
+            run(cloneHost(image, payload));
+            setCloneOpen(false);
           }}
         />
       ) : null}
@@ -436,19 +489,19 @@ function Dashboard({ state }: { state: ControlState }) {
         />
       ) : null}
 
-      {newTemplateOpen ? (
-        <NewTemplateModal
-          busy={bootstrapping}
-          existing={new Set(state.hosts.map((h) => h.id))}
-          onClose={() => setNewTemplateOpen(false)}
-          onCreate={(hostname, resources) => {
-            setBootstrapping(true);
-            bootstrapTemplate(hostname, resources)
+      {commitHost ? (
+        <CommitImageModal
+          hostId={commitHost.id}
+          busy={committing}
+          onClose={() => setCommitHost(null)}
+          onCommit={(name) => {
+            setCommitting(true);
+            commitImage(commitHost.id, name)
               .then(() => setError(null))
               .catch((e: Error) => setError(e.message))
               .finally(() => {
-                setBootstrapping(false);
-                setNewTemplateOpen(false);
+                setCommitting(false);
+                setCommitHost(null);
               });
           }}
         />
