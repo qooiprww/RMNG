@@ -160,6 +160,10 @@ impl PointerLock {
                 "macOS pointer lock: CGAssociateMouseAndMouseCursorPosition(false) failed \
                  (error {cg_err}); pointer lock NOT engaged"
             );
+            if let Some(mon) = monitor.as_ref() {
+                // SAFETY: mon is the value returned by addLocalMonitor…; correct type.
+                unsafe { NSEvent::removeMonitor(mon) };
+            }
             NSCursor::unhide();
             return;
         }
