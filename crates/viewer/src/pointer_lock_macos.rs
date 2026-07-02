@@ -82,8 +82,8 @@ impl PointerLock {
 
     /// Freeze the cursor and start capturing relative mouse deltas.
     ///
-    /// # Panics (debug)
-    /// Call sites are GTK signal handlers — always the main thread.
+    /// Must be called on the main thread (the `NSEvent` monitor requires it).
+    /// Call sites are GTK signal handlers, which always run on the main thread.
     pub fn engage(&self, _surface: &gdk::Surface) {
         if self.engaged.get() {
             return;
