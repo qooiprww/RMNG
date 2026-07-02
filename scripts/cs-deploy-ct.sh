@@ -4,9 +4,12 @@
 # unit, and generates the orchestration SSH key. The control-server binary is
 # already at /usr/local/bin/rmng-control-server (copied from the build CT beforehand).
 #
-#   cs-deploy-ct.sh <proxmox-ssh-target-from-ct>
+#   cs-deploy-ct.sh <proxmox-ssh-target-from-ct> [sock-dir] [storage] [bridge]
 set -euo pipefail
-PROXMOX_FROM_CT="${1:?usage: cs-deploy-ct.sh <proxmox-ssh-target>}"
+PROXMOX_FROM_CT="${1:?usage: cs-deploy-ct.sh <proxmox-ssh-target> [sock-dir] [storage] [bridge]}"
+SOCK_DIR="${2:-/srv/rmng-sock}"
+STORAGE="${3:-local-lvm}"
+BRIDGE="${4:-vmbr0}"
 export DEBIAN_FRONTEND=noninteractive
 
 echo "[deploy-ct] installing runtime deps (no dev toolchain)" >&2
@@ -20,13 +23,15 @@ apt-get install -y -qq \
   openssh-client sshfs ca-certificates >&2
 
 echo "[deploy-ct] config + ssh key + unit" >&2
-mkdir -p /var/lib/rmng /srv/rmng-sock
-# Minimal config: just the Proxmox SSH target so orchestration works out of the box.
-# `setupComplete: false` forces the first-run setup wizard even though ssh is prefilled;
-# storage/bridge/dataDir and the rest are entered there. Linear/Claude/subnet are entered
-# later in the web UI; Claude accounts are imported from a clone.
+mkdir -p /var/lib/rmng "$SOCK_DIR"
+# Minimal config: Proxmox SSH target + the one-time infra settings (storage, bridge,
+# clone socket) PREFILLED from the provisioning flags so the wizard shows values that
+# match the CT that was actually created. `setupComplete: false` still forces the
+# first-run wizard (it latches setupComplete + locks these one-time fields on submit);
+# dataDir and the rest are confirmed there. Linear/Claude/subnet are entered later in
+# the web UI; Claude accounts are imported from a clone.
 cat > /var/lib/rmng/config.json <<CFG
-{ "proxmox": { "ssh": "$PROXMOX_FROM_CT" }, "setupComplete": false }
+{ "proxmox": { "ssh": "$PROXMOX_FROM_CT", "storage": "$STORAGE", "bridge": "$BRIDGE" }, "cloneSocket": "$SOCK_DIR/clones.sock", "setupComplete": false }
 CFG
 chmod 600 /var/lib/rmng/config.json
 

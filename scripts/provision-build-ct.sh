@@ -9,8 +9,18 @@
 # Think "staging vs production": same runtime (both run cs-deploy-ct.sh), and the build
 # CT additionally carries the toolchain so you can rebuild + restart in place.
 #
-#   ./provision-build-ct.sh <proxmox-ssh-target> [hostname]
+#   ./provision-build-ct.sh [flags] <proxmox-ssh-target> [hostname]
 #   e.g. ./provision-build-ct.sh root@10.0.0.100 rmng-build
+#
+# Flags (all optional; put before the positionals):
+#   --storage <name>          rootfs storage             (default local-lvm)
+#   --bridge <name>           network bridge             (default vmbr0)
+#   --template <file>         CT template                (default ubuntu-26.04-…)
+#   --cores <n>               CPU cores                  (default 8)
+#   --memory <mb>             RAM in MiB                 (default 12288)
+#   --rootfs-gb <gb>          rootfs size in GiB         (default 40)
+#   --sock-dir <path>         host clone-socket dir      (default /srv/rmng-sock)
+#   --proxmox-from-ct <tgt>   ssh target the CT uses     (default root@<node>)
 #
 # Output: the CT's id + ip; binary at /usr/local/bin/rmng-control-server, dashboard on
 # :9000. The lean production deploy CT is a separate provision-deploy-ct.sh run.
@@ -18,18 +28,41 @@
 # NOTE: real provisioning + a ~10-min in-CT build; operator-supervised on first run.
 set -euo pipefail
 
-PROXMOX="${1:?usage: provision-build-ct.sh <proxmox-ssh-target> [hostname]}"
-HOSTNAME="${2:-rmng-build}"
-STORAGE="${RMNG_STORAGE:-local-lvm}"
-BRIDGE="${RMNG_BRIDGE:-vmbr0}"
-TEMPLATE="${RMNG_TEMPLATE:-ubuntu-26.04-standard_26.04-1_amd64.tar.zst}"
+usage(){ sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+STORAGE="local-lvm"
+BRIDGE="vmbr0"
+TEMPLATE="ubuntu-26.04-standard_26.04-1_amd64.tar.zst"
 # Build CT compiles the whole workspace + runs the control-server → roomy.
-CORES="${RMNG_CORES:-8}"
-MEMORY="${RMNG_MEMORY:-12288}"
-ROOTFS_GB="${RMNG_ROOTFS_GB:-40}"
-SOCK_HOST_DIR="${RMNG_SOCK_DIR:-/srv/rmng-sock}"   # host dir bind-mounted (clone media socket)
-# SSH target the control-server uses to reach the node from inside the CT (for `pct`).
-PROXMOX_FROM_CT="${RMNG_PROXMOX_FROM_CT:-root@${PROXMOX#*@}}"
+CORES="8"
+MEMORY="12288"
+ROOTFS_GB="40"
+SOCK_HOST_DIR="/srv/rmng-sock"   # host dir bind-mounted (clone media socket)
+PROXMOX_FROM_CT=""               # SSH target the control-server uses from inside the CT (default root@<node>)
+
+POS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --storage)         STORAGE="$2"; shift 2;;
+    --bridge)          BRIDGE="$2"; shift 2;;
+    --template)        TEMPLATE="$2"; shift 2;;
+    --cores)           CORES="$2"; shift 2;;
+    --memory)          MEMORY="$2"; shift 2;;
+    --rootfs-gb)       ROOTFS_GB="$2"; shift 2;;
+    --sock-dir)        SOCK_HOST_DIR="$2"; shift 2;;
+    --proxmox-from-ct) PROXMOX_FROM_CT="$2"; shift 2;;
+    -h|--help)         usage;;
+    --) shift; while [[ $# -gt 0 ]]; do POS+=("$1"); shift; done;;
+    -*) echo "unknown flag: $1" >&2; usage;;
+    *)  POS+=("$1"); shift;;
+  esac
+done
+set -- "${POS[@]:-}"
+
+[[ -n "${1:-}" ]] || usage
+PROXMOX="$1"
+HOSTNAME="${2:-rmng-build}"
+: "${PROXMOX_FROM_CT:=root@${PROXMOX#*@}}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # the RMNG project root
 say(){ printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -109,7 +142,7 @@ rm -f /tmp/rmng-src.tar.gz
 
 prog "configuring as staging control-server (cs-deploy-ct.sh)"
 pct push "$ID" /tmp/cs-deploy-ct.sh /root/cs-deploy-ct.sh >&2
-pct exec "$ID" -- bash /root/cs-deploy-ct.sh "$PROXMOX_FROM_CT" >&2
+pct exec "$ID" -- bash /root/cs-deploy-ct.sh "$PROXMOX_FROM_CT" "$SOCK_HOST_DIR" "$STORAGE" "$BRIDGE" >&2
 rm -f /tmp/cs-deploy-ct.sh
 
 prog "authorizing the control-server's orchestration key on the node"
