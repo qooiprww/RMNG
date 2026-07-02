@@ -189,7 +189,8 @@ per bootstrap in the "New template" modal (`POST /api/template/bootstrap`).
 **control-server:** reads **no `RMNG_*` env vars** — all config is `./config.json` in the
 working directory (the systemd unit sets `WorkingDirectory=/var/lib/rmng`). The clone
 socket, disk-frontend path, and chroma are the `cloneSocket` / `staticDir` / `chroma`
-config fields (each restart-required). Only `RUST_LOG` (`info,tower_http=warn`) is read.
+config fields (restart-required, along with the four listen ports). Only `RUST_LOG`
+(`info,tower_http=warn`) is read.
 
 **clone-daemon:** `RMNG_SOCKET` (media socket; **absent → capture self-test mode**),
 `RMNG_CLONE_ID` (id; default hostname), `RMNG_MONITORS` (layout CSV, below),

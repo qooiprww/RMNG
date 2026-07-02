@@ -180,7 +180,8 @@ verbatim. See [PROTOCOL.md](PROTOCOL.md#config-schema) for the schema.
 ### `PUT /api/config` (partial merge) → `{ config: AppConfigRedacted, restartRequired }`
 Deep-merge a partial config over the stored one, persist to disk at `0600`, apply live.
 Returns the redacted config plus `restartRequired: boolean` — set when a restart-required
-field changed (`staticDir`, `cloneSocket`, `chroma`) so the UI can prompt for a restart.
+field changed (the four listen ports, `cloneSocket`, `staticDir`, `chroma`) so the UI can
+prompt for a restart.
 Secret-merge rules: an **empty string keeps** the stored secret; a non-empty string replaces
 it; `presets` rows merge by name (blank `linearKey` keeps the stored one). One-time fields
 (`dataDir`, `proxmox.storage`, `proxmox.bridge`) are locked once `setupComplete` latches.

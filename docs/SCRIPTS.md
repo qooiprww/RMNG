@@ -60,8 +60,9 @@ node. Env: same `RMNG_*` sizing (defaults 4 cores / 4 GB / 12 GB), `RMNG_SOCK_DI
 (`/srv/rmng-sock`), `RMNG_PROXMOX_FROM_CT`. Prints `RESULT <ctid> <ip>`; dashboard at `:9000`.
 
 ### `cs-deploy-ct.sh <proxmox-ssh-from-ct>`
-Runs inside the deploy CT. Installs runtime deps, writes a minimal `config.json` (just the
-Proxmox SSH target), generates the `~/.ssh/id_ed25519` orchestration key, and installs +
+Runs inside the deploy CT. Installs runtime deps, writes a minimal `config.json` (the
+Proxmox SSH target plus `setupComplete: false`), generates the `~/.ssh/id_ed25519`
+orchestration key, and installs +
 starts the `control-server` systemd unit.
 
 ---
