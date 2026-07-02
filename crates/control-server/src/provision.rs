@@ -493,22 +493,22 @@ async fn bootstrap_after_create(
 ) -> Result<()> {
     let docker = &app.docker;
 
-    // Push the provision script + the embedded binaries into the build container. Match
+    // Push the provision script + the payload binaries into the build container. Match
     // `provision-clone.sh`'s expected paths: /root/rmng-clone-daemon, /root/agent-wrapper,
-    // /root/gnome-shell-patched.deb. Skip-missing WARN behavior (a clean checkout may lack
-    // the embedded assets), same as the old `stage_binary`.
+    // /root/gnome-shell-patched.deb. Skip-missing WARN behavior (a dev checkout may lack
+    // staged payloads), same as the old `stage_binary`.
     on_progress("inject", "pushing provision assets into the build container");
     let mut entries: Vec<TarEntry> = Vec::new();
-    for (embed_name, dest) in [
+    for (payload_name, dest) in [
         ("clone-daemon", "root/rmng-clone-daemon"),
         ("agent-wrapper", "root/agent-wrapper"),
         ("gnome-shell-deb", "root/gnome-shell-patched.deb"),
     ] {
-        match crate::embed::embedded_binary(embed_name) {
+        match crate::assets::payload(payload_name) {
             Some(bytes) => {
                 entries.push(TarEntry { path: dest.into(), data: bytes, mode: 0o755, uid: 0, gid: 0 })
             }
-            None => tracing::warn!("{embed_name} not embedded; skipping (provision falls back)"),
+            None => tracing::warn!("{payload_name} payload missing; skipping (provision falls back)"),
         }
     }
     if !entries.is_empty() {
@@ -727,10 +727,10 @@ const REDEPLOY_UNITS: &[(&str, &str)] = &[
 /// Hot-swap a running clone's `clone-daemon` (+ `agent-wrapper` unless `daemon_only`)
 /// binaries WITHOUT reprovisioning. Per unit: `systemctl --user stop` (exec'd as the clone
 /// user with its `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` — linger guarantees the user
-/// manager is up) → `upload_tar` the embedded binary to **`/opt/rmng/bin/<name>`** (the units
+/// manager is up) → `upload_tar` the payload binary to **`/opt/rmng/bin/<name>`** (the units
 /// exec from there; the old `redeploy.sh` pushed to `$HOME`, a latent path bug this fixes) →
 /// `reset-failed` + `start`. No username arg — the clone user (`CLONE_USER`) is compiled in
-/// (fixes mcp.rs's stray `"pega"`). Skips a unit whose binary isn't embedded (WARN).
+/// (fixes mcp.rs's stray `"pega"`). Skips a unit whose payload is missing (WARN).
 pub async fn redeploy_clone(
     app: &App,
     container: &str,
@@ -746,18 +746,18 @@ pub async fn redeploy_clone(
         bail!("could not resolve uid of '{CLONE_USER}' in {container}: {}", uid_out.trim());
     }
 
-    for (embed_name, unit) in REDEPLOY_UNITS {
-        if daemon_only && *embed_name == "agent-wrapper" {
+    for (payload_name, unit) in REDEPLOY_UNITS {
+        if daemon_only && *payload_name == "agent-wrapper" {
             continue;
         }
-        let Some(bytes) = crate::embed::embedded_binary(embed_name) else {
-            tracing::warn!("redeploy: {embed_name} not embedded; skipping");
-            on_progress("skip", &format!("{embed_name} not embedded; skipped"));
+        let Some(bytes) = crate::assets::payload(payload_name) else {
+            tracing::warn!("redeploy: {payload_name} payload missing; skipping");
+            on_progress("skip", &format!("{payload_name} payload missing; skipped"));
             continue;
         };
 
         // The on-disk binary name in /opt/rmng/bin (provision-clone.sh installs these names).
-        let bin_name = match *embed_name {
+        let bin_name = match *payload_name {
             "clone-daemon" => "rmng-clone-daemon",
             other => other,
         };

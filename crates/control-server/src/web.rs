@@ -10,37 +10,30 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Multipart, Path as AxPath, State},
-    http::{StatusCode, Uri, header},
+    http::{StatusCode, header},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures::stream::{Stream, StreamExt};
-use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-/// The built frontend (`bun run build` → `frontend/build/client`), embedded into
-/// the binary so the server is a single self-contained artifact. `build.rs`
-/// guarantees the folder exists (placeholder if the frontend wasn't built).
-#[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/../../frontend/build/client"]
-struct Frontend;
-
-/// Serve an embedded asset; SPA fallback to `index.html` for unknown paths.
-async fn static_handler(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
-    if let Some(f) = Frontend::get(path) {
-        return ([(header::CONTENT_TYPE, f.metadata.mimetype())], f.data.into_owned()).into_response();
-    }
-    match Frontend::get("index.html") {
-        Some(f) => ([(header::CONTENT_TYPE, "text/html")], f.data.into_owned()).into_response(),
-        None => (StatusCode::NOT_FOUND, "frontend not embedded").into_response(),
-    }
+/// 404 hint when no frontend dir resolves anywhere (image install missing AND no dev
+/// build) — the API stays up so this only ever surfaces in a broken/dev environment.
+async fn missing_frontend() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "frontend not installed: expected {}/static (image) or frontend/build/client \
+             (dev; run `bun run build` in frontend/)",
+            crate::assets::INSTALL_DIR
+        ),
+    )
+        .into_response()
 }
 use wire::{AppConfigRedacted, ConfigPutResponse, ControlState, Operation};
 
@@ -80,19 +73,31 @@ pub fn router(app: App) -> Router {
         .route("/api/chat/:id/events", get(chat_events))
         .route("/api/chat/:id/abort", post(chat_abort));
 
-    // Frontend: embedded by default (self-contained binary). A non-empty
-    // `static_dir` serves from disk instead, for dev hot-reload without a rebuild.
-    // The router is built once at startup, so `static_dir` is restart-required by
-    // construction — no live re-read needed.
-    let dir = app.config().static_dir;
-    let routes = if !dir.is_empty() && Path::new(&dir).is_dir() {
-        let index = Path::new(&dir).join("index.html");
-        routes.fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(index)))
+    // Frontend from the filesystem: a non-empty `static_dir` overrides (dev hot-reload
+    // without a rebuild); otherwise the assets search path resolves it (the image's
+    // /usr/local/share/rmng/static, else the repo dev build). The router is built once
+    // at startup, so `static_dir` is restart-required by construction.
+    let cfg_dir = app.config().static_dir;
+    let dir = if !cfg_dir.is_empty() && Path::new(&cfg_dir).is_dir() {
+        Some(std::path::PathBuf::from(&cfg_dir))
     } else {
-        if !dir.is_empty() {
-            tracing::warn!("static_dir '{dir}' is not a directory; serving the embedded frontend");
+        if !cfg_dir.is_empty() {
+            tracing::warn!("static_dir '{cfg_dir}' is not a directory; using the installed frontend");
         }
-        routes.fallback(static_handler)
+        crate::assets::static_dir()
+    };
+    let routes = match dir {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            routes.fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(index)))
+        }
+        None => {
+            tracing::warn!(
+                "no frontend found ({}/static or the dev build) — web UI disabled, API still up",
+                crate::assets::INSTALL_DIR
+            );
+            routes.fallback(missing_frontend)
+        }
     };
 
     routes.layer(TraceLayer::new_for_http()).with_state(app)

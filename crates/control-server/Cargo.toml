@@ -30,12 +30,9 @@ tower.workspace = true
 tower-http.workspace = true
 notify.workspace = true
 reqwest.workspace = true
-# Decompress the gzipped embedded binaries (clone-daemon, agent-wrapper).
+# Decompress the gzipped payload binaries (clone-daemon, agent-wrapper, gnome-shell
+# deb) that assets.rs reads from /usr/local/share/rmng (image) or embedded-bin/ (dev).
 flate2 = "1"
-# Embed the built frontend (frontend/build/client) into the binary → self-contained.
-# debug-embed: actually embed in debug too (default only embeds in release), so a
-# copied binary is self-contained regardless of profile.
-rust-embed = { version = "8", features = ["mime-guess", "interpolate-folder-path", "debug-embed"] }
 # Docker orchestration substrate (src/docker.rs): the unix-socket daemon client that
 # replaced the retired SSH/pct Proxmox path. `tar` builds the in-memory archives
 # `upload_tar` PUTs into containers.

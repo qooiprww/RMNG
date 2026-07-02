@@ -5,11 +5,11 @@
 //! as explicit "not yet" log lines until Phases 4/6 fill them in.
 
 mod app;
+mod assets;
 mod chat;
 mod claude;
 mod config;
 mod docker;
-mod embed;
 mod files;
 mod jobs;
 mod linear;

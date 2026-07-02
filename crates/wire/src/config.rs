@@ -217,7 +217,8 @@ pub struct AppConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
     /// Built frontend bundle directory served on the web port. Empty (the default) serves
-    /// the frontend embedded in the binary; a non-empty path serves the bundle from disk.
+    /// the installed frontend (`/usr/local/share/rmng/static` in the image, else the repo
+    /// dev build); a non-empty path overrides it (dev hot-reload without a rebuild).
     /// Restart-required (the static-file service is wired at startup).
     #[serde(default = "default_static_dir")]
     pub static_dir: String,
@@ -423,7 +424,7 @@ mod tests {
         assert_eq!(c.listen.video, 9001);
         assert_eq!(c.agent_port, 4096);
         // New one-time / restart-required fields carry their documented defaults.
-        assert_eq!(c.static_dir, ""); // empty = embedded frontend
+        assert_eq!(c.static_dir, ""); // empty = installed/default frontend dir
         assert_eq!(c.clone_socket, "/srv/rmng-sock/clones.sock");
         assert!(!c.setup_complete); // wizard latches this true
         assert_eq!(c.docker.socket, "/var/run/docker.sock");

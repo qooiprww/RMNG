@@ -1,3 +1,5 @@
-# Build artifacts staged here by cs-build-ct.sh before the control-server build:
-#   clone-daemon.gz, agent-wrapper.gz  (embedded into the binary via rust-embed)
-*.gz
+# Dev payload dir: stage clone-daemon.gz / agent-wrapper.gz / gnome-shell-deb.gz here
+# for `cargo run -p control-server` (assets.rs reads this dir when the image install
+# path /usr/local/share/rmng doesn't exist). The Docker image does NOT use this dir.
+*
+!.gitignore

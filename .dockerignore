@@ -1,0 +1,39 @@
+# Build context excludes. Root-anchored (leading `/`) where a path must survive at a
+# deeper level — notably `/scripts/` (repo-root scripts, retired) vs
+# `crates/control-server/scripts/` (guest scripts `include_str!`'d at compile time, MUST
+# be in context).
+#
+# NOT excluded, load-bearing:
+#   - gnome-patch/                     (the gnome-build stage compiles the patched shell)
+#   - crates/control-server/scripts/   (include_str!'d guest scripts)
+
+# Rust build output (25G+; rebuilt in-stage with cache mounts)
+target/
+**/target/
+
+# JS deps + build outputs (reinstalled/rebuilt in the bun stage)
+node_modules/
+**/node_modules/
+frontend/build/
+
+# Gzipped embedded binaries — rebuilt in-stage before control-server compiles
+crates/control-server/embedded-bin/*.gz
+
+# VCS + tooling metadata
+.git/
+.gitignore
+.dockerignore
+
+# Docs / agent scaffolding — none of it is compiled or COPY'd
+docs/
+.superpowers/
+.claude/
+
+# Retired repo-root scripts (root-anchored so the CRATE-level
+# crates/control-server/scripts/ dir — include_str!'d — survives).
+/scripts/
+
+# Editor/OS cruft
+*.tmp.*
+*.swp
+.DS_Store
