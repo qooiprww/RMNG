@@ -79,6 +79,23 @@ pub fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Resolve a caller-supplied image — a repo-tag reference (`rmng/template:<name>`), a full
+/// `sha256:…` id, or a bare 64-hex id — to the **canonical** [`wire::ImageInfo`] `reference`
+/// of the matching clone-source image. `None` when nothing in the listed clone sources
+/// matches (i.e. the input isn't a labeled `rmng.image=1` image at all).
+///
+/// This is what keeps `Host.source` canonical regardless of the caller's input form: the
+/// in-use accounting (web.rs `fill_in_use_by`) and the images-delete 409 guard both compare
+/// `Host.source == ImageInfo.reference`, so a host created from an id form must still record
+/// the reference — otherwise its base image would show as unused and be deletable under
+/// live clones.
+pub fn resolve_reference(images: &[wire::ImageInfo], input: &str) -> Option<String> {
+    images
+        .iter()
+        .find(|i| i.reference == input || i.id == input || i.id.strip_prefix("sha256:") == Some(input))
+        .map(|i| i.reference.clone())
+}
+
 /// The clone→control-server + detector-inference env every clone needs, as
 /// `environment.d`-style `KEY=VALUE` [`EnvVar`]s. Points the detector's feedback + agent
 /// `set_state` MCP at THIS control-server and the detector's vision model at the configured
@@ -194,10 +211,12 @@ fn clone_pct(step: &str) -> Option<f64> {
 /// identity/preset/PATH files, and wait for its daemon to register.
 ///
 /// Steps (→ pct): `queued` 0, `allocate` 8, `create` 20, `inject` 35, `start` 55,
-/// `wait-ready` 75, `done` 100. Returns the new container id (`Host.container`) and its
-/// static IP (`Host.host`) on success. On any failure BEFORE readiness, a cleanup trap
-/// removes the created container + its per-clone dind volume so a retry isn't blocked by a
-/// stale same-named container (gotcha #7).
+/// `wait-ready` 75, `done` 100. Returns `(container_id, ip, reference)` on success — the new
+/// container id (`Host.container`), its static IP (`Host.host`), and the **canonical**
+/// image reference (`Host.source`; see [`resolve_reference`] — the caller may have passed an
+/// id form, but state must always record the reference for in-use accounting). On any
+/// failure BEFORE readiness, a cleanup trap removes the created container + its per-clone
+/// dind volume so a retry isn't blocked by a stale same-named container (gotcha #7).
 ///
 /// `image` must be a clone source (`rmng.image=1`); `env` is the resolved control + preset
 /// env (control URLs first so a preset can still override). One `upload_tar` injects: an
@@ -214,7 +233,7 @@ pub async fn clone_container(
     hostname: &str,
     env: &[EnvVar],
     mut on_progress: impl FnMut(&str, &str),
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     if !is_dns_label(hostname) {
         bail!("clone hostname must be a DNS label (lowercase letters, digits, hyphens)");
     }
@@ -225,18 +244,16 @@ pub async fn clone_container(
 
     // Validate the source is actually a clone-source image (label rmng.image=1) — not just
     // any image id. The image picker only offers labeled images, but a raw MCP/API caller
-    // could pass anything, so gate it here (matches by reference or id).
+    // could pass anything (reference, sha256: id, or bare id), so gate it here AND resolve
+    // whatever form was passed to the canonical reference — everything downstream
+    // (`Host.source`, in-use accounting, delete guards) keys on the reference.
     if !docker.image_exists(image).await? {
         bail!("source image '{image}' does not exist");
     }
-    let is_clone_source = docker
-        .list_rmng_images()
-        .await?
-        .iter()
-        .any(|i| i.reference == image || i.id == image || i.id.strip_prefix("sha256:") == Some(image));
-    if !is_clone_source {
+    let images = docker.list_rmng_images().await?;
+    let Some(reference) = resolve_reference(&images, image) else {
         bail!("image '{image}' is not a clone source (missing the `rmng.image=1` label)");
-    }
+    };
 
     // The rmng bridge is lazy; make sure it's up before allocating an IP on it.
     docker.ensure_network().await?;
@@ -249,12 +266,13 @@ pub async fn clone_container(
     let ip = docker.allocate_ip(&reserved).await?;
     on_progress("allocate", &format!("clone IP {ip}"));
 
-    // Create the container (name == host id). A stale same-named container 409s here — the
-    // daemon message is surfaced verbatim (gotcha #7).
+    // Create the container (name == host id) from the CANONICAL reference (equivalent to the
+    // caller's input — same image — but keeps `docker ps`'s Image column readable). A stale
+    // same-named container 409s here — the daemon message is surfaced verbatim (gotcha #7).
     on_progress("create", &format!("creating container {hostname} at {ip}"));
     let spec = CreateSpec {
         name: hostname.to_string(),
-        image: image.to_string(),
+        image: reference.clone(),
         ip: ip.clone(),
         hostname: hostname.to_string(),
         env: env.iter().filter(|v| !v.key.is_empty()).map(|v| (v.key.clone(), v.value.clone())).collect(),
@@ -271,7 +289,7 @@ pub async fn clone_container(
     // guard that removes the container + its dind volume on any early return.
     let result = clone_container_after_create(app, &container, hostname, env, &mut on_progress).await;
     match result {
-        Ok(()) => Ok((container, ip)),
+        Ok(()) => Ok((container, ip, reference)),
         Err(e) => {
             tracing::warn!("clone {hostname} failed after create; cleaning up: {e}");
             docker.remove_container(&container).await.ok();
@@ -797,20 +815,6 @@ async fn run_user_systemctl(app: &App, container: &str, uid: &str, args: &[&str]
 
 // --- monitors -------------------------------------------------------------------------
 
-/// Progress step → percentage for apply-monitors (coarse; the script itself streams `[ct]`
-/// lines that set the op message). Retained as provision's public step-table surface even
-/// though `apply_monitors` currently streams `[ct]` lines directly (web.rs's monitors-apply
-/// isn't an Operation, so it has no op-progress table to feed) — see `monitors_step_pct`.
-#[allow(dead_code)]
-fn monitors_pct(step: &str) -> Option<f64> {
-    Some(match step {
-        "queued" => 0.0,
-        "apply" => 50.0,
-        "done" => 100.0,
-        _ => return None,
-    })
-}
-
 /// Apply the configured monitor layout to a RUNNING clone without reprovisioning: streams
 /// [`APPLY_MONITORS_SCRIPT`] over `docker exec bash -s` as root with args `<user> <csv>`. Its
 /// `[ct]` lines flow to the progress callback (as `apply` steps).
@@ -870,8 +874,10 @@ pub async fn run_clone_op(app: &App, container: &str, op: &str, extra: &[&str]) 
 
 // --- op-log pct helpers (exposed for jobs.rs step tables) -----------------------------
 
-/// The clone/bootstrap/commit/delete/monitors step→pct tables, exposed so `jobs.rs` (Task 6)
-/// maps a streamed step key to the operation's coarse percentage without re-deriving it.
+/// The clone/bootstrap/commit/delete step→pct tables, exposed so `jobs.rs` maps a streamed
+/// step key to the operation's coarse percentage without re-deriving it. (Monitors-apply is
+/// intentionally NOT an Operation — web.rs streams its `[ct]` lines directly — so there is
+/// no monitors table here.)
 pub fn step_pct(kind: wire::OperationKind, step: &str) -> Option<f64> {
     match kind {
         wire::OperationKind::Clone => clone_pct(step),
@@ -879,14 +885,6 @@ pub fn step_pct(kind: wire::OperationKind, step: &str) -> Option<f64> {
         wire::OperationKind::Commit => commit_pct(step),
         wire::OperationKind::Delete => delete_pct(step),
     }
-}
-
-/// The apply-monitors step→pct table (not an `OperationKind`, so exposed separately). Kept
-/// as public surface for a future monitors-as-Operation flow; today web.rs applies monitors
-/// without an Operation (streaming `[ct]` lines directly), so nothing in-crate calls it yet.
-#[allow(dead_code)]
-pub fn monitors_step_pct(step: &str) -> Option<f64> {
-    monitors_pct(step)
 }
 
 /// Discover the shared clone-socket source directory to bind into a new clone at
@@ -930,6 +928,41 @@ mod tests {
         assert!(!is_dns_label("trail-"));
         assert!(!is_dns_label("has space"));
         assert!(!is_dns_label(""));
+    }
+
+    #[test]
+    fn resolve_reference_canonicalizes_every_input_form() {
+        const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let img = |reference: &str, hex: &str| wire::ImageInfo {
+            id: format!("sha256:{hex}"),
+            reference: reference.into(),
+            size_bytes: 0,
+            created_at: String::new(),
+            base: false,
+            created_from: None,
+            in_use_by: Vec::new(),
+        };
+        let images = vec![img("rmng/template:base", HEX_A), img("rmng/template:dev", HEX_B)];
+
+        // Repo-tag reference → itself.
+        assert_eq!(
+            resolve_reference(&images, "rmng/template:base").as_deref(),
+            Some("rmng/template:base")
+        );
+        // Full `sha256:` id → its reference.
+        assert_eq!(
+            resolve_reference(&images, &format!("sha256:{HEX_B}")).as_deref(),
+            Some("rmng/template:dev")
+        );
+        // Bare 64-hex id (prefix-stripped form) → its reference.
+        assert_eq!(resolve_reference(&images, HEX_A).as_deref(), Some("rmng/template:base"));
+        // No match (unknown reference, unknown id, empty) → None.
+        assert_eq!(resolve_reference(&images, "rmng/template:nope"), None);
+        assert_eq!(resolve_reference(&images, "sha256:cccc"), None);
+        assert_eq!(resolve_reference(&images, ""), None);
+        // Empty image list → None.
+        assert_eq!(resolve_reference(&[], "rmng/template:base"), None);
     }
 
     #[test]
@@ -1030,7 +1063,6 @@ mod tests {
         assert_eq!(step_pct(Delete, "stop"), Some(40.0));
         assert_eq!(step_pct(Delete, "remove"), Some(75.0));
 
-        assert_eq!(monitors_step_pct("apply"), Some(50.0));
         // Unknown step keys yield None (jobs.rs leaves the pct unchanged).
         assert_eq!(step_pct(Clone, "bogus"), None);
     }

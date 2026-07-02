@@ -204,7 +204,10 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // env first; the operator's chosen preset follows (so a preset key can still override).
     let mut env = control_env_vars(&app).await;
     env.extend(spec.env.iter().cloned());
-    let (container, ip) =
+    // `image_ref` is the CANONICAL reference of the image actually used (the caller may have
+    // passed an id form — MCP/raw API); `Host.source` must record the reference so the image
+    // shows as in-use (`fill_in_use_by`) and the images-delete 409 guard protects it.
+    let (container, ip, image_ref) =
         match clone_container(&app, &spec.source_image, &spec.new_hostname, &env, progress).await {
             Ok(v) => v,
             Err(e) => return fail_op(&app, &op_id, e.to_string()),
@@ -221,7 +224,7 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             username: "rmng".into(),
             password: "rmng".into(),
             container: Some(container.clone()),
-            source: Some(spec.source_image.clone()),
+            source: Some(image_ref.clone()),
             ..Default::default()
         };
         if let Some(m) = &spec.linear {
