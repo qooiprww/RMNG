@@ -6,7 +6,8 @@
 # needs only /dev/dri/renderD128 — already passed in the LXC config). Replaces the
 # old g-r-d/GDM handover + the computer-use virtual-monitor service.
 #
-#   provision-clone.sh <username> <password>   (clone-daemon pushed to /root/rmng-clone-daemon)
+#   provision-clone.sh <username> <password> <monitors> <clone_socket>
+#     (clone-daemon pushed to /root/rmng-clone-daemon)
 set -euo pipefail
 say(){ echo "    [ct] $*"; }
 USERNAME="${1:-rmng}"; PASSWORD="${2:-rmng}"
@@ -14,6 +15,9 @@ USERNAME="${1:-rmng}"; PASSWORD="${2:-rmng}"
 # RMNG_MONITORS env (one virtual monitor per entry). The headless dummy backend's mode
 # specs must offer each requested size, so derive them (unique sizes, colon-joined).
 MONITORS="${3:-}"
+# Media socket the clone-daemon connects to (config.cloneSocket, passed by bootstrap.sh) →
+# the clone-daemon unit's RMNG_SOCKET env. The host dir is bind-mounted at the same path.
+CLONE_SOCKET="${4:-/srv/rmng-sock/clones.sock}"
 if [ -n "$MONITORS" ]; then
   # Each entry is WxH+X+Y[*]; the dummy mode specs want just WxH (unique, colon-joined).
   MODE_SPECS="$(printf '%s' "$MONITORS" | tr ',' '\n' | sed -E 's/\+.*$//; s/\*$//' | awk 'NF && !seen[$0]++' | paste -sd: -)"
@@ -461,10 +465,11 @@ Wants=gnome-headless.service
 [Service]
 Type=simple
 Environment=WAYLAND_DISPLAY=wayland-0
-# Ship to the control-server's media socket — the shared host dir /srv/rmng-sock is
-# bind-mounted at the same path (see bootstrap.sh / the deploy CT mp0). Without this
-# the daemon falls back to standalone capture self-test (no connection to the server).
-Environment=RMNG_SOCKET=/srv/rmng-sock/clones.sock
+# Ship to the control-server's media socket (path from config cloneSocket, passed in as
+# \$CLONE_SOCKET) — its host dir is bind-mounted at the same path (see bootstrap.sh / the
+# deploy CT mp0). Without this the daemon falls back to standalone capture self-test (no
+# connection to the server).
+Environment=RMNG_SOCKET=$CLONE_SOCKET
 ${MONITORS:+Environment=RMNG_MONITORS=$MONITORS}
 ExecStart=$BINDIR/rmng-clone-daemon
 Restart=on-failure

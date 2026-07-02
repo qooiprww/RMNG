@@ -268,7 +268,7 @@ pub async fn bootstrap_template(
         BOOTSTRAP_SCRIPT,
         &[
             hostname, BASE_IMAGE, &cfg.proxmox.storage, &cfg.proxmox.bridge, &prov_b64, &cd_arg,
-            &aw_arg, &mons, &shell_arg, &cores, &mem, &disk,
+            &aw_arg, &mons, &shell_arg, &cores, &mem, &disk, &cfg.clone_socket,
         ],
         on_progress,
     )

@@ -194,6 +194,7 @@ mod tests {
         let mut base = AppConfig::default();
         base.setup_complete = true;
         base.data_dir = "data".into();
+        base.clone_socket = "/srv/rmng-sock/clones.sock".into();
         base.proxmox.storage = "local-lvm".into();
         base.proxmox.bridge = "vmbr0".into();
         base
@@ -206,6 +207,11 @@ mod tests {
         let e = merge_update(&base, serde_json::json!({ "dataDir": "other" })).unwrap_err();
         assert!(e.to_string().contains("dataDir"), "err: {e}");
         assert!(e.to_string().contains("first-run"), "err: {e}");
+        // cloneSocket
+        let e = merge_update(&base, serde_json::json!({ "cloneSocket": "/tmp/other.sock" }))
+            .unwrap_err();
+        assert!(e.to_string().contains("cloneSocket"), "err: {e}");
+        assert!(e.to_string().contains("first-run"), "err: {e}");
         // proxmox.storage
         let e = merge_update(&base, serde_json::json!({ "proxmox": { "storage": "fast-nvme" } }))
             .unwrap_err();
@@ -217,10 +223,11 @@ mod tests {
         // A no-op resend of the same values is fine (final value == base value).
         let ok = merge_update(
             &base,
-            serde_json::json!({ "dataDir": "data", "proxmox": { "storage": "local-lvm", "bridge": "vmbr0" } }),
+            serde_json::json!({ "dataDir": "data", "cloneSocket": "/srv/rmng-sock/clones.sock", "proxmox": { "storage": "local-lvm", "bridge": "vmbr0" } }),
         )
         .unwrap();
         assert_eq!(ok.data_dir, "data");
+        assert_eq!(ok.clone_socket, "/srv/rmng-sock/clones.sock");
         // Blank strings are unchanged (deep-merge protects them) — never an error.
         let ok = merge_update(
             &base,
@@ -238,11 +245,13 @@ mod tests {
             &base,
             serde_json::json!({
                 "dataDir": "elsewhere",
+                "cloneSocket": "/run/other/clones.sock",
                 "proxmox": { "storage": "fast-nvme", "bridge": "vmbr9" },
             }),
         )
         .unwrap();
         assert_eq!(merged.data_dir, "elsewhere");
+        assert_eq!(merged.clone_socket, "/run/other/clones.sock");
         assert_eq!(merged.proxmox.storage, "fast-nvme");
         assert_eq!(merged.proxmox.bridge, "vmbr9");
     }
@@ -388,6 +397,9 @@ fn enforce_categories(base: &AppConfig, merged: &AppConfig) -> Result<()> {
     if base.setup_complete {
         if merged.data_dir != base.data_dir {
             bail!("dataDir is a one-time setting (set during first-run setup) and cannot be changed after setup");
+        }
+        if merged.clone_socket != base.clone_socket {
+            bail!("cloneSocket is a one-time setting (set during first-run setup) and cannot be changed after setup");
         }
         if merged.proxmox.storage != base.proxmox.storage {
             bail!("proxmox.storage is a one-time setting (set during first-run setup) and cannot be changed after setup");

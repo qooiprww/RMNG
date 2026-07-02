@@ -204,7 +204,10 @@ pub struct AppConfig {
     #[serde(default = "default_static_dir")]
     pub static_dir: String,
     /// Unix socket the clone-daemons connect to (media plane over `SCM_RIGHTS`, not the
-    /// network). Restart-required (the socket is bound at startup).
+    /// network). **One-time**: baked into every CT's socket bind-mount and clone-daemon
+    /// unit (`RMNG_SOCKET`) at provision, so it can only be set during first-run setup
+    /// (changing it later wouldn't update already-provisioned CTs). Also restart-required
+    /// for pre-latch edits, since the server binds it at startup.
     #[serde(default = "default_clone_socket")]
     pub clone_socket: String,
     /// Latched `true` by the first-run setup wizard once setup is complete; gates the

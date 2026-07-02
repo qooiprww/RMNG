@@ -3,7 +3,8 @@
 # template/clone CT from a base image, end-to-end (the "from-zero" path, proven on
 # CT 132 rmng-build). Emits "P <step> <msg>" progress + "RESULT <ctid> <ip>".
 #
-#   bootstrap.sh <hostname> <template-vztmpl> <storage> <bridge> <prov_b64>
+#   bootstrap.sh <hostname> <template-vztmpl> <storage> <bridge> <prov_b64> \
+#     <cd_bin> <aw_bin> <monitors> <shell_deb> <cores> <memory_mb> <disk_gb> <clone_socket>
 # where prov_b64 = base64(provision-clone.sh), run inside the new CT.
 set -euo pipefail
 prog(){ echo "P $1 ${*:2}"; }
@@ -15,6 +16,7 @@ SHELL_DEB="${9:-}"  # node-side path to the patched gnome-shell .deb (shell-01 +
 CORES="${10:-16}"      # CT resources, chosen in the "New template" modal
 MEMORY_MB="${11:-32768}"
 DISK_GB="${12:-128}"
+CLONE_SOCKET="${13:-/srv/rmng-sock/clones.sock}"  # config.cloneSocket → clone-daemon RMNG_SOCKET (+ its host dir bind-mount)
 
 prog locate "ensuring base image $TEMPLATE"
 case "$TEMPLATE" in
@@ -41,9 +43,9 @@ pct create "$NEWID" "$TEMPLATE" \
 # unconfined profile, plus bind /dev/null over the kernel's apparmor-enabled param so
 # nested processes see it off, relaxed proc/sys auto-mounts, and a cleared mount hook +
 # the shared control-server media socket dir bind-mounted at the SAME path (NOT under
-# /run — the CT's tmpfs would shadow it). clone-daemon ships to <dir>/clones.sock.
+# /run — the CT's tmpfs would shadow it). clone-daemon ships to $CLONE_SOCKET.
 # Clones inherit this via clone.sh's config copy.
-SOCK_HOST_DIR="${RMNG_SOCK_DIR:-/srv/rmng-sock}"
+SOCK_HOST_DIR="$(dirname "$CLONE_SOCKET")"
 mkdir -p "$SOCK_HOST_DIR"; chmod 0777 "$SOCK_HOST_DIR"
 printf '%s\n' \
   'dev0: /dev/dri/renderD128,gid=993,mode=0666' \
@@ -82,7 +84,7 @@ if [ -n "$SHELL_DEB" ] && [ -f "$SHELL_DEB" ]; then
 fi
 printf '%s' "$PROV_B64" | base64 -d > "/tmp/prov-$NEWID.sh"
 pct push "$NEWID" "/tmp/prov-$NEWID.sh" /root/provision-clone.sh >&2
-pct exec "$NEWID" -- bash /root/provision-clone.sh rmng rmng "$MONITORS" >&2
+pct exec "$NEWID" -- bash /root/provision-clone.sh rmng rmng "$MONITORS" "$CLONE_SOCKET" >&2
 rm -f "/tmp/prov-$NEWID.sh"
 
 prog done "CT $NEWID ready at $IP"
