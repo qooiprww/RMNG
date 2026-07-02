@@ -56,6 +56,10 @@ mod pointer_lock {
     }
 }
 
+// Carbon kVK → Linux evdev translation table (macOS only).
+#[cfg(target_os = "macos")]
+mod kvk_evdev;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -1257,20 +1261,47 @@ fn install_keyboard(
                 release_all_input(&w, &state);
                 return glib::Propagation::Stop;
             }
-            // Physical key identity: evdev keycode = GTK hardware_keycode - 8 (so games
-            // that read raw keys — Minecraft/GLFW — get the right keys regardless of layout).
-            let keycode = code.saturating_sub(8);
-            state.pressed.borrow_mut().insert(keycode);
-            send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+            // Physical key identity → Linux evdev keycode sent on the wire.
+            // Linux/X11: GTK hardware_keycode = evdev + 8; subtract 8 to recover evdev.
+            // macOS: GTK hardware_keycode is Carbon kVK (0-127); translate via lookup table.
+            //        Skip the event (return Proceed) for sentineled / unmapped kVK codes.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let keycode = code.saturating_sub(8);
+                state.pressed.borrow_mut().insert(keycode);
+                send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let keycode = kvk_evdev::translate(code);
+                tracing::debug!("key press: hw={:#04x} evdev={}", code, keycode);
+                if keycode != 0 {
+                    state.pressed.borrow_mut().insert(keycode);
+                    send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+                }
+            }
             glib::Propagation::Proceed
         });
     }
     {
         let (w, state) = (writer.clone(), state.clone());
         key.connect_key_released(move |_c, _keyval, code, _s| {
-            let keycode = code.saturating_sub(8);
-            state.pressed.borrow_mut().remove(&keycode);
-            release_keycode(&w, keycode);
+            // Mirror the press-side translation so pressed/released are symmetric.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let keycode = code.saturating_sub(8);
+                state.pressed.borrow_mut().remove(&keycode);
+                release_keycode(&w, keycode);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let keycode = kvk_evdev::translate(code);
+                tracing::debug!("key release: hw={:#04x} evdev={}", code, keycode);
+                if keycode != 0 {
+                    state.pressed.borrow_mut().remove(&keycode);
+                    release_keycode(&w, keycode);
+                }
+            }
         });
     }
     window.add_controller(key);
