@@ -33,6 +33,22 @@ Set them via `pct set <id> --features nesting=1,keyctl=1` and edit the conf for 
 fleet you intend to run (clones default to 16 cores / 32 GiB each — tune
 `docker.cloneCpus` / `docker.cloneMemoryMb` in the wizard).
 
+## 1b. Raise the kernel keyring quotas on the Proxmox host
+
+In an unprivileged CT, **every** container's root maps to the same host uid, so all their
+session keyrings (one per `docker run`, incl. each clone's inner-Docker containers) share
+that uid's kernel quota. At the stock `kernel.keys.maxbytes=20000` a fleet dies around its
+6th-7th concurrent container with `unable to join session keyring: … disk quota exceeded`
+(found live in E2E). On the **Proxmox host**:
+
+```sh
+cat >> /etc/sysctl.d/99-rmng-keys.conf <<EOF
+kernel.keys.maxkeys = 20000
+kernel.keys.maxbytes = 2000000
+EOF
+sysctl --system
+```
+
 ## 2. Install Docker in the CT
 
 ```sh
