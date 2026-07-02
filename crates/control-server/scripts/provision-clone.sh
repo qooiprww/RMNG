@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
-# In-CT provisioning for a rmng clone/template (runs INSIDE the CT as root).
-# Codifies the recipe validated on CT 132 `rmng-build`: vanilla headless GNOME (NO
+# In-container provisioning for a rmng base image (runs INSIDE the build container as
+# root). The control-server streams this over `docker exec bash -s` (Task 3's
+# exec_script) into a privileged `sleep infinity` build container where systemd is NOT
+# running as PID 1 — so any `systemctl enable/mask/set-default` here are pure symlink
+# ops that require SYSTEMD_OFFLINE=1 (the Rust caller sets it, alongside
+# DEBIAN_FRONTEND=noninteractive); linger is a file-touch (no bus to reach loginctl).
+# Codifies the recipe validated on the `rmng-build` box: vanilla headless GNOME (NO
 # gdm3, NO gnome-remote-desktop, NO flatpak) + Mesa VA-API + the `clone-daemon`,
 # brought up by a `systemd --user` unit under linger (Mutter's headless backend
-# needs only /dev/dri/renderD128 — already passed in the LXC config). Replaces the
-# old g-r-d/GDM handover + the computer-use virtual-monitor service.
+# needs only /dev/dri/renderD128). Replaces the old g-r-d/GDM handover + the
+# computer-use virtual-monitor service.
 #
 #   provision-clone.sh <username> <password> <monitors> <clone_socket>
 #     (clone-daemon pushed to /root/rmng-clone-daemon)
 set -euo pipefail
 say(){ echo "    [ct] $*"; }
 USERNAME="${1:-rmng}"; PASSWORD="${2:-rmng}"
-# Monitor layout (CSV "WxH,WxH" from config.monitors via bootstrap.sh) → the clone-daemon
-# RMNG_MONITORS env (one virtual monitor per entry). The headless dummy backend's mode
-# specs must offer each requested size, so derive them (unique sizes, colon-joined).
+# Monitor layout (CSV "WxH,WxH" from config.monitors, passed by the control-server) → the
+# clone-daemon RMNG_MONITORS env (one virtual monitor per entry). The headless dummy
+# backend's mode specs must offer each requested size, so derive them (unique, colon-joined).
 MONITORS="${3:-}"
-# Media socket the clone-daemon connects to (config.cloneSocket, passed by bootstrap.sh) →
-# the clone-daemon unit's RMNG_SOCKET env. The host dir is bind-mounted at the same path.
+# Media socket the clone-daemon connects to (config.cloneSocket, passed by the control-server)
+# → the clone-daemon unit's RMNG_SOCKET env. The host dir is bind-mounted at the same path.
 CLONE_SOCKET="${4:-/srv/rmng-sock/clones.sock}"
 if [ -n "$MONITORS" ]; then
   # Each entry is WxH+X+Y[*]; the dummy mode specs want just WxH (unique, colon-joined).
@@ -39,7 +44,7 @@ aa-teardown 2>/dev/null || true; systemctl disable --now apparmor 2>/dev/null ||
 say "locale + timezone + ping range"
 apt-get install -y -qq locales >/dev/null 2>&1 || true
 locale-gen en_US.UTF-8 >/dev/null 2>&1 || true; update-locale LANG=en_US.UTF-8
-# Timezone: symlink + /etc/timezone (timedatectl can't set the clock in an unprivileged LXC).
+# Timezone: symlink + /etc/timezone (timedatectl can't set the clock inside a container).
 ln -sf /usr/share/zoneinfo/America/Toronto /etc/localtime; echo America/Toronto > /etc/timezone
 mkdir -p /etc/sysctl.d && echo 'net.ipv4.ping_group_range = 0 65534' > /etc/sysctl.d/99-ping.conf
 
@@ -67,6 +72,25 @@ update-alternatives --set x-terminal-emulator /usr/bin/ptyxis 2>/dev/null || tru
 # Masking makes the activation fail instantly instead of timing out.
 say "mask ModemManager (won't run in a container; its D-Bus activation otherwise hangs Settings)"
 systemctl mask ModemManager.service >/dev/null 2>&1 || true
+
+# Mark eth0 unmanaged by NetworkManager. The clone runs on a static Docker IP (the whole
+# fleet relies on Host.host — source-IP MCP routing + agent/daemon dials); if NM manages
+# eth0 it DHCPs that static address into oblivion. This is the highest-severity guest diff
+# vs the old LXC setup, so pin it via a keyfile conf before NM ever comes up.
+say "NetworkManager: mark eth0 unmanaged (keep the static docker IP)"
+install -d -m0755 /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/10-rmng-unmanaged.conf <<'NMCONF'
+[keyfile]
+unmanaged-devices=interface-name:eth0
+NMCONF
+
+# Mask the udev + networkd-wait-online units. In a privileged container systemd-udevd sees
+# the HOST's uevents (it should never manage the host's devices from inside a guest), and
+# systemd-networkd-wait-online never completes on an unmanaged static interface — it would
+# stall boot until timeout. SYSTEMD_OFFLINE=1 (set by the caller) makes these symlink ops in
+# the build container where systemd isn't PID 1.
+say "mask systemd-udevd + udev-trigger + networkd-wait-online (host uevents / static iface)"
+systemctl mask systemd-udevd.service systemd-udev-trigger.service systemd-networkd-wait-online.service >/dev/null 2>&1 || true
 
 # Patched gnome-shell (shell-01 hide screen-sharing indicator + shell-03 enable
 # org.gnome.Shell.Eval for the clone-daemon window-management MCP tools), if the
@@ -145,12 +169,20 @@ fi
 
 curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/microsoft.gpg || say "WARN: msft key"
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ noble main" > /etc/apt/sources.list.d/azure-cli.list
+# VS Code — same microsoft.gpg keyring imported just above; the `code` repo.
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list
 
 curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/cloud.google.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/cloud.google.gpg || say "WARN: gcloud key"
 echo "deb [signed-by=/etc/apt/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
 
 curl -fsSL https://packages.stripe.dev/api/security/keypair/stripe-cli-gpg/public | gpg --dearmor -o /etc/apt/keyrings/stripe.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/stripe.gpg || say "WARN: stripe key"
 echo "deb [signed-by=/etc/apt/keyrings/stripe.gpg] https://packages.stripe.dev/stripe-cli-debian-local stable main" > /etc/apt/sources.list.d/stripe.list
+
+# ngrok — its own keyring (dedicated, matching the per-repo keyring pattern above). No auth
+# token is baked here: NGROK_AUTHTOKEN is a per-clone preset env var (the agent reads it
+# natively), set through the Presets UI, consistent with the no-env-settings invariant.
+curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | gpg --dearmor -o /etc/apt/keyrings/ngrok.gpg 2>/dev/null && chmod a+r /etc/apt/keyrings/ngrok.gpg || say "WARN: ngrok key"
+echo "deb [signed-by=/etc/apt/keyrings/ngrok.gpg] https://ngrok-agent.s3.amazonaws.com buster main" > /etc/apt/sources.list.d/ngrok.list
 
 # ONLYOFFICE Desktop Editors — official repo (replaces the Flathub build). GPG-KEY file is
 # ASCII-armored; handle the binary case too just in case. "squeeze" is ONLYOFFICE's fixed
@@ -168,10 +200,10 @@ apt-get update -qq || say "WARN: apt update after adding toolbox repos"
 say "dev toolbox: install (grouped so one bad package doesn't sink the rest)"
 apti fish ripgrep micro tmux just gh xdotool build-essential clang libclang-dev default-jdk
 apti docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin fuse-overlayfs
-apti azure-cli google-cloud-cli stripe
+apti azure-cli google-cloud-cli stripe ngrok
 apti libsodium23 libpq-dev libcairo2 libcairo2-dev
 apti fonts-noto-cjk fonts-noto-color-emoji papirus-icon-theme
-apti celluloid ffmpeg firefox google-chrome-stable cursor
+apti celluloid ffmpeg firefox google-chrome-stable cursor code
 # Former Flathub apps now available via apt: Extension Manager (Ubuntu universe) + ONLYOFFICE.
 apti gnome-shell-extension-manager onlyoffice-desktopeditors
 
@@ -255,7 +287,10 @@ getent group docker >/dev/null 2>&1 && usermod -aG docker "$USERNAME" || say "WA
 printf '%s:%s\n' "$USERNAME" "$PASSWORD" | chpasswd
 printf 'root:%s\n' "$PASSWORD" | chpasswd
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > "/etc/sudoers.d/$USERNAME"; chmod 0440 "/etc/sudoers.d/$USERNAME"
-loginctl enable-linger "$USERNAME"
+# Enable linger by touching the marker file directly — `loginctl enable-linger` needs a
+# running systemd bus, which isn't up in the `sleep infinity` build container. This is
+# exactly what loginctl writes; the user manager auto-starts on first boot of a real clone.
+mkdir -p /var/lib/systemd/linger && touch "/var/lib/systemd/linger/$USERNAME"
 
 # Default shell → fish for the clone user + root (fish installed in the dev toolbox above;
 # it registers itself in /etc/shells so chsh accepts it). Non-fatal if fish is missing.
@@ -397,9 +432,9 @@ chmod 644 "$CLAUDE_DIR/CLAUDE.md"
 # Cursor agent; the agent-wrapper registers the same server programmatically).
 # mcpServers lives in ~/.claude.json — a top-level key; settings.json does NOT
 # support it. ${LINEAR_API_KEY} stays literal here (single-quoted jq arg): claude
-# expands it at runtime from the session env, where clone.sh's 30-rmng-preset.conf
-# put the chosen preset's key. No key in the env (e.g. on the template itself) ⇒
-# claude skips the server with a "missing environment variables" warning.
+# expands it at runtime from the session env, where the per-clone 30-rmng-preset.conf
+# (written by the control-server) put the chosen preset's key. No key in the env (e.g.
+# on the base image) ⇒ claude skips the server with a "missing environment variables" warning.
 say "user-scope linear MCP → ~/.claude.json"
 CLAUDE_JSON="/home/$USERNAME/.claude.json"
 [ -s "$CLAUDE_JSON" ] || echo '{}' > "$CLAUDE_JSON"
@@ -466,9 +501,9 @@ Wants=gnome-headless.service
 Type=simple
 Environment=WAYLAND_DISPLAY=wayland-0
 # Ship to the control-server's media socket (path from config cloneSocket, passed in as
-# \$CLONE_SOCKET) — its host dir is bind-mounted at the same path (see bootstrap.sh / the
-# deploy CT mp0). Without this the daemon falls back to standalone capture self-test (no
-# connection to the server).
+# \$CLONE_SOCKET) — its host dir is the shared sock volume mounted at the same path
+# (/srv/rmng-sock). Without this the daemon falls back to standalone capture self-test
+# (no connection to the server).
 Environment=RMNG_SOCKET=$CLONE_SOCKET
 ${MONITORS:+Environment=RMNG_MONITORS=$MONITORS}
 ExecStart=$BINDIR/rmng-clone-daemon
@@ -498,7 +533,8 @@ UNIT
 # settings portal, and theming behave like a real GNOME session. We launch
 # `gnome-shell --headless` directly — no GDM / gnome-session / pam_systemd — so nothing
 # else sets these. systemd --user reads environment.d → the session + all user units.
-# Per-clone env presets live in 30-rmng-preset.conf (written by clone.sh); higher number wins.
+# Per-clone env presets live in 30-rmng-preset.conf (written by the control-server at clone
+# create, materialized from the UI-configured preset); higher number wins.
 ENVDIR="/home/$USERNAME/.config/environment.d"; install -d "$ENVDIR"
 cat > "$ENVDIR/10-rmng-session.conf" <<'ENVD'
 XDG_CURRENT_DESKTOP=GNOME
@@ -511,21 +547,23 @@ ENVD
 
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config"
 uid="$(id -u "$USERNAME")"
-# Enable for auto-start by creating the wants symlinks directly — `systemctl --user
-# enable` is unreliable during provisioning (the user manager may not be up yet).
+# Enable for auto-start by creating the wants symlinks directly (a plain `ln`, no bus or
+# `systemctl --user enable` needed). This runs in a `sleep infinity` build container with
+# no user systemd manager, so the symlinks are what carry over into the committed image;
+# they take effect on the first boot of a real clone (linger, marked above, starts the
+# user manager then).
 WANTS="$UDIR/default.target.wants"; install -d -o "$USERNAME" -g "$USERNAME" "$WANTS"
 for u in gnome-headless rmng-clone-daemon agent-wrapper; do
   ln -sf "../$u.service" "$WANTS/$u.service"
 done
 chown -h "$USERNAME:$USERNAME" "$WANTS"/*.service
+# Best-effort live start: in the build container there is no user manager, so these
+# no-op (guarded); on a real clone the units start from the wants symlinks at boot.
 SC="runuser -u $USERNAME -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user"
 $SC daemon-reload 2>/dev/null || true
 $SC daemon-reexec 2>/dev/null || true  # re-read environment.d into the manager env before starting units
-# Start now too — the user manager came up at enable-linger time (before the units
-# were linked), so the wants symlinks alone won't start them until the next boot.
 $SC start gnome-headless.service 2>/dev/null || true
 sleep 2
 $SC start rmng-clone-daemon.service agent-wrapper.service 2>/dev/null || true
 
 say "provision complete; render node:"; ls -l /dev/dri || true
-echo "RESULT ok"
