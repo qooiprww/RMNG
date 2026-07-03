@@ -323,6 +323,11 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             op.finished_at = Some(now_ms());
         }
     });
+    // The clone-daemon's first `Hello` typically races this store update — it lands during
+    // wait-ready, before the host row above exists, so the Hello-triggered `request_check`
+    // finds no managed host and skips. Re-request now that the row is in place so swap-at-
+    // create coverage doesn't have to wait for the next sweep.
+    app.swap.request_check(&spec.new_hostname);
     schedule_prune(app.clone(), op_id.clone(), PRUNE_DONE_MS);
 
     // Assign a Claude account/group (or explicitly none): record the operator's
