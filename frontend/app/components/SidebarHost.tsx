@@ -106,6 +106,8 @@ export interface SidebarHostProps {
   onCommit: () => void;
   /** Change this clone's Claude account/group. */
   onChangeAccount: () => void;
+  /** Open the port-forward editor for this host. */
+  onPortForward: () => void;
 }
 
 /** The per-host overflow menu (⋯) — collapses the commit / change-account / delete
@@ -117,6 +119,7 @@ function OverflowMenu({
   busy,
   onCommit,
   onChangeAccount,
+  onPortForward,
   onDelete,
 }: {
   hostId: string;
@@ -124,6 +127,7 @@ function OverflowMenu({
   busy: boolean;
   onCommit: () => void;
   onChangeAccount: () => void;
+  onPortForward: () => void;
   onDelete: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -193,6 +197,7 @@ function OverflowMenu({
             <>
               {item("Commit to image…", onCommit)}
               {item("Change account…", onChangeAccount)}
+              {item("Port forward…", onPortForward)}
               <div className="my-1 h-px bg-slate-100 dark:bg-slate-700" />
             </>
           ) : null}
@@ -213,6 +218,7 @@ export function SidebarHost({
   onDelete,
   onCommit,
   onChangeAccount,
+  onPortForward,
 }: SidebarHostProps) {
   const busy = op?.status === "running";
   // Managed clones (backed by a container named after the host id) get the commit /
@@ -353,6 +359,7 @@ export function SidebarHost({
         busy={busy}
         onCommit={onCommit}
         onChangeAccount={onChangeAccount}
+        onPortForward={onPortForward}
         onDelete={onDelete}
       />
     </div>

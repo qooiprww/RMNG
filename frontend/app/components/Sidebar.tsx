@@ -47,6 +47,8 @@ export interface SidebarProps {
   onCommitHost: (host: Host) => void;
   /** Change a managed clone's Claude account / group. */
   onChangeAccountHost: (host: Host) => void;
+  /** Open the port-forward editor for a host. */
+  onPortForwardHost: (host: Host) => void;
   /** New host id order after a drag-reorder. */
   onReorder: (nextIds: string[]) => void;
 }
@@ -71,6 +73,7 @@ export function Sidebar({
   onDeleteHost,
   onCommitHost,
   onChangeAccountHost,
+  onPortForwardHost,
   onReorder,
 }: SidebarProps) {
   const runningClone = operations.some(
@@ -163,6 +166,7 @@ export function Sidebar({
                     onCommit={() => onCommitHost(host)}
                     onDelete={() => onDeleteHost(host)}
                     onChangeAccount={() => onChangeAccountHost(host)}
+                    onPortForward={() => onPortForwardHost(host)}
                   />
                 ))}
               </div>

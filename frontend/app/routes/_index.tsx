@@ -5,6 +5,7 @@ import { ChangeAccountModal } from "~/components/ChangeAccountModal";
 import { CloneModal } from "~/components/CloneModal";
 import { CommitImageModal } from "~/components/CommitImageModal";
 import { ImportAccountModal } from "~/components/ImportAccountModal";
+import { PortForwardModal } from "~/components/PortForwardModal";
 import { SettingsPanel } from "~/components/SettingsPanel";
 import { SetupWizard } from "~/components/SetupWizard";
 import { Sidebar } from "~/components/Sidebar";
@@ -19,6 +20,7 @@ import {
   listImages,
   pullTemplate,
   putConfig,
+  putForwards,
   refreshClaudeUsage,
   reorder,
   swapClaudeAccount,
@@ -27,6 +29,7 @@ import {
 import { type ControlState, type Host, emptyState } from "~/lib/types";
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
 import type { ContainerStats } from "~/lib/wire/ContainerStats";
+import type { ForwardRuntime } from "~/lib/wire/ForwardRuntime";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
 
 import type { Route } from "./+types/_index";
@@ -58,6 +61,7 @@ export function clientLoader() {
 function useLiveState(initial: ControlState) {
   const [state, setState] = useState(initial);
   const [stats, setStats] = useState<Record<string, ContainerStats>>({});
+  const [forwards, setForwards] = useState<Record<string, ForwardRuntime[]>>({});
   useEffect(() => {
     const es = new EventSource("/events");
     es.onmessage = (e) => {
@@ -74,15 +78,22 @@ function useLiveState(initial: ControlState) {
         // ignore malformed frame
       }
     });
+    es.addEventListener("forwards", (e) => {
+      try {
+        setForwards(JSON.parse((e as MessageEvent).data));
+      } catch {
+        // ignore malformed frame
+      }
+    });
     return () => es.close();
   }, []);
-  return { state, stats };
+  return { state, stats, forwards };
 }
 
 export default function Home({ loaderData }: Route.ComponentProps) {
   // The live SSE state powers both the wizard (template-provision progress) and the
   // dashboard, so it lives here at the gate. `stats` is the volatile per-host usage map.
-  const { state, stats } = useLiveState(loaderData);
+  const { state, stats, forwards } = useLiveState(loaderData);
   // First-run gate: hold the config (null while loading). Render a minimal centered
   // "Loading…" until it resolves so the dashboard never flashes before the wizard
   // decision; render the wizard INSTEAD of the dashboard while setup isn't complete.
@@ -107,16 +118,25 @@ export default function Home({ loaderData }: Route.ComponentProps) {
   if (!cfg.setupComplete) {
     return <SetupWizard state={state} initialConfig={cfg} onDone={refetchConfig} />;
   }
-  return <Dashboard state={state} stats={stats} cloneCpus={cfg.docker.cloneCpus} />;
+  return (
+    <Dashboard
+      state={state}
+      stats={stats}
+      forwards={forwards}
+      cloneCpus={cfg.docker.cloneCpus}
+    />
+  );
 }
 
 function Dashboard({
   state,
   stats,
+  forwards,
   cloneCpus,
 }: {
   state: ControlState;
   stats: Record<string, ContainerStats>;
+  forwards: Record<string, ForwardRuntime[]>;
   cloneCpus: number;
 }) {
   const [error, setError] = useState<string | null>(null);
@@ -127,6 +147,9 @@ function Dashboard({
   const [committing, setCommitting] = useState(false);
   const [changeHost, setChangeHost] = useState<Host | null>(null);
   const [changing, setChanging] = useState(false);
+  const [forwardHost, setForwardHost] = useState<Host | null>(null);
+  const [forwarding, setForwarding] = useState(false);
+  const [forwardError, setForwardError] = useState<string | null>(null);
 
   // Clone-source images (from /api/images) — fetched on mount and refetched
   // whenever a pull/commit/delete op leaves `running` (the image set changed).
@@ -284,6 +307,10 @@ function Dashboard({
           }}
           onCommitHost={(host) => setCommitHost(host)}
           onChangeAccountHost={(host) => setChangeHost(host)}
+          onPortForwardHost={(host) => {
+            setForwardError(null);
+            setForwardHost(host);
+          }}
           onReorder={onReorder}
         />
 
@@ -426,6 +453,24 @@ function Dashboard({
                 setChanging(false);
                 setChangeHost(null);
               });
+          }}
+        />
+      ) : null}
+
+      {forwardHost ? (
+        <PortForwardModal
+          host={state.hosts.find((h) => h.id === forwardHost.id) ?? forwardHost}
+          runtime={forwards[forwardHost.id] ?? []}
+          busy={forwarding}
+          error={forwardError}
+          onClose={() => setForwardHost(null)}
+          onSubmit={(list) => {
+            setForwarding(true);
+            setForwardError(null);
+            putForwards(forwardHost.id, list)
+              .then(() => setForwardHost(null))
+              .catch((e: Error) => setForwardError(e.message))
+              .finally(() => setForwarding(false));
           }}
         />
       ) : null}

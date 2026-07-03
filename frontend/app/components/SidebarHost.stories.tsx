@@ -40,6 +40,7 @@ const meta = {
     onDelete: fn(),
     onCommit: fn(),
     onChangeAccount: fn(),
+    onPortForward: fn(),
   },
 } satisfies Meta<typeof SidebarHost>;
 

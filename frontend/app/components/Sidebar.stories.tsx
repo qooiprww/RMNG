@@ -33,6 +33,7 @@ const meta = {
     onDeleteHost: fn(),
     onCommitHost: fn(),
     onChangeAccountHost: fn(),
+    onPortForwardHost: fn(),
     onReorder: fn(),
   },
 } satisfies Meta<typeof Sidebar>;
