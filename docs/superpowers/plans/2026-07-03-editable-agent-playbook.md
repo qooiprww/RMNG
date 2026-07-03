@@ -770,3 +770,28 @@ git commit -m "test(e2e): Proxmox CT validation of injected agent playbook"
 - **Spec coverage:** §1 merge → Task 1; §2 wrapper read → Task 1; §3 config/wire → Task 2; §4 compose+inject → Task 3; §5 frontend → Task 4; §6 docs → Task 5; testing (wire/provision/wrapper/E2E) → Tasks 1–3 unit tests + Task 6 E2E. All covered.
 - **Placeholder scan:** the only intentionally non-verbatim steps are Task 6 Steps 6/8 (wizard + clone API bodies), which depend on live endpoint shapes to be read from `web.rs`/`api.ts` at execution — every assertion command (Steps 7/9/10) is exact.
 - **Type consistency:** `agent_playbook` (Rust) / `agentPlaybook` (TS/JSON) used consistently; `compose_playbook(&AppConfig, Option<&Preset>) -> String`; `clone_container(.., agent_playbook: &str, ..)`; `resolveSystemAppend(injectedPath, read?)`; `CloneSpec.agent_playbook: String` (distinct from `agent_instructions: Option<String>`).
+
+---
+
+## E2E result (2026-07-03) — BYTE-EXACT PASS
+
+Ran on a freshly provisioned Proxmox LXC (CT 122 `rmng-playbook-e2e`, Ubuntu 24.04, Docker
+29.6.1, at 10.0.0.130) with the feature branch built into `rmng:latest` and run there.
+
+**Validated end-to-end against the running server (my code):**
+- Control-server builds + boots GPU-free; first-run setup completes and creates the `rmng` bridge.
+- `PUT /api/config` accepts a global `agentPlaybook` **and** a preset `agentPlaybook`, merges them
+  (global via `deep_merge`, preset via `merge_presets`), and **persists both to `/data/config.json`**
+  verbatim.
+- Creating a clone from the `e2e` preset injects `/home/rmng/.config/rmng/agent-instructions.md`
+  into the clone with **owner `rmng:rmng` (uid/gid 1000), mode `644`**, and content **byte-exact**
+  (`cmp` clean, 55 bytes, sha `597289696d00…`) equal to `compose_playbook` output:
+  `E2E-GLOBAL-MARKER-8811\nline two\n\nE2E-PRESET-MARKER-4423` (global + blank line + preset append,
+  no trailing newline). The wrapper's default `AGENT_INSTRUCTIONS_PATH` is exactly that path;
+  `resolveSystemAppend` (unit-tested) returns the injected content.
+
+**Environment gotcha (not a product bug):** the clone default `docker.cloneCpus` is **16**; a create
+on a host/CT with fewer CPUs 400s with `range of CPUs is from 0.01 to 8.00`. For an E2E on a small
+CT, first `PUT /api/config {"docker":{"cloneCpus":4,"cloneMemoryMb":6144}}`. (Also required: a GPU
+render node is a *runtime* check that fails GPU-less, but clone create/inject do NOT need it — the
+video plane does.) Both are orthogonal to the agent-playbook feature.
