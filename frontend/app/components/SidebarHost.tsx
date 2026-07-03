@@ -68,8 +68,6 @@ export interface SidebarHostProps {
   onDelete: () => void;
   /** Commit this managed clone to a new clone-source image. */
   onCommit: () => void;
-  /** Hot-swap this clone's clone-daemon + agent-wrapper binaries (no reprovision). */
-  onRedeploy: () => void;
   /** Change this clone's Claude account/group. */
   onChangeAccount: () => void;
 }
@@ -124,25 +122,6 @@ function AccountIcon() {
   );
 }
 
-function RedeployIcon() {
-  return (
-    <svg
-      width="13"
-      height="13"
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.4"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
-      <path d="M13.5 2.5V5H11" />
-    </svg>
-  );
-}
-
 export function SidebarHost({
   host,
   selected,
@@ -150,12 +129,11 @@ export function SidebarHost({
   onSelect,
   onDelete,
   onCommit,
-  onRedeploy,
   onChangeAccount,
 }: SidebarHostProps) {
   const busy = op?.status === "running";
   // Managed clones (backed by a container named after the host id) get the commit /
-  // redeploy / account actions; plain unmanaged rows only get delete.
+  // account actions; plain unmanaged rows only get delete.
   const managed = host.managed === true;
   const status = effectiveStatus(host);
   const claudeSel = claudeSelection(host);
@@ -293,19 +271,6 @@ export function SidebarHost({
             className="rounded p-1 text-slate-400 opacity-0 hover:bg-emerald-50 hover:text-emerald-600 group-hover:opacity-100 disabled:opacity-0"
           >
             <AccountIcon />
-          </button>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRedeploy();
-            }}
-            disabled={busy}
-            aria-label={`redeploy ${host.id}`}
-            title="redeploy clone-daemon + agent-wrapper"
-            className="rounded p-1 text-slate-400 opacity-0 hover:bg-sky-50 hover:text-sky-600 group-hover:opacity-100 disabled:opacity-0"
-          >
-            <RedeployIcon />
           </button>
         </>
       ) : null}

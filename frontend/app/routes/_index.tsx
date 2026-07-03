@@ -34,7 +34,6 @@ import {
   getConfig,
   listImages,
   pullTemplate,
-  redeployClone,
   refreshClaudeUsage,
   reorder,
   swapClaudeAccount,
@@ -361,14 +360,6 @@ function Dashboard({ state, templateRef }: { state: ControlState; templateRef: s
                             ? `Delete ${host.id}? This destroys its container.`
                             : `Remove ${host.id}? This unregisters the host.`;
                           if (confirm(msg)) run(deleteHost(host.id));
-                        }}
-                        onRedeploy={() => {
-                          if (
-                            confirm(
-                              `Redeploy clone-daemon + agent-wrapper to ${host.id}?\n\nSwaps the binaries from the control-server's embedded copies and restarts both units (drops the agent's current Claude session). No reprovision.`,
-                            )
-                          )
-                            run(redeployClone(host.id));
                         }}
                         onChangeAccount={() => setChangeHost(host)}
                       />

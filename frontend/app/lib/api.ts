@@ -72,11 +72,6 @@ export const deleteImage = (reference: string) =>
 /** The environment preflight rows for the setup wizard's first step. */
 export const getSetupEnv = () => getJson("/api/setup/env") as Promise<SetupEnv>;
 
-/** Hot-swap a clone's clone-daemon (+ agent-wrapper unless daemonOnly) binaries from the
- *  control-server's embedded copies, without reprovisioning. Restarts the unit(s). */
-export const redeployClone = (id: string, daemonOnly = false) =>
-  postJson("/api/clone/redeploy", { id, daemonOnly });
-
 /** Force an immediate Claude usage poll (refresh tokens + fetch 5h/7d). */
 export const refreshClaudeUsage = () => postJson("/api/claude/refresh", {});
 /** Confirm a clone is signed in to Claude Code via claude.ai; returns its identity. */

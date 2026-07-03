@@ -48,7 +48,6 @@ pub fn router(app: App) -> Router {
         .route("/api/activate", post(activate))
         .route("/api/reorder", post(reorder))
         .route("/api/clone", post(clone))
-        .route("/api/clone/redeploy", post(clone_redeploy))
         .route("/api/monitors/apply", post(monitors_apply))
         .route("/api/delete", post(delete))
         .route("/api/notes/:id", get(notes_get).post(notes_save))
@@ -478,34 +477,6 @@ async fn delete(
     jobs::start_delete(&app, &req.id)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RedeployReq {
-    id: String,
-    #[serde(default)]
-    daemon_only: bool,
-}
-
-/// `POST /api/clone/redeploy` — hot-swap a clone's `clone-daemon` (+ `agent-wrapper`
-/// unless `daemonOnly`) binaries from the embedded copies, without reprovisioning.
-async fn clone_redeploy(
-    State(app): State<App>,
-    Json(req): Json<RedeployReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let host = app.store.get().hosts.iter().find(|h| h.id == req.id).cloned();
-    let host = host.ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown host '{}'", req.id)))?;
-    if !host.managed {
-        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", req.id)));
-    }
-    let units = crate::provision::manual_redeploy_units(req.daemon_only);
-    crate::provision::redeploy_clone(&app, &host.id, &units, |step, msg| {
-        tracing::info!("redeploy {} {step}: {msg}", req.id);
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// `POST /api/monitors/apply` — apply the saved monitor layout to every running clone

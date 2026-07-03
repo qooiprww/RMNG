@@ -9,9 +9,10 @@
 //!
 //! Caller-facing division of responsibility (as with `orchestrate.rs`): `jobs.rs` owns the
 //! `Operation` record + the progress→op-log plumbing and calls the flows here; `claude.rs`
-//! drives credential ops via [`run_clone_op`]; `web.rs`/`mcp.rs` call [`redeploy_clone`] +
-//! [`apply_monitors`]. These functions address a clone by its container *name*, which
-//! equals the host id (`Host.managed` rows) — no container id is stored anywhere.
+//! drives credential ops via [`run_clone_op`]; `web.rs` calls [`apply_monitors`]; the
+//! `binswap` engine is the sole caller of [`redeploy_clone`]. These functions address a
+//! clone by its container *name*, which equals the host id (`Host.managed` rows) — no
+//! container id is stored anywhere.
 //!
 //! Guest scripts are embedded (`include_str!`) and streamed over `docker exec bash -s`:
 //! [`crate::docker::DockerCtl::exec_script`]. Binaries (clone-daemon, agent-wrapper) are
@@ -688,8 +689,8 @@ pub async fn delete_clone(
 /// One clone `systemd --user` unit in the hot-swap plan: the [`crate::assets::payload`]
 /// name to resolve bytes for, the user unit to bounce, and the on-disk binary name under
 /// `/opt/rmng/bin` (`provision-clone.sh` installs these names). This folds in the
-/// payload-name → bin-name match that used to live inline in the redeploy loop, so both
-/// the manual redeploy surfaces and the automatic swap engine (`binswap`) share one table.
+/// payload-name → bin-name match that used to live inline in the redeploy loop; the
+/// automatic swap engine (`binswap`) is the sole consumer of this table.
 pub struct RedeployUnit {
     /// Asset name passed to [`crate::assets::payload`] (`clone-daemon`, `agent-wrapper`).
     pub payload: &'static str,
@@ -705,34 +706,14 @@ pub const REDEPLOY_UNITS: &[RedeployUnit] = &[
     RedeployUnit { payload: "agent-wrapper", unit: "agent-wrapper.service", bin: "agent-wrapper" },
 ];
 
-/// Resolve the payloads the manual redeploy surfaces (web.rs `clone_redeploy`, mcp.rs
-/// redeploy tool) push: walk [`REDEPLOY_UNITS`] (agent-wrapper dropped when `daemon_only`),
-/// reading each payload from the image assets and **skipping — with a WARN — any that's
-/// absent** (a dev checkout without that binary staged). Byte resolution moved out of
-/// [`redeploy_clone`] into the caller in the swap-engine refactor; this keeps the manual
-/// callers' pre-refactor behavior (the automatic engine resolves + hash-guards its own set).
-pub fn manual_redeploy_units(daemon_only: bool) -> Vec<(&'static RedeployUnit, Vec<u8>)> {
-    REDEPLOY_UNITS
-        .iter()
-        .filter(|u| !(daemon_only && u.payload == "agent-wrapper"))
-        .filter_map(|u| match crate::assets::payload(u.payload) {
-            Some(bytes) => Some((u, bytes)),
-            None => {
-                tracing::warn!("redeploy: {} payload missing; skipping", u.payload);
-                None
-            }
-        })
-        .collect()
-}
-
-/// Hot-swap a running clone's binaries WITHOUT reprovisioning. The caller resolves the
-/// `(unit, payload-bytes)` pairs (from [`manual_redeploy_units`] or the swap engine's
-/// hash-guarded resolution); this drives the systemd dance. Per unit: `systemctl --user
-/// stop` (exec'd as the clone user with its `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
-/// — linger guarantees the user manager is up) → `upload_tar` the binary to
-/// **`/opt/rmng/bin/<bin>`** (the units exec from there; the old `redeploy.sh` pushed to
-/// `$HOME`, a latent path bug this fixes) → `reset-failed` + `start`. No username arg — the
-/// clone user (`CLONE_USER`) is compiled in (fixes mcp.rs's stray `"pega"`).
+/// Hot-swap a running clone's binaries WITHOUT reprovisioning. The caller (the `binswap`
+/// hash-guarded engine) resolves the `(unit, payload-bytes)` pairs; this drives the systemd
+/// dance. Per unit: `systemctl --user stop` (exec'd as the clone user with its
+/// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` — linger guarantees the user manager is up)
+/// → `upload_tar` the binary to **`/opt/rmng/bin/<bin>`** (the units exec from there; the
+/// old `redeploy.sh` pushed to `$HOME`, a latent path bug this fixes) → `reset-failed` +
+/// `start`. No username arg — the clone user (`CLONE_USER`) is compiled in (fixes mcp.rs's
+/// stray `"pega"`).
 pub async fn redeploy_clone(
     app: &App,
     container: &str,

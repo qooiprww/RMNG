@@ -137,12 +137,6 @@ fn tools_for(scope: Scope) -> Value {
             json!(["image", "hostname"]),
         ));
         tools.push(tool("delete", "Delete a host", clone_arg.clone(), json!(["clone"])));
-        tools.push(tool(
-            "redeploy",
-            "Hot-swap a clone's clone-daemon (+ agent-wrapper unless daemonOnly) binaries from the embedded copies, without reprovisioning",
-            json!({ "clone": { "type": "string", "description": "target clone id" }, "daemonOnly": { "type": "boolean", "description": "skip the agent-wrapper (keeps its Claude session)" } }),
-            json!(["clone"]),
-        ));
         tools.push(tool("claude_recommended", "Recommended Claude account for a new clone", json!({}), json!([])));
         tools.push(tool(
             "claude_swap",
@@ -290,21 +284,6 @@ async fn call_tool(st: &McpState, caller: Option<&str>, name: &str, args: Value)
             let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
             let op = jobs::start_delete(app, clone).map_err(|e| e.to_string())?;
             Ok(text(format!("delete started: op {}", op.id)))
-        }
-        "redeploy" => {
-            let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
-            let daemon_only = args.get("daemonOnly").and_then(Value::as_bool).unwrap_or(false);
-            let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-            if !host.managed {
-                return Err("not a managed clone".into());
-            }
-            let units = crate::provision::manual_redeploy_units(daemon_only);
-            crate::provision::redeploy_clone(app, &host.id, &units, |step, msg| {
-                tracing::info!("redeploy {clone} {step}: {msg}");
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(text(format!("redeployed {clone}{}", if daemon_only { " (daemon only)" } else { "" })))
         }
         "claude_recommended" => {
             Ok(text(json!({ "email": crate::claude::recommend(app) }).to_string()))
