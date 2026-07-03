@@ -32,7 +32,8 @@ The two-pane layout stays Notes/Chat (`pane: "notes" | "chat"`) — the planned 
   `PUT /api/config` and apply live. Claude accounts are imported from a signed-in clone
   (`ClaudeAccountsPanel`), not entered here. Reads the redacted `GET /api/config` —
   plaintext secrets never reach the browser.
-- A **"New base image"** affordance (`POST /api/images/bootstrap`), plus commit-a-clone
+- A **"+ Pull template"** affordance (`POST /api/images/pull` — prompts for a registry
+  reference, prefilled with the configured `docker.templateReference`), plus commit-a-clone
   (`POST /api/images/commit`), with progress shown via the existing `OperationProgress`.
 - **Image picker** in `CloneModal`: pick a clone-source image (from `GET /api/images`) to
   clone from — the clone streams as an `Operation`.

@@ -63,8 +63,8 @@ inside Cursor that this agent types `implement <link>` into; if the ticket proce
 were shared, that inner agent would recursively try to open Cursor.
 
 **Shared on-disk memory** — `~/.claude/CLAUDE.md`: general engineering guidance
-(disposable sandbox, verify-before-done, git discipline), deployed once per clone by
-`provision-clone.sh`. Read by all three consumers: the SDK agent via
+(disposable sandbox, verify-before-done, git discipline), written into the template image by
+`template/setup/30-user.sh` at template build. Read by all three consumers: the SDK agent via
 `settingSources: ["user"]` (which also loads `~/.claude/settings.json` — theme,
 etc.), the inner Cursor Claude Code, and any interactive `claude` a human opens.
 `permissionMode`/`mcpServers`/`model` are set programmatically and override anything

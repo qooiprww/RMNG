@@ -16,17 +16,17 @@ relevant — and both patch **gnome-shell**:
 
 ## How it ships
 
-`build-shell-deb.sh` runs in the **`gnome-build` Dockerfile stage** (`docker build`) and
-produces a patched `gnome-shell_<ver>+ngshell1_amd64.deb`. It rebuilds only `libshell-<N>.so`
-(both patches are JS compiled into the gresource baked into that one library) and swaps it
-into the stock gnome-shell `.deb`, bumping the version so it installs cleanly over stock. It
-prints the produced path as `DEB=<path>`.
+`build-shell-deb.sh` runs in the **`gnome-build` stage of `template/Dockerfile`**
+(`docker build`) and produces a patched `gnome-shell_<ver>+ngshell1_amd64.deb`. It rebuilds
+only `libshell-<N>.so` (both patches are JS compiled into the gresource baked into that one
+library) and swaps it into the stock gnome-shell `.deb`, bumping the version so it installs
+cleanly over stock. It prints the produced path as `DEB=<path>`.
 
-The Dockerfile copies that deb to **`/usr/local/share/rmng/gnome-shell.deb`** in the runtime
-image (a plain payload — no gzip, no embedding). When the control-server builds a base image,
-`provision.rs` pushes the payload into the build container and `provision-clone.sh` installs
-it over the stock shell; every clone off that image inherits the patched shell. `assets.rs`
-tolerates the payload being absent (clones fall back to the stock shell).
+`template/Dockerfile` copies that deb to `/tmp/gnome-shell.deb` in its final stage, where
+`template/setup/15-gnome-patch.sh` `dpkg -i`s it over the stock shell **during the template
+build** — every clone created from the published template inherits the patched shell. The deb
+is not a control-server payload (the retired in-product bootstrap was its only consumer): a
+missing/failed install fails the template build rather than publishing a degraded template.
 
 Build standalone (needs the gnome-shell build-deps, i.e. `apt build-dep gnome-shell`):
 
