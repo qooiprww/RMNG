@@ -30,7 +30,43 @@ mod config;
 mod forward;
 mod glunpack;
 mod headless;
+// The Wayland pointer-lock implementation only compiles (and links) on Linux.
+// The macOS twin lives in pointer_lock_macos.rs (§4.5).
+// Other platforms get a no-op stub.
+#[cfg(target_os = "linux")]
 mod pointer_lock;
+#[cfg(target_os = "macos")]
+#[path = "pointer_lock_macos.rs"]
+mod pointer_lock;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod pointer_lock {
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+
+    use gtk4::gdk;
+
+    /// Stub for non-Linux/macOS builds: always returns `None` from `new`.
+    pub struct PointerLock;
+
+    impl PointerLock {
+        pub fn new(_display: &gdk::Display, _writer: Arc<Mutex<Option<TcpStream>>>) -> Option<Self> {
+            None
+        }
+        pub fn is_engaged(&self) -> bool {
+            false
+        }
+        pub fn engage(&self, _surface: &gdk::Surface) {}
+        pub fn release(&self) {}
+    }
+}
+
+// Carbon kVK → Linux evdev translation table (macOS only).
+#[cfg(target_os = "macos")]
+mod kvk_evdev;
+
+// Native macOS titlebar: replaces the GTK HeaderBar with NSWindow + NSButton accessories.
+#[cfg(target_os = "macos")]
+mod native_titlebar;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -65,6 +101,8 @@ fn main() -> Result<()> {
     // Empirically confirmed on this Intel/Mesa box: cairo=clean(slow), ngl/vulkan=stale, gl=clean.
     // Pin `gl` unless the user overrides. Must be set before GTK realizes its first surface; we're
     // still single-threaded here so set_var is sound.
+    // macOS: the legacy `gl` renderer was removed in GTK ≥ 4.18; the pin is Linux-only.
+    #[cfg(target_os = "linux")]
     if std::env::var_os("GSK_RENDERER").is_none() {
         unsafe { std::env::set_var("GSK_RENDERER", "gl") };
     }
@@ -637,44 +675,54 @@ fn make_monitor_window(
     overlay.add_overlay(&cursor);
     window.set_child(Some(&overlay));
 
-    // Header bar: FPS readout (left) + a fullscreen toggle (F11 also toggles).
-    // Styling matches the gtk-kasmvnc-client title bar (see the CSS in build_ui).
-    let header = gtk4::HeaderBar::new();
-    // FPS readout at the top-left of the title bar.
-    let fps_label = gtk4::Label::new(Some("0 FPS"));
-    fps_label.add_css_class("fps-readout");
-    header.pack_start(&fps_label);
-    let fs_btn = gtk4::Button::from_icon_name("view-fullscreen-symbolic");
-    fs_btn.set_tooltip_text(Some("Toggle fullscreen (F11)"));
+    // ── Title bar ──────────────────────────────────────────────────────────────────────
+    // On Linux (and non-macOS): build the GTK HeaderBar with FPS readout, fullscreen
+    // button, and (primary only) server-address button.
+    // On macOS: skip the GTK HeaderBar entirely; native_titlebar::install wires native
+    // NSButton accessories to the real NSWindow titlebar (see native_titlebar.rs).
+    // Do NOT call window.set_titlebar(...) on macOS — that path stays Linux-only.
+    #[cfg(not(target_os = "macos"))]
     {
-        let win = window.clone();
-        fs_btn.connect_clicked(move |_| toggle_fullscreen(&win));
-    }
-    header.pack_end(&fs_btn);
-    // Settings (server address) lives only on the main window's title bar, like the
-    // gtk-kasmvnc-client header. pack_end after the fullscreen button puts it to its left.
-    if primary {
-        let settings = gtk4::Button::from_icon_name("network-server-symbolic");
-        settings.set_tooltip_text(Some("Server address"));
-        let (win, addr, writer) = (window.clone(), addr.clone(), writer.clone());
-        settings.connect_clicked(move |_| show_server_addr_dialog(&win, &addr, &writer));
-        header.pack_end(&settings);
-    }
-    window.set_titlebar(Some(&header));
+        // Header bar: FPS readout (left) + a fullscreen toggle (F11 also toggles).
+        // Styling matches the gtk-kasmvnc-client title bar (see the CSS in build_ui).
+        let header = gtk4::HeaderBar::new();
+        // FPS readout at the top-left of the title bar.
+        let fps_label = gtk4::Label::new(Some("0 FPS"));
+        fps_label.add_css_class("fps-readout");
+        header.pack_start(&fps_label);
+        let fs_btn = gtk4::Button::from_icon_name("view-fullscreen-symbolic");
+        fs_btn.set_tooltip_text(Some("Toggle fullscreen (F11)"));
+        {
+            let win = window.clone();
+            fs_btn.connect_clicked(move |_| toggle_fullscreen(&win));
+        }
+        header.pack_end(&fs_btn);
+        // Settings (server address) lives only on the main window's title bar, like the
+        // gtk-kasmvnc-client header. pack_end after the fullscreen button puts it to its left.
+        if primary {
+            let settings = gtk4::Button::from_icon_name("network-server-symbolic");
+            settings.set_tooltip_text(Some("Server address"));
+            let (win, addr, writer) = (window.clone(), addr.clone(), writer.clone());
+            settings.connect_clicked(move |_| show_server_addr_dialog(&win, &addr, &writer));
+            header.pack_end(&settings);
+        }
+        window.set_titlebar(Some(&header));
 
-    // FPS: count presented frames off the paintable, report once a second.
-    let present_count = Rc::new(Cell::new(0u32));
-    {
-        let c = present_count.clone();
-        paintable.connect_invalidate_contents(move |_| c.set(c.get() + 1));
+        // FPS: count presented frames off the paintable, report once a second.
+        let present_count = Rc::new(Cell::new(0u32));
+        {
+            let c = present_count.clone();
+            paintable.connect_invalidate_contents(move |_| c.set(c.get() + 1));
+        }
+        {
+            let (c, label) = (present_count.clone(), fps_label.clone());
+            glib::timeout_add_seconds_local(1, move || {
+                label.set_text(&format!("{} FPS", c.replace(0)));
+                glib::ControlFlow::Continue
+            });
+        }
     }
-    {
-        let (c, label) = (present_count.clone(), fps_label.clone());
-        glib::timeout_add_seconds_local(1, move || {
-            label.set_text(&format!("{} FPS", c.replace(0)));
-            glib::ControlFlow::Continue
-        });
-    }
+    // TODO(spike): native FPS label on macOS — add NSTextField updated from a 1s glib timer.
 
     // Close logic copied from gtk-kasmvnc-client: only the main window is closable,
     // and closing it quits the whole viewer (every monitor window). Secondary windows
@@ -695,6 +743,12 @@ fn make_monitor_window(
     let state = Rc::new(WinInput::default());
     install_pointer(&video, mid, &paintable, &window, layout, writer, &state, pointer_lock, warp);
     install_keyboard(&window, writer, &state, pointer_lock);
+
+    // macOS: register the native titlebar BEFORE present() so connect_realize fires once
+    // the surface is actually ready. The closure runs asynchronously on the main thread.
+    #[cfg(target_os = "macos")]
+    native_titlebar::install(&window, primary, addr, writer);
+
     window.present();
 
     MonitorWindow { video, cursor, appsrc, paintable, last_version: 0, native_cursor: None, cursor_hidden: false }
@@ -713,15 +767,20 @@ fn make_startup_window(app: &gtk4::Application, addr: &ServerAddr, writer: &Writ
         .build();
 
     // Same Settings button as the primary monitor window's title bar.
-    let header = gtk4::HeaderBar::new();
-    let settings = gtk4::Button::from_icon_name("network-server-symbolic");
-    settings.set_tooltip_text(Some("Server address"));
+    // On Linux: use the GTK HeaderBar. On macOS: use native NSButton via native_titlebar.
+    #[cfg(not(target_os = "macos"))]
     {
-        let (win, addr, writer) = (window.clone(), addr.clone(), writer.clone());
-        settings.connect_clicked(move |_| show_server_addr_dialog(&win, &addr, &writer));
+        let header = gtk4::HeaderBar::new();
+        let settings = gtk4::Button::from_icon_name("network-server-symbolic");
+        settings.set_tooltip_text(Some("Server address"));
+        {
+            let (win, addr, writer) = (window.clone(), addr.clone(), writer.clone());
+            settings.connect_clicked(move |_| show_server_addr_dialog(&win, &addr, &writer));
+        }
+        header.pack_end(&settings);
+        window.set_titlebar(Some(&header));
     }
-    header.pack_end(&settings);
-    window.set_titlebar(Some(&header));
+    // macOS: native settings button is installed after realize (see below).
 
     let spinner = gtk4::Spinner::new();
     spinner.set_spinning(true);
@@ -759,6 +818,10 @@ fn make_startup_window(app: &gtk4::Application, addr: &ServerAddr, writer: &Writ
         });
     }
 
+    // macOS: install native titlebar with settings button before presenting.
+    #[cfg(target_os = "macos")]
+    native_titlebar::install(&window, true, addr, writer);
+
     window.present();
     window
 }
@@ -766,7 +829,7 @@ fn make_startup_window(app: &gtk4::Application, addr: &ServerAddr, writer: &Writ
 /// Settings dialog (main window only): edit the server `host:port` and persist it to
 /// the config file. On save, the net thread's current connection is dropped so it
 /// reconnects to the new address. Mirrors gtk-kasmvnc-client's control-server dialog.
-fn show_server_addr_dialog(parent: &gtk4::ApplicationWindow, addr: &ServerAddr, writer: &Writer) {
+pub(crate) fn show_server_addr_dialog(parent: &gtk4::ApplicationWindow, addr: &ServerAddr, writer: &Writer) {
     let dialog = gtk4::Window::builder()
         .transient_for(parent)
         .modal(true)
@@ -842,7 +905,7 @@ fn valid_addr(s: &str) -> bool {
 }
 
 /// Toggle a window between fullscreen and normal (F11 / header button).
-fn toggle_fullscreen(window: &gtk4::ApplicationWindow) {
+pub(crate) fn toggle_fullscreen(window: &gtk4::ApplicationWindow) {
     if window.is_fullscreen() {
         window.unfullscreen();
     } else {
@@ -861,8 +924,16 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     // lowest latency for a live, latest-wins paintable (no audio to sync to). It also makes
     // the sink immune to any reorder/DPB latency the decoder declares in a LATENCY query, so
     // the only display delay left is the next vsync. Matches the 444 path (make_decoder_yuv444).
+    //
+    // macOS: vtdec_hw emits NV12 GLMemory with texture-target=rectangle (IOSurface/CGL); the sink
+    // only accepts RGBA/RGB 2D GLMemory, so glcolorconvert converts rectangle→2D + NV12→RGBA in
+    // one GPU pass. glupload drops out (vtdec_hw is its own GL producer). Linux string unchanged.
+    #[cfg(not(target_os = "macos"))]
     let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
          h264parse ! vah264dec ! glupload ! gtk4paintablesink name=sink sync=false";
+    #[cfg(target_os = "macos")]
+    let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
+         h264parse ! vtdec_hw ! glcolorconvert ! gtk4paintablesink name=sink sync=false";
     let pipeline = gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
     if let Some(bus) = pipeline.bus() {
         bus.set_sync_handler(move |_, msg| {
@@ -905,17 +976,25 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
 /// texture zero-copy. The returned appsrc/paintable match the 4:2:0 path's interface (intrinsic
 /// size `W×H`), so the rest of the viewer (letterbox, cursor overlay, fps) is unchanged.
 ///
-/// Do **not** put a `glcolorconvert`/`videoconvert` between `glupload` and `rmngavc444unpack`:
-/// that would 4:2:0-upsample the packed chroma and destroy the auxiliary view. The element reads
-/// the raw Y/UV textures.
+/// Do **not** put a `glcolorconvert`/`videoconvert` between the decoder (`glupload` on Linux,
+/// `vtdec_hw` on macOS) and `rmngavc444unpack`: that would 4:2:0-upsample the packed chroma and
+/// destroy the auxiliary view. The element reads the raw Y/UV textures.
 fn make_decoder_yuv444(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     glunpack::register()?;
     // Plain `gtk4paintablesink sync=false` (present on arrival, no audio to clock-sync to) — same as
     // the 4:2:0 path. The "old frame from a few back when downscaling" bug was NOT a sink backlog
     // (the sink is latest-wins); it was GTK's `ngl`/`vulkan` GSK renderer caching a recycled
     // GdkTexture — fixed by pinning `GSK_RENDERER=gl` in main().
+    // macOS: vtdec_hw replaces vah264dec + glupload (vtdec_hw is its own GL producer, outputs
+    // NV12 rectangle GLMemory). Do NOT insert glcolorconvert here: rmngavc444unpack reads the raw
+    // Y/UV textures; a prior colorconvert would 4:2:0-upsample the packed auxiliary chroma and
+    // destroy the AVC444 reconstruction. Rectangle→2D conversion is Task 3. Linux string unchanged.
+    #[cfg(not(target_os = "macos"))]
     let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
          h264parse ! vah264dec ! glupload ! rmngavc444unpack ! gtk4paintablesink name=sink sync=false";
+    #[cfg(target_os = "macos")]
+    let desc = "appsrc name=src is-live=true format=time do-timestamp=true ! \
+         h264parse ! vtdec_hw ! rmngavc444unpack ! gtk4paintablesink name=sink sync=false";
     let pipeline = gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
     if let Some(bus) = pipeline.bus() {
         bus.set_sync_handler(move |_, msg| {
@@ -1044,12 +1123,18 @@ fn install_pointer(
             // no-ops until the following crossing. Bouncing through a *named* cursor takes
             // GDK's cursor-shape path (clearing the attached flag), and restoring the
             // texture cursor then forces a full set_cursor with the current enter serial.
+            // Wayland-specific; gated so macOS doesn't get the unnecessary bounce.
+            #[cfg(target_os = "linux")]
             if !pl.as_ref().is_some_and(|p| p.is_engaged()) {
                 if let Some(cur) = video2.cursor() {
                     video2.set_cursor_from_name(Some("default"));
                     video2.set_cursor(Some(&cur));
                 }
             }
+            // On non-Linux `pl` is captured by the closure but used only in the Linux
+            // block above; suppress the unused-variable warning without a rename.
+            #[cfg(not(target_os = "linux"))]
+            let _ = &pl;
         });
     }
     {
@@ -1232,20 +1317,47 @@ fn install_keyboard(
                 release_all_input(&w, &state);
                 return glib::Propagation::Stop;
             }
-            // Physical key identity: evdev keycode = GTK hardware_keycode - 8 (so games
-            // that read raw keys — Minecraft/GLFW — get the right keys regardless of layout).
-            let keycode = code.saturating_sub(8);
-            state.pressed.borrow_mut().insert(keycode);
-            send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+            // Physical key identity → Linux evdev keycode sent on the wire.
+            // Linux/X11: GTK hardware_keycode = evdev + 8; subtract 8 to recover evdev.
+            // macOS: GTK hardware_keycode is Carbon kVK (0-127); translate via lookup table.
+            //        Skip the event (return Proceed) for sentineled / unmapped kVK codes.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let keycode = code.saturating_sub(8);
+                state.pressed.borrow_mut().insert(keycode);
+                send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let keycode = kvk_evdev::translate(code);
+                tracing::debug!("key press: hw={:#04x} evdev={}", code, keycode);
+                if keycode != 0 {
+                    state.pressed.borrow_mut().insert(keycode);
+                    send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+                }
+            }
             glib::Propagation::Proceed
         });
     }
     {
         let (w, state) = (writer.clone(), state.clone());
         key.connect_key_released(move |_c, _keyval, code, _s| {
-            let keycode = code.saturating_sub(8);
-            state.pressed.borrow_mut().remove(&keycode);
-            release_keycode(&w, keycode);
+            // Mirror the press-side translation so pressed/released are symmetric.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let keycode = code.saturating_sub(8);
+                state.pressed.borrow_mut().remove(&keycode);
+                release_keycode(&w, keycode);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let keycode = kvk_evdev::translate(code);
+                tracing::debug!("key release: hw={:#04x} evdev={}", code, keycode);
+                if keycode != 0 {
+                    state.pressed.borrow_mut().remove(&keycode);
+                    release_keycode(&w, keycode);
+                }
+            }
         });
     }
     window.add_controller(key);
