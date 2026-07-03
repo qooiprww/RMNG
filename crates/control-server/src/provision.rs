@@ -32,7 +32,8 @@ use crate::docker::{CreateSpec, PullEvent, TarEntry, CLONE_USER};
 const APPLY_MONITORS_SCRIPT: &str = include_str!("../scripts/apply-monitors.sh");
 const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
 
-/// The clone user's uid/gid inside every image (created uid 1000 by `provision-clone.sh`).
+/// The clone user's uid/gid inside every image (created uid 1000 by `template/setup/30-user.sh`
+/// at template build).
 /// tar entries under `home/rmng/**` carry this verbatim so the daemon extracts them owned
 /// by the clone user (gotcha #2).
 const CLONE_UID: u64 = 1000;
@@ -424,15 +425,21 @@ async fn clone_container_after_create(
 // --- template pull --------------------------------------------------------------------
 
 /// A template-pull progress event. Unlike the shared `(step, msg)` callback the clone /
-/// commit / delete flows use, the pull emits either a coarse STEP transition (jobs maps it
-/// to the [`pull_pct`] table) or a fine byte-progress PCT inside the long `pull` step, so
-/// the aggregate download fraction reaches the op bar without a log line per byte tick.
+/// commit / delete flows use, the pull emits a coarse STEP transition (jobs maps it to the
+/// [`pull_pct`] table), a fine byte-progress PCT inside the long `pull` step (so the
+/// aggregate download fraction reaches the op bar without a log line per byte tick), or a
+/// per-layer status LOG line (message + op log, no pct move) — the same volume-capped
+/// per-(layer, status) transitions the retired in-product bootstrap logged.
 #[derive(Debug, Clone)]
 pub enum PullProgress {
     /// A coarse step transition (`queued`/`pull`/`verify`/`tag`/`done`); maps to [`pull_pct`].
     Step { step: String, msg: String },
     /// Fine byte progress inside the `pull` step: an absolute pct (2–90) + a message.
     Pct { pct: f64, msg: String },
+    /// A per-layer pull status line (`docker.rs`'s deduped `PullEvent::Status`): pushed to the
+    /// op log + the message, WITHOUT moving `step` off `"pull"` or touching `pct` (pct stays
+    /// byte-driven via [`PullProgress::Pct`]).
+    Log { msg: String },
 }
 
 /// Progress step → percentage for a template pull. The `pull` step's 2–90 span is filled by
@@ -500,24 +507,25 @@ pub async fn pull_template(
         bail!("an image named '{reference}' already exists; pick another name or delete it first");
     }
 
-    // Pull (2–90%): map the aggregate byte fraction onto `2 + frac·88`. `Status` lines carry
-    // the per-layer detail as the message (pinned to the current pct floor so the bar doesn't
-    // stall); `Bytes` drives the fine pct. A daemon error (e.g. a Docker Hub rate limit) is
+    // Pull (2–90%): map the aggregate byte fraction onto `2 + frac·88`. `Status` lines (already
+    // deduped per-(layer, status) transition by `pull_image`) land in the op LOG + message, as
+    // the retired in-product bootstrap logged them — same formatting, without moving pct;
+    // `Bytes` drives the fine pct + message with NO log line (it fires up to ~100 times per
+    // pull, which would swamp the log). A daemon error (e.g. a Docker Hub rate limit) is
     // surfaced verbatim by `pull_image` (gotcha #9).
     on_progress(PullProgress::Step { step: "pull".into(), msg: format!("pulling {remote}") });
     {
         let on_progress = &mut on_progress;
-        let mut last_pct = 2.0_f64;
         docker
             .pull_image(remote, |event| match event {
                 PullEvent::Status { layer, status } => {
                     let msg = if layer.is_empty() { status } else { format!("{layer}: {status}") };
-                    on_progress(PullProgress::Pct { pct: last_pct, msg });
+                    on_progress(PullProgress::Log { msg });
                 }
                 PullEvent::Bytes { frac } => {
-                    last_pct = 2.0 + frac * 88.0;
+                    let pct = 2.0 + frac * 88.0;
                     on_progress(PullProgress::Pct {
-                        pct: last_pct,
+                        pct,
                         msg: format!("pulling {remote}: {}%", (frac * 100.0) as i64),
                     });
                 }
@@ -688,7 +696,7 @@ pub async fn delete_clone(
 
 /// One clone `systemd --user` unit in the hot-swap plan: the [`crate::assets::payload`]
 /// name to resolve bytes for, the user unit to bounce, and the on-disk binary name under
-/// `/opt/rmng/bin` (`provision-clone.sh` installs these names). This folds in the
+/// `/opt/rmng/bin` (set up by `template/setup/30-user.sh` at template build). This folds in the
 /// payload-name → bin-name match that used to live inline in the redeploy loop; the
 /// automatic swap engine (`binswap`) is the sole consumer of this table.
 pub struct RedeployUnit {

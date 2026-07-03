@@ -47,7 +47,8 @@ use tokio::sync::mpsc;
 use crate::app::App;
 use crate::provision::{REDEPLOY_UNITS, RedeployUnit};
 
-/// Where clones install the swappable binaries (`provision-clone.sh`); the units exec from
+/// Where clones install the swappable binaries (set up by `template/setup/30-user.sh` at
+/// template build); the units exec from
 /// here and [`crate::provision::redeploy_clone`] uploads here.
 const BIN_DIR: &str = "/opt/rmng/bin";
 

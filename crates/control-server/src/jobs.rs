@@ -148,7 +148,9 @@ fn op_progress(app: &App, op_id: &str, kind: OperationKind) -> impl FnMut(&str, 
 /// flow doesn't use the shared `(step, msg)` callback). A `Step` transition sets the
 /// step/message + a log line and raises the pct to the `pull_pct` floor; a `Pct` byte tick
 /// raises the bar (monotonic `max`) + updates the message with NO log line — a single pull
-/// emits up to ~100 byte ticks, which would swamp the op log.
+/// emits up to ~100 byte ticks, which would swamp the op log; a `Log` line (per-layer pull
+/// status) pushes to the op log + updates the message WITHOUT touching `step` or `pct` — it
+/// fires mid-`"pull"` step, same as the old bootstrap's per-layer log lines.
 fn pull_op_progress(app: &App, op_id: &str) -> impl FnMut(PullProgress) {
     let app = app.clone();
     let op_id = op_id.to_string();
@@ -172,6 +174,16 @@ fn pull_op_progress(app: &App, op_id: &str) -> impl FnMut(PullProgress) {
             patch_op(&app, &op_id, |op| {
                 op.pct = op.pct.max(pct);
                 op.message = msg;
+            });
+        }
+        PullProgress::Log { msg } => {
+            patch_op(&app, &op_id, |op| {
+                op.log.push(format!("{}: {msg}", op.step));
+                op.message = msg;
+                if op.log.len() > LOG_LIMIT {
+                    let drop = op.log.len() - LOG_LIMIT;
+                    op.log.drain(0..drop);
+                }
             });
         }
     }
@@ -604,5 +616,35 @@ mod tests {
         assert_eq!(b.status, OperationStatus::Done); // untouched
         // No Running op remains, so a same-target op is no longer blocked forever.
         assert!(!st.operations.iter().any(|o| o.status == OperationStatus::Running));
+    }
+
+    /// Per-layer pull `Status` events (surfaced to `pull_op_progress` as [`PullProgress::Log`])
+    /// must reach the op LOG + message like the retired bootstrap's pull logging did, but
+    /// without moving `step` off `"pull"` or perturbing the byte-driven `pct` — that's owned
+    /// exclusively by [`PullProgress::Pct`] (`Bytes` events), which must stay message-only.
+    #[tokio::test]
+    async fn pull_log_event_reaches_op_log_without_moving_pct_or_step() {
+        let app = test_app();
+        app.store.mutate(|s| s.operations.push(running_op("op_a", "tpl-a")));
+        let mut progress = pull_op_progress(&app, "op_a");
+
+        progress(PullProgress::Log { msg: "aaaaaaaaaaaa: Downloading".into() });
+
+        let st = app.store.get();
+        let op = st.operations.iter().find(|o| o.id == "op_a").unwrap();
+        assert_eq!(op.step, "pull"); // unmoved
+        assert_eq!(op.pct, 40.0); // unmoved — pct stays byte-driven
+        assert_eq!(op.message, "aaaaaaaaaaaa: Downloading");
+        assert!(op.log.iter().any(|l| l == "pull: aaaaaaaaaaaa: Downloading"));
+
+        // A subsequent `Pct` (Bytes) tick updates pct + message but must NOT add a log line —
+        // the log stays exactly as the `Log` event left it.
+        let log_len_before = op.log.len();
+        progress(PullProgress::Pct { pct: 50.0, msg: "pulling docker.io/x:y: 55%".into() });
+        let st = app.store.get();
+        let op = st.operations.iter().find(|o| o.id == "op_a").unwrap();
+        assert_eq!(op.pct, 50.0);
+        assert_eq!(op.message, "pulling docker.io/x:y: 55%");
+        assert_eq!(op.log.len(), log_len_before); // no new log line from a Pct/Bytes tick
     }
 }

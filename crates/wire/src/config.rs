@@ -71,7 +71,8 @@ pub struct EnvVar {
 /// `~/.config/environment.d/30-rmng-preset.conf`; the Linear key is additionally
 /// injected as `LINEAR_API_KEY`, which auths the clone's `linear` MCP). Vars that must
 /// ALWAYS be present (e.g. `XDG_CURRENT_DESKTOP`) are NOT presets — they're baked into the
-/// template's base session env by `provision-clone.sh`, inherited by every clone.
+/// template's base session env by `template/setup/30-user.sh` at template build, inherited by
+/// every clone.
 /// NOT TS-exported: `linear_key` is a secret — the browser sees [`PresetRedacted`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
