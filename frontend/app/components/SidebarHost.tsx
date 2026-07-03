@@ -1,11 +1,15 @@
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { EllipsisVertical } from "lucide-react";
+import { ArrowRight, EllipsisVertical } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import chatgptLogo from "../assets/chatgpt.png";
 import claudeLogo from "../assets/claude.png";
 import type { Host, Operation } from "~/lib/types";
 import type { ContainerStats } from "~/lib/wire/ContainerStats";
+import type { ForwardRuntime } from "~/lib/wire/ForwardRuntime";
+import type { ForwardState } from "~/lib/wire/ForwardState";
+import type { PortForward } from "~/lib/wire/PortForward";
 import { workspaceBadge } from "~/lib/workspace";
 
 // Text color + label per host state. `working` is sky, `idle` amber (done / awaiting
@@ -21,40 +25,45 @@ function effectiveStatus(host: Host): { text: string; label: string } {
   return AGENT_STATUS[host.monitorState ?? "idle"];
 }
 
-/** How this clone's Claude account was chosen + which account is actually in use, for
- *  the sidebar line. `mode` is the selection kind; `email` is the live account (absent
- *  for "none", or when auto/specific hasn't resolved one). Returns null when there's
- *  nothing Claude-related to show (e.g. auto with no accounts configured). */
-type ClaudeSel = { mode: "auto" | "group" | "specific" | "none"; group?: string; email?: string };
-function claudeSelection(host: Host): ClaudeSel | null {
-  const email = host.claudeAccountEmail || undefined;
-  const sel = host.claudeSelection;
-  if (host.claudeGroup) return { mode: "group", group: host.claudeGroup, email };
-  if (sel === "none") return { mode: "none" };
-  if (sel === "auto") return email ? { mode: "auto", email } : null;
-  if (sel && !sel.startsWith("group:")) return { mode: "specific", email: email ?? sel };
+/** How this clone's account for one provider was chosen + which account is actually in
+ *  use, for a sidebar line. `mode` is the selection kind; `email` is the live account
+ *  (absent for "none", or when auto/specific hasn't resolved one). Returns null when
+ *  there's nothing to show (e.g. auto with no accounts configured). Provider-agnostic:
+ *  the Claude and Codex lines both derive from this, off their respective host fields. */
+type AcctSel = { mode: "auto" | "group" | "specific" | "none"; group?: string; email?: string };
+function accountSelection(
+  accountEmail: string | null | undefined,
+  selection: string | null | undefined,
+  group: string | null | undefined,
+): AcctSel | null {
+  const email = accountEmail || undefined;
+  if (group) return { mode: "group", group, email };
+  if (selection === "none") return { mode: "none" };
+  if (selection === "auto") return email ? { mode: "auto", email } : null;
+  if (selection && !selection.startsWith("group:")) return { mode: "specific", email: email ?? selection };
   // Legacy host (no selection recorded): show the account, without a mode badge.
   return email ? { mode: "specific", email } : null;
 }
 
 /** Short badge for the non-default selection modes (specific renders as the plain
  *  email, so it — and legacy hosts — get no badge). Group shows the group name. */
-function selBadge(sel: ClaudeSel): string | null {
+function selBadge(sel: AcctSel): string | null {
   if (sel.mode === "auto") return "auto";
   if (sel.mode === "none") return "none";
   if (sel.mode === "group") return sel.group ?? "group";
   return null; // specific
 }
 
-/** CPU (percent of the clone's cpu allowance) + memory-used strings for the top row,
- *  e.g. `{ cpu: "20%", mem: "3.2GB" }`. Rendered in fixed-width, right-aligned tabular
- *  slots so the figures line up across every row. CPU normalizes `stats.cpuPct` (docker
- *  convention: 100 == one core) by `cloneCpus`; below 1% one decimal is kept so a
- *  near-idle clone doesn't read as dead-zero. When `cloneCpus <= 0` (unlimited clone)
- *  it falls back to a cores figure (`2.4c`). MEM is memory used in GiB, one decimal.
- *  Returns null when there's no usable sample — no stats yet, or a stopped/unmanaged
- *  host with no memory limit. `mem*` are typed bigint by ts-rs but arrive as JSON
- *  numbers, hence the `Number()` coercion. */
+/** CPU (percent of the clone's cpu allowance) + memory-used strings, e.g.
+ *  `{ cpu: "20%", mem: "3.2GB" }`. CPU rides the Claude line and MEM the Codex line;
+ *  each renders in a fixed-width, right-aligned tabular slot so the two figures stack
+ *  and line up across every row. CPU normalizes `stats.cpuPct` (docker convention:
+ *  100 == one core) by `cloneCpus`; below 1% one decimal is kept so a near-idle clone
+ *  doesn't read as dead-zero. When `cloneCpus <= 0` (unlimited clone) it falls back to a
+ *  cores figure (`2.4c`). MEM is memory used in GiB, one decimal. Returns null when
+ *  there's no usable sample — no stats yet, or a stopped/unmanaged host with no memory
+ *  limit. `mem*` are typed bigint by ts-rs but arrive as JSON numbers, hence the
+ *  `Number()` coercion. */
 function usageParts(
   stats: ContainerStats | undefined,
   cloneCpus: number,
@@ -74,17 +83,106 @@ function usageParts(
   return { cpu, mem };
 }
 
-function selTitle(sel: ClaudeSel): string {
+function selTitle(sel: AcctSel, provider: string): string {
   switch (sel.mode) {
     case "group":
-      return `Claude group: ${sel.group} (on ${sel.email ?? "?"})`;
+      return `${provider} group: ${sel.group} (on ${sel.email ?? "?"})`;
     case "auto":
-      return `Claude: auto — server picks the best account${sel.email ? ` (on ${sel.email})` : ""}`;
+      return `${provider}: auto — server picks the best account${sel.email ? ` (on ${sel.email})` : ""}`;
     case "none":
-      return "Claude: none — no token installed";
+      return `${provider}: none — no token installed`;
     default:
-      return `Claude account: ${sel.email} (fixed)`;
+      return `${provider} account: ${sel.email} (fixed)`;
   }
+}
+
+/** One provider's metadata line: the account (logo · optional mode badge · email, which
+ *  truncates) on the left, and an optional right-aligned usage metric (CPU or MEM) in a
+ *  fixed-width tabular slot so the Claude and Codex figures align. `sel === null` renders
+ *  just a left spacer — e.g. a Codex-less clone whose Codex line still carries MEM. */
+function AccountLine({
+  sel,
+  logo,
+  provider,
+  metric,
+}: {
+  sel: AcctSel | null;
+  logo: string;
+  provider: string;
+  metric?: { label: string; value: string; title: string };
+}) {
+  return (
+    <div className="flex items-center gap-2 text-[10px]">
+      {sel ? (
+        <span
+          className="flex min-w-0 flex-1 items-center gap-1 text-slate-400 dark:text-slate-500"
+          title={selTitle(sel, provider)}
+        >
+          <img src={logo} alt={provider} className="h-3 w-3 shrink-0 object-contain" />
+          {selBadge(sel) ? (
+            <span className="shrink-0 rounded bg-slate-100 px-1 text-[9px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+              {selBadge(sel)}
+            </span>
+          ) : null}
+          {sel.email ? (
+            <span className="truncate">{sel.email}</span>
+          ) : sel.mode === "none" ? (
+            <span className="italic text-slate-300 dark:text-slate-600">no token</span>
+          ) : null}
+        </span>
+      ) : (
+        <span className="min-w-0 flex-1" />
+      )}
+      {metric ? (
+        <span className="flex shrink-0 items-baseline gap-1 tabular-nums" title={metric.title}>
+          <span className="font-medium text-slate-400 dark:text-slate-500">{metric.label}</span>
+          <span className="w-8 text-right font-semibold text-slate-700 dark:text-slate-200">
+            {metric.value}
+          </span>
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+// Status dot per forward state (+ a muted "disabled" for rules toggled off), shown in
+// the compact per-host forwards chips.
+const FORWARD_DOT: Record<ForwardState | "disabled", string> = {
+  listening: "bg-emerald-500",
+  error: "bg-red-500",
+  offline: "bg-slate-400 dark:bg-slate-500",
+  disabled: "bg-slate-300 dark:bg-slate-600",
+};
+
+/** A compact wrapping row of this host's port forwards — one `remote→local` chip per
+ *  rule with a status-colored dot, live state merged from the `forwards` SSE event by
+ *  rule id. A disabled rule renders muted; hover shows the full mapping + state/error. */
+function ForwardChips({ forwards, runtime }: { forwards: PortForward[]; runtime: ForwardRuntime[] }) {
+  const rtById = new Map(runtime.map((r) => [r.id, r]));
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {forwards.map((f) => {
+        const rt = rtById.get(f.id);
+        const state: ForwardState | "disabled" = !f.enabled ? "disabled" : rt?.state ?? "offline";
+        const conns = rt && rt.activeConns > 0 ? ` · ${rt.activeConns} conn` : "";
+        const err = rt?.error ? ` · ${rt.error}` : "";
+        return (
+          <span
+            key={f.id}
+            title={`${f.remotePort} → 127.0.0.1:${f.localPort} · ${state}${conns}${err}`}
+            className={`inline-flex items-center gap-1 rounded bg-slate-100 px-1 py-0.5 font-mono text-[9px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400 ${
+              f.enabled ? "" : "opacity-60"
+            }`}
+          >
+            <span className={`size-1.5 shrink-0 rounded-full ${FORWARD_DOT[state]}`} />
+            {f.remotePort}
+            <ArrowRight className="size-2.5 shrink-0 text-slate-500 dark:text-slate-400" />
+            {f.localPort}
+          </span>
+        );
+      })}
+    </div>
+  );
 }
 
 export interface SidebarHostProps {
@@ -108,6 +206,9 @@ export interface SidebarHostProps {
   onChangeAccount: () => void;
   /** Open the port-forward editor for this host. */
   onPortForward: () => void;
+  /** Live runtime status for this host's forwards (from the `forwards` SSE event),
+   *  merged into the compact forwards chips by rule id. */
+  forwardRuntime?: ForwardRuntime[];
 }
 
 /** The per-host overflow menu (⋯) — collapses the commit / change-account / delete
@@ -219,14 +320,28 @@ export function SidebarHost({
   onCommit,
   onChangeAccount,
   onPortForward,
+  forwardRuntime,
 }: SidebarHostProps) {
   const busy = op?.status === "running";
   // Managed clones (backed by a container named after the host id) get the commit /
   // account actions; plain unmanaged rows only get remove.
   const managed = host.managed === true;
   const status = effectiveStatus(host);
-  const claudeSel = claudeSelection(host);
+  const claudeSel = accountSelection(host.claudeAccountEmail, host.claudeSelection, host.claudeGroup);
+  const codexSel = accountSelection(host.codexAccountEmail, host.codexSelection, host.codexGroup);
   const usage = usageParts(stats, cloneCpus);
+  // CPU rides the Claude line, MEM the Codex line, so the two figures stack on the right
+  // across both lines. They share `usage`, so they appear and vanish together.
+  const cpuMetric = usage
+    ? { label: "CPU", value: usage.cpu, title: "live container CPU (% of clone allowance)" }
+    : undefined;
+  const memMetric = usage
+    ? { label: "MEM", value: usage.mem, title: "container memory used" }
+    : undefined;
+  // Show a provider line when it has an account or its metric; drop it when empty so a
+  // Codex-less, stat-less clone doesn't sprout a blank row.
+  const showClaudeLine = !!claudeSel || !!cpuMetric;
+  const showCodexLine = !!codexSel || !!memMetric;
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: host.id, disabled: busy });
 
@@ -267,47 +382,46 @@ export function SidebarHost({
       }`}
     >
       <div className="min-w-0 flex-1">
-        {/* Row 1: Claude account (left, truncates) · CPU/MEM (right, fixed-width tabular
-            slots so figures align across rows). Hidden while an op is running. */}
-        {!busy ? (
-          <div className="mb-0.5 flex items-center gap-2 text-[10px]">
-            {claudeSel ? (
-              <span
-                className="flex min-w-0 flex-1 items-center gap-1 text-slate-400 dark:text-slate-500"
-                title={selTitle(claudeSel)}
-              >
-                <img src={claudeLogo} alt="" className="h-3 w-3 shrink-0 object-contain" />
-                {selBadge(claudeSel) ? (
-                  <span className="shrink-0 rounded bg-slate-100 px-1 text-[9px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                    {selBadge(claudeSel)}
-                  </span>
-                ) : null}
-                {claudeSel.email ? (
-                  <span className="truncate">{claudeSel.email}</span>
-                ) : claudeSel.mode === "none" ? (
-                  <span className="italic text-slate-300 dark:text-slate-600">no token</span>
-                ) : null}
-              </span>
+        {/* Top block: the Claude line and, under it, the Codex line — each an account on
+            the left with its usage figure (CPU on Claude, MEM on Codex) right-aligned in
+            a shared tabular slot. The ⋯ menu sits to the right, vertically centered so it
+            spans both lines. While busy, the op step replaces the two lines. */}
+        <div className="mb-0.5 flex items-center gap-1">
+          <div className="min-w-0 flex-1">
+            {busy ? (
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 break-words text-sm font-medium text-slate-800 dark:text-slate-100">
+                  {host.displayName ?? host.id}
+                </span>
+                <span className="shrink-0 text-[10px] font-medium text-sky-600 dark:text-sky-400">
+                  {op?.kind === "delete" ? "deleting…" : op?.step}
+                </span>
+              </div>
             ) : (
-              <span className="min-w-0 flex-1" />
+              <>
+                {showClaudeLine ? (
+                  <AccountLine sel={claudeSel} logo={claudeLogo} provider="Claude" metric={cpuMetric} />
+                ) : null}
+                {showCodexLine ? (
+                  <AccountLine sel={codexSel} logo={chatgptLogo} provider="Codex" metric={memMetric} />
+                ) : null}
+              </>
             )}
-            {usage ? (
-              <span
-                className="flex shrink-0 items-baseline gap-1 tabular-nums"
-                title="live container CPU (% of clone allowance) · memory used"
-              >
-                <span className="font-medium text-slate-400 dark:text-slate-500">CPU</span>
-                <span className="w-8 text-right font-semibold text-slate-700 dark:text-slate-200">{usage.cpu}</span>
-                <span className="ml-1 font-medium text-slate-400 dark:text-slate-500">MEM</span>
-                <span className="w-8 text-right font-semibold text-slate-700 dark:text-slate-200">{usage.mem}</span>
-              </span>
-            ) : null}
           </div>
-        ) : null}
+          <OverflowMenu
+            hostId={host.id}
+            managed={managed}
+            busy={busy}
+            onCommit={onCommit}
+            onChangeAccount={onChangeAccount}
+            onPortForward={onPortForward}
+            onDelete={onDelete}
+          />
+        </div>
 
-        {/* Row 2: unread "!" mark + ticket badge inlined with the title, so a wrapped title
+        {/* Title: unread "!" mark + ticket badge inlined with the title, so a wrapped title
             flows back to the left edge on the next line (the badge doesn't indent it).
-            While busy, show the op step in place of the title row. */}
+            Hidden while busy — the op step shows in the top block instead. */}
         {!busy ? (
           <p className="break-words text-sm font-medium leading-snug text-slate-800 dark:text-slate-100">
             {host.unread && !selected ? (
@@ -330,18 +444,9 @@ export function SidebarHost({
             ) : null}
             {host.displayName ?? host.id}
           </p>
-        ) : (
-          <div className="flex items-center gap-2">
-            <span className="min-w-0 flex-1 break-words text-sm font-medium text-slate-800 dark:text-slate-100">
-              {host.displayName ?? host.id}
-            </span>
-            <span className="shrink-0 text-[10px] font-medium text-sky-600 dark:text-sky-400">
-              {op?.kind === "delete" ? "deleting…" : op?.step}
-            </span>
-          </div>
-        )}
+        ) : null}
 
-        {/* Row 3: agent state note (or status label fallback), colored by status. */}
+        {/* Agent state note (or status label fallback), colored by status. */}
         {!busy ? (
           <p
             className={`mt-1 line-clamp-2 text-xs leading-snug ${status.text}`}
@@ -350,18 +455,12 @@ export function SidebarHost({
             {[host.linearLabel, host.stateNote || status.label].filter(Boolean).join(" · ")}
           </p>
         ) : null}
-      </div>
 
-      {/* Commit / change-account / delete collapsed into a ⋯ overflow menu. */}
-      <OverflowMenu
-        hostId={host.id}
-        managed={managed}
-        busy={busy}
-        onCommit={onCommit}
-        onChangeAccount={onChangeAccount}
-        onPortForward={onPortForward}
-        onDelete={onDelete}
-      />
+        {/* Compact list of this host's port forwards (remote→local, live status dot). */}
+        {!busy && host.forwards && host.forwards.length > 0 ? (
+          <ForwardChips forwards={host.forwards} runtime={forwardRuntime ?? []} />
+        ) : null}
+      </div>
     </div>
   );
 }

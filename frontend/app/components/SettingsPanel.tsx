@@ -463,9 +463,12 @@ export function SettingsPanel({
       onClick={onClose}
     >
       <div
-        className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5 shadow-xl"
+        className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Scrollable body. The footer lives outside this so it stays flush to the
+            panel's bottom edge instead of floating above the scroll container's padding. */}
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">Settings</h2>
           <button
@@ -1115,28 +1118,32 @@ export function SettingsPanel({
                 </div>
               ) : null}
             </Section>
-
-            {/* Footer. */}
-            <div className="sticky bottom-0 -mx-5 -mb-5 flex items-center justify-end gap-2 border-t border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-800 px-5 py-3">
-              {saved ? <span className="mr-auto text-xs font-medium text-emerald-600 dark:text-emerald-400">Saved ✓</span> : null}
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded border border-slate-300 dark:border-slate-600 px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
-              >
-                Close
-              </button>
-              <button
-                type="button"
-                onClick={save}
-                disabled={saving}
-                className="rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
-              >
-                {saving ? "Saving…" : "Save"}
-              </button>
-            </div>
           </div>
         )}
+        </div>
+
+        {/* Footer — a flex sibling of the scroll body, so it's always pinned flush to
+            the panel's bottom edge. Only shown once the config has loaded. */}
+        {cfg ? (
+          <div className="flex items-center justify-end gap-2 border-t border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-800 px-5 py-3">
+            {saved ? <span className="mr-auto text-xs font-medium text-emerald-600 dark:text-emerald-400">Saved ✓</span> : null}
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-slate-300 dark:border-slate-600 px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              onClick={save}
+              disabled={saving}
+              className="rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

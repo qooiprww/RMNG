@@ -90,7 +90,38 @@ export const hostUnmanaged: Host = {
   monitorState: "idle",
 };
 
-export const hosts: Host[] = [hostWorking, hostIdle, hostOffline, hostNoToken, hostUnmanaged];
+/** A managed clone holding *both* providers: a pinned Claude account and a Codex group.
+ *  Exercises the two-line sidebar layout (Claude line + Codex line, CPU on the first /
+ *  MEM on the second) and a Codex group badge. */
+export const hostDualProvider: Host = {
+  id: "pega-dual-9",
+  host: "10.99.0.14",
+  port: 3389,
+  username: "pega",
+  password: "",
+  managed: true,
+  source: "rmng/template:base",
+  claudeAccountEmail: "alex@example.com",
+  claudeSelection: "alex@example.com",
+  codexGroup: "team",
+  codexAccountEmail: "alex@openai.com",
+  codexSelection: "group:team",
+  linearWorkspace: "we",
+  linearTicket: "WE-207",
+  displayName: "Port the encoder path to the new VA surface pool",
+  monitorState: "working",
+  agentReport: "working",
+  stateNote: "Wiring the dual-provider account pickers into the clone modal",
+};
+
+export const hosts: Host[] = [
+  hostWorking,
+  hostIdle,
+  hostOffline,
+  hostNoToken,
+  hostUnmanaged,
+  hostDualProvider,
+];
 export const hostIds: string[] = hosts.map((h) => h.id);
 
 // --- live container usage (the volatile `stats` SSE map) --------------------
@@ -109,6 +140,11 @@ export const stats: Record<string, ContainerStats> = {
   [hostNoToken.id]: {
     cpuPct: 3,
     memUsed: BigInt(Math.round(0.6 * GiB)),
+    memLimit: BigInt(32 * GiB),
+  },
+  [hostDualProvider.id]: {
+    cpuPct: 288, // ÷ cloneCpus(16) → 18% of the clone's allowance
+    memUsed: BigInt(Math.round(3.2 * GiB)),
     memLimit: BigInt(32 * GiB),
   },
 };

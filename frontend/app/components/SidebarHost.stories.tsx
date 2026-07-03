@@ -6,6 +6,7 @@ import { fn } from "storybook/test";
 import { SidebarHost } from "./SidebarHost";
 import {
   deleteOperation,
+  hostDualProvider,
   hostIdle,
   hostIds,
   hostNoToken,
@@ -57,6 +58,12 @@ export const Idle: Story = {
   args: { host: hostIdle, stats: stats[hostIdle.id] },
 };
 
+/** Both providers: a pinned Claude account on line 1 and a Codex group on line 2, with
+ *  CPU on the Claude line and MEM on the Codex line, and the ⋯ spanning both. */
+export const DualProvider: Story = {
+  args: { host: hostDualProvider, stats: stats[hostDualProvider.id] },
+};
+
 /** Offline (wrapper unreachable), Claude on auto. */
 export const Offline: Story = {
   args: { host: hostOffline },
@@ -95,5 +102,28 @@ export const LongTitleAndDescription: Story = {
         "Reproduced on CT 106 — the reconnect loop fires because the daemon re-applies the monitor layout before the encoder releases the previous VA surface; drafting a fix that serializes the two on the shared clone-daemon unit and adds a backoff",
     },
     stats: stats[hostWorking.id],
+  },
+};
+
+/** Compact port-forward chips under the state note — one `remote→local` chip per rule
+ *  with a live status dot, covering every state: listening (with active-conn count),
+ *  error, offline (no runtime yet), and a muted rule toggled off. */
+export const WithForwards: Story = {
+  args: {
+    host: {
+      ...hostWorking,
+      forwards: [
+        { id: "f8080", remotePort: 3000, localPort: 8080, enabled: true, label: null },
+        { id: "f9000", remotePort: 9000, localPort: 9000, enabled: true, label: null },
+        { id: "f5433", remotePort: 5432, localPort: 5433, enabled: true, label: null },
+        { id: "f7000", remotePort: 7000, localPort: 7000, enabled: false, label: null },
+      ],
+    },
+    stats: stats[hostWorking.id],
+    forwardRuntime: [
+      { id: "f8080", state: "listening", error: null, activeConns: 2 },
+      { id: "f9000", state: "error", error: "connection refused", activeConns: 0 },
+      // f5433 has no runtime entry → offline; f7000 is disabled → muted.
+    ],
   },
 };

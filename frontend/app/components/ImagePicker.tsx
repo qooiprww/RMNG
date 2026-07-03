@@ -1,5 +1,5 @@
-// Radio list of clone-source images, used inside the clone dialog. Takes the
-// image list as props (the dashboard owns the `/api/images` fetch), preselects the
+// Dropdown of clone-source images, used inside the clone dialog. Takes the image
+// list as props (the dashboard owns the `/api/images` fetch), preselects the
 // wizard-built base (`base: true`) — or the first image — and reports the chosen
 // reference up via `onChange`. Shows a loading / empty state (empty = no base
 // image yet: the operator must build one in the wizard or the Images panel first).
@@ -43,39 +43,18 @@ export function ImagePicker({
   }
 
   return (
-    <div className="mt-1 space-y-1.5">
-      {images.map((img) => {
-        const selected = value === img.reference;
-        return (
-          <label
-            key={img.reference}
-            className={`flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-2 text-xs ${
-              selected
-                ? "border-emerald-400 bg-emerald-50 dark:bg-emerald-950"
-                : "border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
-            }`}
-          >
-            <input
-              type="radio"
-              name="clone-image"
-              checked={selected}
-              onChange={() => onChange(img.reference)}
-              className="shrink-0"
-            />
-            <span className="min-w-0 flex-1 truncate font-medium text-slate-800 dark:text-slate-100">
-              {img.reference}
-            </span>
-            {img.base ? (
-              <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400">
-                base
-              </span>
-            ) : null}
-            <span className="shrink-0 text-slate-400 dark:text-slate-500">
-              {formatBytes(img.sizeBytes)} · {relativeAge(img.createdAt)}
-            </span>
-          </label>
-        );
-      })}
-    </div>
+    <select
+      aria-label="Source image"
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value)}
+      className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
+    >
+      {images.map((img) => (
+        <option key={img.reference} value={img.reference}>
+          {img.reference}
+          {img.base ? " · base" : ""} · {formatBytes(img.sizeBytes)} · {relativeAge(img.createdAt)}
+        </option>
+      ))}
+    </select>
   );
 }

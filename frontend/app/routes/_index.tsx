@@ -297,6 +297,7 @@ function Dashboard({
           accounts={state.claudeAccounts ?? []}
           hosts={orderedHosts}
           stats={stats}
+          forwards={forwards}
           operations={state.operations}
           selectedId={state.selected}
           cloneCpus={cloneCpus}

@@ -20,6 +20,7 @@ import { OperationProgress } from "~/components/OperationProgress";
 import { SidebarHost } from "~/components/SidebarHost";
 import type { ClaudeUsage, Host, Operation } from "~/lib/types";
 import type { ContainerStats } from "~/lib/wire/ContainerStats";
+import type { ForwardRuntime } from "~/lib/wire/ForwardRuntime";
 
 export interface SidebarProps {
   /** Off-canvas drawer state (< lg); the panel is static + always visible ≥ lg. */
@@ -30,6 +31,9 @@ export interface SidebarProps {
   hosts: Host[];
   /** Live per-host CPU/RAM map (the volatile `stats` SSE event). */
   stats: Record<string, ContainerStats>;
+  /** Live per-host forward-runtime map (the `forwards` SSE event), fanned out to each
+   *  host row's compact forwards chips. */
+  forwards?: Record<string, ForwardRuntime[]>;
   /** All operations; the sidebar derives per-host badges, the clone-busy state,
    *  and the Activity list from these. */
   operations: Operation[];
@@ -62,6 +66,7 @@ export function Sidebar({
   accounts,
   hosts,
   stats,
+  forwards = {},
   operations,
   selectedId,
   cloneCpus,
@@ -159,6 +164,7 @@ export function Sidebar({
                     key={host.id}
                     host={host}
                     stats={stats[host.id]}
+                    forwardRuntime={forwards[host.id]}
                     cloneCpus={cloneCpus}
                     selected={selectedId === host.id}
                     op={opForHost(host.id)}
