@@ -31,11 +31,11 @@ export function ImagePicker({
   }, [images, value, onChange]);
 
   if (loading && images.length === 0) {
-    return <p className="mt-1 text-xs text-slate-400">Loading images…</p>;
+    return <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">Loading images…</p>;
   }
   if (images.length === 0) {
     return (
-      <p className="mt-1 rounded-md border border-dashed border-slate-300 p-3 text-center text-[11px] text-slate-400">
+      <p className="mt-1 rounded-md border border-dashed border-slate-300 p-3 text-center text-[11px] text-slate-400 dark:border-slate-600 dark:text-slate-500">
         No clone-source images yet. Build a base image from the Images panel (or re-run setup)
         first.
       </p>
@@ -51,8 +51,8 @@ export function ImagePicker({
             key={img.reference}
             className={`flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-2 text-xs ${
               selected
-                ? "border-emerald-400 bg-emerald-50"
-                : "border-slate-200 hover:bg-slate-50"
+                ? "border-emerald-400 bg-emerald-50 dark:bg-emerald-950"
+                : "border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
             }`}
           >
             <input
@@ -62,15 +62,15 @@ export function ImagePicker({
               onChange={() => onChange(img.reference)}
               className="shrink-0"
             />
-            <span className="min-w-0 flex-1 truncate font-medium text-slate-800">
+            <span className="min-w-0 flex-1 truncate font-medium text-slate-800 dark:text-slate-100">
               {img.reference}
             </span>
             {img.base ? (
-              <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+              <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400">
                 base
               </span>
             ) : null}
-            <span className="shrink-0 text-slate-400">
+            <span className="shrink-0 text-slate-400 dark:text-slate-500">
               {formatBytes(img.sizeBytes)} · {relativeAge(img.createdAt)}
             </span>
           </label>

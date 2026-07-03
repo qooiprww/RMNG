@@ -1,3 +1,4 @@
+import { ChevronDown, ChevronRight, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
@@ -8,7 +9,7 @@ import { ImagesSection } from "~/components/ImagesSection";
 import { MonitorsEditor, type Mon } from "~/components/MonitorsEditor";
 
 const input =
-  "w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-slate-400 focus:outline-none";
+  "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none";
 
 /** When a changed setting takes effect. Placed on section headers / fields to set
  *  expectations: `immediate` applies on save, `restart` needs a control-server
@@ -18,10 +19,10 @@ const input =
 function EffectBadge({ effect }: { effect: "immediate" | "restart" | "one-time" }) {
   const style =
     effect === "immediate"
-      ? "bg-emerald-100 text-emerald-700"
+      ? "bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400"
       : effect === "restart"
-        ? "bg-amber-100 text-amber-700"
-        : "bg-slate-100 text-slate-500";
+        ? "bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400"
+        : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400";
   return (
     <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${style}`}>{effect}</span>
   );
@@ -39,12 +40,12 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="border-t border-slate-100 pt-4">
+    <section className="border-t border-slate-100 dark:border-slate-800 pt-4">
       <div className="flex items-center gap-2">
-        <h3 className="text-sm font-semibold text-slate-800">{title}</h3>
+        <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-100">{title}</h3>
         {effect ? <EffectBadge effect={effect} /> : null}
       </div>
-      {hint ? <p className="mb-2 mt-0.5 text-xs text-slate-400">{hint}</p> : <div className="mb-2" />}
+      {hint ? <p className="mb-2 mt-0.5 text-xs text-slate-400 dark:text-slate-500">{hint}</p> : <div className="mb-2" />}
       {children}
     </section>
   );
@@ -53,7 +54,7 @@ function Section({
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="mb-0.5 block text-xs font-medium text-slate-500">{label}</span>
+      <span className="mb-0.5 block text-xs font-medium text-slate-500 dark:text-slate-400">{label}</span>
       {children}
     </label>
   );
@@ -84,7 +85,7 @@ function Secret({
         />
         <span
           className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-            set ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-400"
+            set ? "bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400" : "bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500"
           }`}
         >
           {set ? "set" : "unset"}
@@ -358,35 +359,35 @@ export function SettingsPanel({
       onClick={onClose}
     >
       <div
-        className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-xl"
+        className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-slate-900">Settings</h2>
+          <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">Settings</h2>
           <button
             type="button"
             onClick={onClose}
-            className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+            className="rounded p-1 text-slate-400 dark:text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-600 dark:hover:text-slate-300"
             aria-label="Close"
           >
-            ✕
+            <X className="size-4" />
           </button>
         </div>
 
         {error ? (
-          <div className="mb-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          <div className="mb-3 rounded border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 px-3 py-2 text-xs text-red-700 dark:text-red-400">
             {error}
           </div>
         ) : null}
 
         {restartRequired ? (
-          <div className="mb-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <div className="mb-3 rounded border border-amber-300 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-400">
             Run <code>docker restart rmng</code> to apply the changed port/socket/video settings.
           </div>
         ) : null}
 
         {!cfg ? (
-          <p className="py-8 text-center text-sm text-slate-400">Loading…</p>
+          <p className="py-8 text-center text-sm text-slate-400 dark:text-slate-500">Loading…</p>
         ) : (
           <div className="space-y-4">
             {/* Monitors — size, position + primary per monitor, with a live preview. */}
@@ -412,9 +413,9 @@ export function SettingsPanel({
               hint="A preset = Linear API key + the ticket labels that auto-select it + env vars, written to the clone's session env at creation. The key is also injected as LINEAR_API_KEY (auths the clone's `linear` MCP). Cloning from a ticket auto-picks by label; other clones require an explicit pick."
             >
               <div className="space-y-3">
-                {presets.length === 0 ? <p className="text-xs text-slate-400">No presets.</p> : null}
+                {presets.length === 0 ? <p className="text-xs text-slate-400 dark:text-slate-500">No presets.</p> : null}
                 {presets.map((p, i) => (
-                  <div key={i} className="rounded border border-slate-200 p-3">
+                  <div key={i} className="rounded border border-slate-200 dark:border-slate-700 p-3">
                     <div className="flex items-center gap-2">
                       <input
                         value={p.name}
@@ -425,7 +426,7 @@ export function SettingsPanel({
                       <button
                         type="button"
                         onClick={() => rmPreset(i)}
-                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
+                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
                         Remove
                       </button>
@@ -436,7 +437,7 @@ export function SettingsPanel({
                         onChange={(e) => setPresetField(i, "labels", e.target.value)}
                         placeholder="Linear ticket labels, comma-separated (auto-selects this preset)"
                         spellCheck={false}
-                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:border-slate-400 focus:outline-none"
+                        className="w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none"
                       />
                     </div>
                     <div className="mt-1.5">
@@ -455,23 +456,23 @@ export function SettingsPanel({
                             onChange={(e) => setVar(i, k, "key", e.target.value)}
                             placeholder="KEY"
                             spellCheck={false}
-                            className="w-2/5 rounded border border-slate-300 px-2 py-1 font-mono text-xs focus:border-slate-400 focus:outline-none"
+                            className="w-2/5 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 font-mono text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none"
                           />
-                          <span className="text-slate-400">=</span>
+                          <span className="text-slate-400 dark:text-slate-500">=</span>
                           <input
                             value={v.value}
                             onChange={(e) => setVar(i, k, "value", e.target.value)}
                             placeholder="value"
                             spellCheck={false}
-                            className="flex-1 rounded border border-slate-300 px-2 py-1 font-mono text-xs focus:border-slate-400 focus:outline-none"
+                            className="flex-1 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 font-mono text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none"
                           />
                           <button
                             type="button"
                             onClick={() => rmVar(i, k)}
                             title="remove variable"
-                            className="shrink-0 rounded px-2 py-1 text-xs text-slate-400 hover:bg-slate-100"
+                            className="shrink-0 rounded px-2 py-1 text-xs text-slate-400 dark:text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
                           >
-                            ×
+                            <X className="size-4" />
                           </button>
                         </div>
                       ))}
@@ -479,7 +480,7 @@ export function SettingsPanel({
                     <button
                       type="button"
                       onClick={() => addVar(i)}
-                      className="mt-2 rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                      className="mt-2 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                     >
                       + Add variable
                     </button>
@@ -488,7 +489,7 @@ export function SettingsPanel({
                 <button
                   type="button"
                   onClick={addPreset}
-                  className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                  className="rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   + Add preset
                 </button>
@@ -502,15 +503,15 @@ export function SettingsPanel({
                   <button
                     type="button"
                     onClick={runTest}
-                    className="rounded border border-slate-300 px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                    className="rounded border border-slate-300 dark:border-slate-600 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                   >
                     Test Docker
                   </button>
-                  {testMsg ? <p className="text-xs text-slate-500">{testMsg}</p> : null}
+                  {testMsg ? <p className="text-xs text-slate-500 dark:text-slate-400">{testMsg}</p> : null}
                 </div>
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-medium text-slate-500">Clone hostname prefix</span>
+                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Clone hostname prefix</span>
                     <EffectBadge effect="immediate" />
                   </div>
                   <input
@@ -519,7 +520,7 @@ export function SettingsPanel({
                     placeholder="pega-"
                     className={`mt-0.5 ${input}`}
                   />
-                  <p className="mt-0.5 text-xs text-slate-400">
+                  <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
                     Prepended to derived clone hostnames — e.g. <code>{hostnamePrefix || "pega-"}</code>dev-123 /{" "}
                     <code>{hostnamePrefix || "pega-"}</code>my-task. Lowercased + sanitized to a DNS label; blank keeps
                     the current value.
@@ -527,7 +528,7 @@ export function SettingsPanel({
                 </div>
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-medium text-slate-500">Template reference</span>
+                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Template reference</span>
                     <EffectBadge effect="immediate" />
                   </div>
                   <input
@@ -537,7 +538,7 @@ export function SettingsPanel({
                     spellCheck={false}
                     className={`mt-0.5 ${input}`}
                   />
-                  <p className="mt-0.5 text-xs text-slate-400">
+                  <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
                     Registry <code>repo:tag</code> the wizard/Images panel pulls the clone template
                     from, then retags locally to <code>rmng/template:&lt;name&gt;</code>. Read fresh on
                     each pull.
@@ -547,7 +548,7 @@ export function SettingsPanel({
                     setup, so it's one-time: editable only during first-run setup. */}
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-medium text-slate-500">Clone network subnet</span>
+                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Clone network subnet</span>
                     <EffectBadge effect="one-time" />
                   </div>
                   <input
@@ -556,9 +557,9 @@ export function SettingsPanel({
                     disabled={cfg.setupComplete}
                     placeholder="10.99.0.0/24"
                     spellCheck={false}
-                    className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                    className={`mt-0.5 ${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
                   />
-                  <p className="mt-0.5 text-xs text-slate-400">
+                  <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
                     {cfg.setupComplete
                       ? "Set during first-run setup — baked into the rmng network + clone IPs, cannot be changed."
                       : "IPv4 CIDR (/16–/24) for the rmng bridge — .1 gateway, .2 control-server, .10+ clone pool."}
@@ -567,7 +568,7 @@ export function SettingsPanel({
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">CPU limit per clone (cores)</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">CPU limit per clone (cores)</span>
                       <EffectBadge effect="immediate" />
                     </div>
                     <input
@@ -580,7 +581,7 @@ export function SettingsPanel({
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Memory limit per clone (MB)</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Memory limit per clone (MB)</span>
                       <EffectBadge effect="immediate" />
                     </div>
                     <input
@@ -592,7 +593,7 @@ export function SettingsPanel({
                     />
                   </div>
                 </div>
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-slate-400 dark:text-slate-500">
                   Limits apply to newly created clones (existing clones keep the limits they were
                   created with).
                 </p>
@@ -635,7 +636,7 @@ export function SettingsPanel({
                     className={input}
                   />
                 </Field>
-                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600">
+                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
                   <input
                     type="checkbox"
                     checked={claude.autoSwapOnExhaustion}
@@ -653,10 +654,10 @@ export function SettingsPanel({
             >
               <div className="space-y-3">
                 {claudeGroups.length === 0 ? (
-                  <p className="text-xs text-slate-400">No groups.</p>
+                  <p className="text-xs text-slate-400 dark:text-slate-500">No groups.</p>
                 ) : null}
                 {claudeGroups.map((g, i) => (
-                  <div key={i} className="rounded border border-slate-200 p-3">
+                  <div key={i} className="rounded border border-slate-200 dark:border-slate-700 p-3">
                     <div className="flex items-center gap-2">
                       <input
                         value={g.name}
@@ -667,19 +668,19 @@ export function SettingsPanel({
                       <button
                         type="button"
                         onClick={() => rmGroup(i)}
-                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
+                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
                         Remove
                       </button>
                     </div>
                     {accountEmails.length === 0 ? (
-                      <p className="mt-2 text-xs text-slate-400">
+                      <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
                         Import some accounts first to add them to a group.
                       </p>
                     ) : (
                       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
                         {accountEmails.map((email) => (
-                          <label key={email} className="flex items-center gap-1.5 text-xs text-slate-600">
+                          <label key={email} className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
                             <input
                               type="checkbox"
                               checked={g.accounts.includes(email)}
@@ -695,7 +696,7 @@ export function SettingsPanel({
                 <button
                   type="button"
                   onClick={addGroup}
-                  className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                  className="rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   + Add group
                 </button>
@@ -738,9 +739,10 @@ export function SettingsPanel({
               <button
                 type="button"
                 onClick={() => setAdvanced((a) => !a)}
-                className="text-xs font-medium text-slate-500 hover:text-slate-700"
+                className="flex items-center gap-1 text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
               >
-                {advanced ? "▾ Hide" : "▸ Show"} ports + directories (restart the control-server to apply)
+                {advanced ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+                {advanced ? "Hide" : "Show"} ports + directories (restart the control-server to apply)
               </button>
               {advanced ? (
                 <div className="mt-2 grid grid-cols-2 gap-3">
@@ -749,7 +751,7 @@ export function SettingsPanel({
                   {(["web", "video", "cloneMcp", "globalMcp"] as const).map((k) => (
                     <div key={k}>
                       <div className="flex items-center gap-2">
-                        <span className="text-xs font-medium text-slate-500">Port: {k}</span>
+                        <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Port: {k}</span>
                         <EffectBadge effect="restart" />
                       </div>
                       <input
@@ -762,7 +764,7 @@ export function SettingsPanel({
                   ))}
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Port: daemonMcp</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Port: daemonMcp</span>
                       <EffectBadge effect="immediate" />
                     </div>
                     <input
@@ -771,11 +773,11 @@ export function SettingsPanel({
                       onChange={(e) => setListen({ ...listen, daemonMcp: Number(e.target.value) || 0 })}
                       className={`mt-0.5 ${input}`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">must match what clones bake in: 9004</p>
+                    <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">must match what clones bake in: 9004</p>
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Agent-wrapper port</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Agent-wrapper port</span>
                       <EffectBadge effect="immediate" />
                     </div>
                     <input
@@ -784,22 +786,22 @@ export function SettingsPanel({
                       onChange={(e) => setAgentPort(Number(e.target.value) || 0)}
                       className={`mt-0.5 ${input}`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">must match what clones bake in: 4096</p>
+                    <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">must match what clones bake in: 4096</p>
                   </div>
                   {/* Data dir is the control-server's WORKDIR inside its container: fixed at
                       /data (the mounted volume). Shown read-only for reference. */}
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Data dir</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Data dir</span>
                       <EffectBadge effect="one-time" />
                     </div>
                     <input
                       value={dataDir}
                       readOnly
                       disabled
-                      className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                      className={`mt-0.5 ${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">
+                    <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
                       fixed at <code>/data</code> in the container (the mounted volume)
                     </p>
                   </div>
@@ -807,7 +809,7 @@ export function SettingsPanel({
                       mounted sock volume; shown read-only. */}
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Clone socket</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Clone socket</span>
                       <EffectBadge effect="one-time" />
                     </div>
                     <input
@@ -816,15 +818,15 @@ export function SettingsPanel({
                       disabled
                       placeholder="/srv/rmng-sock/clones.sock"
                       spellCheck={false}
-                      className={`mt-0.5 ${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                      className={`mt-0.5 ${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">
+                    <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
                       fixed by the container's shared sock volume
                     </p>
                   </div>
                   <div className="col-span-2">
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Static (frontend) dir</span>
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Static (frontend) dir</span>
                       <EffectBadge effect="restart" />
                     </div>
                     <input
@@ -833,19 +835,19 @@ export function SettingsPanel({
                       spellCheck={false}
                       className={`mt-0.5 ${input}`}
                     />
-                    <p className="mt-0.5 text-xs text-slate-400">empty = built-in (embedded) frontend</p>
+                    <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">empty = built-in (embedded) frontend</p>
                   </div>
                 </div>
               ) : null}
             </Section>
 
             {/* Footer. */}
-            <div className="sticky bottom-0 -mx-5 -mb-5 flex items-center justify-end gap-2 border-t border-slate-100 bg-white px-5 py-3">
-              {saved ? <span className="mr-auto text-xs font-medium text-emerald-600">Saved ✓</span> : null}
+            <div className="sticky bottom-0 -mx-5 -mb-5 flex items-center justify-end gap-2 border-t border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-800 px-5 py-3">
+              {saved ? <span className="mr-auto text-xs font-medium text-emerald-600 dark:text-emerald-400">Saved ✓</span> : null}
               <button
                 type="button"
                 onClick={onClose}
-                className="rounded border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
+                className="rounded border border-slate-300 dark:border-slate-600 px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
               >
                 Close
               </button>
@@ -853,7 +855,7 @@ export function SettingsPanel({
                 type="button"
                 onClick={save}
                 disabled={saving}
-                className="rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+                className="rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
               >
                 {saving ? "Saving…" : "Save"}
               </button>

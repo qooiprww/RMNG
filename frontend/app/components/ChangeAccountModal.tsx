@@ -47,28 +47,28 @@ export function ChangeAccountModal({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl"
+        className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-800"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === "Escape") onClose();
         }}
       >
-        <h3 className="text-sm font-semibold text-slate-900">
-          Claude account · <span className="text-emerald-700">{host.displayName ?? host.id}</span>
+        <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+          Claude account · <span className="text-emerald-700 dark:text-emerald-400">{host.displayName ?? host.id}</span>
         </h3>
-        <p className="mt-1 text-xs text-slate-500">
+        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
           Pick a single account, a group (stays on one account until it exhausts,
           then swaps to the least-used member), or “none” to remove this clone’s token.
         </p>
 
-        <label className="mt-4 block text-xs font-medium text-slate-600">
+        <label className="mt-4 block text-xs font-medium text-slate-600 dark:text-slate-300">
           Account or group
           <AccountGroupSelect
             groups={groups}
             accounts={accounts}
             value={value}
             onChange={setValue}
-            className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none"
+            className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
           />
         </label>
 
@@ -76,7 +76,7 @@ export function ChangeAccountModal({
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
+            className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
           >
             Cancel
           </button>

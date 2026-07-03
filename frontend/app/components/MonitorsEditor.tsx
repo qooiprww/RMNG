@@ -23,7 +23,7 @@ function LayoutPreview({ monitors }: { monitors: Mon[] }) {
   return (
     <svg
       viewBox={`0 0 ${BOX_W} ${BOX_H}`}
-      className="mb-3 h-[150px] w-full rounded border border-slate-200 bg-slate-50"
+      className="mb-3 h-[150px] w-full rounded border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900"
       role="img"
       aria-label="monitor layout preview"
     >
@@ -94,7 +94,7 @@ export function MonitorsEditor({
     <>
       <LayoutPreview monitors={monitors} />
       <div className="space-y-1.5">
-        <div className="flex items-center gap-2 px-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+        <div className="flex items-center gap-2 px-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400 dark:text-slate-500">
           <span className="w-5">#</span>
           <span className="w-[4.5rem]">width</span>
           <span className="w-[4.5rem]">height</span>
@@ -104,7 +104,7 @@ export function MonitorsEditor({
         </div>
         {monitors.map((m, i) => (
           <div key={i} className="flex items-center gap-2">
-            <span className="w-5 text-xs text-slate-400">{i}</span>
+            <span className="w-5 text-xs text-slate-400 dark:text-slate-500">{i}</span>
             {(["width", "height", "x", "y"] as const).map((k) => (
               <input
                 key={k}
@@ -112,7 +112,7 @@ export function MonitorsEditor({
                 value={m[k]}
                 min={k === "width" || k === "height" ? 1 : 0}
                 onChange={(e) => setMon(i, k, Number(e.target.value) || 0)}
-                className="w-[4.5rem] rounded border border-slate-300 px-1.5 py-1 text-sm focus:border-slate-400 focus:outline-none"
+                className="w-[4.5rem] rounded border border-slate-300 px-1.5 py-1 text-sm focus:border-slate-400 focus:outline-none dark:border-slate-600 dark:focus:border-slate-500"
               />
             ))}
             <input
@@ -127,7 +127,7 @@ export function MonitorsEditor({
               type="button"
               onClick={() => rmMon(i)}
               disabled={monitors.length <= 1}
-              className="ml-auto rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-100 disabled:opacity-40"
+              className="ml-auto rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-100 disabled:opacity-40 dark:text-slate-400 dark:hover:bg-slate-800"
             >
               Remove
             </button>
@@ -140,7 +140,7 @@ export function MonitorsEditor({
             key={p.label}
             type="button"
             onClick={() => addMon(p)}
-            className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+            className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
           >
             + {p.label} ({p.width}×{p.height})
           </button>
@@ -149,7 +149,7 @@ export function MonitorsEditor({
       {/* Apply to running clones (saves + restarts each clone's desktop). Hidden when
           the host has no clones to apply to (the wizard omits onApply). */}
       {onApply ? (
-        <div className="mt-3 flex items-center gap-3 border-t border-slate-100 pt-3">
+        <div className="mt-3 flex items-center gap-3 border-t border-slate-100 pt-3 dark:border-slate-800">
           <button
             type="button"
             onClick={() => onApply()}
@@ -158,7 +158,7 @@ export function MonitorsEditor({
           >
             {applying ? "Applying…" : "Apply to running clones"}
           </button>
-          <span className="text-xs text-slate-500">
+          <span className="text-xs text-slate-500 dark:text-slate-400">
             {applyMsg ?? "Saves the layout, then restarts each running clone's desktop to apply it."}
           </span>
         </div>

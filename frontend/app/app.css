@@ -1,7 +1,24 @@
 @import "tailwindcss";
 
+/* `dark:*` applies when the OS is in dark mode (the app is auto/device-driven, no
+   toggle) OR when a `.dark` ancestor is present. The media query keeps the real app
+   automatic; the `.dark` class hook exists only so Storybook's theme toolbar can
+   force-preview dark on a light-OS machine. */
+@custom-variant dark {
+  @media (prefers-color-scheme: dark) {
+    @slot;
+  }
+  &:where(.dark, .dark *) {
+    @slot;
+  }
+}
+
+/* Auto light/dark from the OS: `color-scheme: light dark` lets the browser theme
+   native controls (scrollbars, form widgets, spinners) for whichever the device is
+   in. Combined with the `dark:` variant above, the whole app switches automatically
+   with the system setting. */
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
 }
 
 html,
@@ -10,6 +27,14 @@ body {
   color: #0f172a;
   font-family:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  html,
+  body {
+    background: #0b0f1a;
+    color: #e2e8f0;
+  }
 }
 
 /* Notes: links are disabled (see HostEditor.tsx). New ones can't be created, but

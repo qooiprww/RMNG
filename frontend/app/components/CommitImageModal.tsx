@@ -37,21 +37,21 @@ export function CommitImageModal({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl"
+        className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-800"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === "Escape") onClose();
         }}
       >
-        <h3 className="text-sm font-semibold text-slate-900">
-          Commit <span className="text-emerald-700">{hostId}</span> to an image
+        <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+          Commit <span className="text-emerald-700 dark:text-emerald-400">{hostId}</span> to an image
         </h3>
-        <p className="mt-1 text-xs text-slate-500">
+        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
           Snapshots this clone's filesystem to a new clone-source image (tagged under{" "}
           <code>rmng/template</code>). Other clones can then be created from it.
         </p>
 
-        <label className="mt-4 block text-xs font-medium text-slate-600">
+        <label className="mt-4 block text-xs font-medium text-slate-600 dark:text-slate-300">
           Image name
           <input
             autoFocus
@@ -62,20 +62,20 @@ export function CommitImageModal({
             }}
             placeholder="my-snapshot"
             spellCheck={false}
-            className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none"
+            className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
           />
           {trimmed && !labelOk ? (
-            <p className="mt-1 text-[11px] font-normal text-red-600">
+            <p className="mt-1 text-[11px] font-normal text-red-600 dark:text-red-400">
               lowercase letters, digits and hyphens only (no leading/trailing hyphen, ≤63 chars)
             </p>
           ) : (
-            <p className="mt-1 text-[11px] font-normal text-slate-400">
+            <p className="mt-1 text-[11px] font-normal text-slate-400 dark:text-slate-500">
               → <code>rmng/template:{trimmed || "…"}</code>
             </p>
           )}
         </label>
 
-        <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+        <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-400">
           The commit bakes this clone's on-disk credentials (Claude token, Linear key) into the
           image. Only build images from clones you trust to redistribute.
         </p>
@@ -84,7 +84,7 @@ export function CommitImageModal({
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
+            className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
           >
             Cancel
           </button>

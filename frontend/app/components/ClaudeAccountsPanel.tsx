@@ -4,6 +4,7 @@
 // utilization you'd be at if you spent the quota uniformly across the window
 // (elapsed fraction of [resetsAt - windowLength, resetsAt]); fill past the marker
 // = burning faster than uniform.
+import { Plus, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import chatgptLogo from "../assets/chatgpt.png";
@@ -62,18 +63,18 @@ function Bar({
   const pace = now != null ? pacePct(win.resetsAt, windowMs, now) : null;
   return (
     <div className="flex items-center gap-1.5">
-      <span className="w-4 shrink-0 text-[10px] font-medium text-slate-500">{label}</span>
-      <div className="relative h-1.5 flex-1 overflow-hidden rounded-sm bg-slate-200">
+      <span className="w-4 shrink-0 text-[10px] font-medium text-slate-500 dark:text-slate-400">{label}</span>
+      <div className="relative h-1.5 flex-1 overflow-hidden rounded-sm bg-slate-200 dark:bg-slate-700">
         <div className={`h-full ${barColor(pct)}`} style={{ width: `${Math.max(1, pct)}%` }} />
         {pace != null ? (
           <div
-            className="absolute top-0 h-full w-px bg-slate-900/70"
+            className="absolute top-0 h-full w-px bg-slate-900/70 dark:bg-slate-100/70"
             style={{ left: `${pace}%` }}
             title={`uniform pace ${Math.round(pace)}%`}
           />
         ) : null}
       </div>
-      <span className="w-8 shrink-0 text-right text-[11px] font-medium tabular-nums text-slate-700">
+      <span className="w-8 shrink-0 text-right text-[11px] font-medium tabular-nums text-slate-700 dark:text-slate-200">
         {pct}%
       </span>
     </div>
@@ -89,11 +90,11 @@ function Row({ a, now }: { a: ClaudeUsage; now: number | null }) {
           alt={a.provider === "codex" ? "ChatGPT" : "Claude"}
           className="h-4 w-4 shrink-0 rounded-[3px] object-contain"
         />
-        <span className="min-w-0 flex-1 truncate text-[11px] text-slate-700">
+        <span className="min-w-0 flex-1 truncate text-[11px] text-slate-700 dark:text-slate-200">
           {a.email}
         </span>
         {a.spend ? (
-          <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+          <span className="shrink-0 text-[10px] tabular-nums text-slate-500 dark:text-slate-400">
             {spendLine(a.spend)}
           </span>
         ) : null}
@@ -138,7 +139,7 @@ export function ClaudeAccountsPanel({
   return (
     <div>
       <div className="flex items-center justify-between px-1">
-        <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+        <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
           Usage{accounts.length ? ` (${accounts.length})` : ""}
         </h2>
         {accounts.length > 0 ? (
@@ -148,17 +149,17 @@ export function ClaudeAccountsPanel({
               onClick={() => onImport()}
               disabled={busy}
               title="Import a Claude account from a clone"
-              className="rounded px-1 text-[12px] leading-none text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50"
+              className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-300"
             >
-              +
+              <Plus className="size-4" />
             </button>
             <button
               type="button"
               onClick={wrap(onRefresh)}
               disabled={busy}
-              className="rounded px-1 text-[10px] text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50"
+              className="rounded px-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-300"
             >
-              {busy ? "…" : "↻"}
+              {busy ? "…" : <RefreshCw className="size-4" />}
             </button>
           </div>
         ) : null}
@@ -168,12 +169,12 @@ export function ClaudeAccountsPanel({
         <button
           type="button"
           onClick={() => onImport()}
-          className="mt-0.5 w-full rounded border border-dashed border-slate-300 px-2 py-1 text-[10px] text-slate-400 hover:bg-white"
+          className="mt-0.5 w-full rounded border border-dashed border-slate-300 px-2 py-1 text-[10px] text-slate-400 hover:bg-white dark:border-slate-600 dark:text-slate-500 dark:hover:bg-slate-800"
         >
           Import Claude account
         </button>
       ) : (
-        <div className="mt-0.5 divide-y divide-slate-200/70">
+        <div className="mt-0.5 divide-y divide-slate-200/70 dark:divide-slate-700/70">
           {accounts.map((a) => (
             <Row key={a.id} a={a} now={now} />
           ))}

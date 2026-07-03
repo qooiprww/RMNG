@@ -5,6 +5,7 @@
 // stay editable here because the server only latches them once `setupComplete`
 // flips (via the Finish step's `putConfig({ setupComplete: true })`, which also
 // ensures the `rmng` bridge network).
+import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import { useCallback, useState } from "react";
 
 import { EnvChecklist } from "~/components/EnvChecklist";
@@ -16,7 +17,7 @@ import type { ChromaMode } from "~/lib/wire/ChromaMode";
 import type { ControlState } from "~/lib/types";
 
 const input =
-  "w-full rounded border border-slate-300 px-2 py-1 text-sm focus:border-slate-400 focus:outline-none";
+  "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none";
 
 /** Default local name for the pulled template image. Names are bare DNS labels — the
  *  server itself prepends the repo (`base` → `rmng/template:base`). */
@@ -45,7 +46,7 @@ const STEPS = ["Environment", "Server", "Download template", "Finish"] as const;
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="mb-0.5 block text-xs font-medium text-slate-500">{label}</span>
+      <span className="mb-0.5 block text-xs font-medium text-slate-500 dark:text-slate-400">{label}</span>
       {children}
     </label>
   );
@@ -54,7 +55,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 /** The amber "cannot be changed after setup" callout for one-time fields. */
 function OneTimeWarning({ children }: { children: React.ReactNode }) {
   return (
-    <div className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+    <div className="rounded border border-amber-300 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-400">
       {children}
     </div>
   );
@@ -220,12 +221,12 @@ export function SetupWizard({
     (step === 2 && imgRunning);
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
-      <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 dark:bg-slate-900 p-4">
+      <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-xl">
         {/* Header + step indicator. */}
-        <div className="shrink-0 border-b border-slate-100 px-6 pb-4 pt-5">
-          <h1 className="text-lg font-semibold text-slate-900">Set up rmng</h1>
-          <p className="mt-0.5 text-xs text-slate-400">
+        <div className="shrink-0 border-b border-slate-100 dark:border-slate-800 px-6 pb-4 pt-5">
+          <h1 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Set up rmng</h1>
+          <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
             First-run configuration — a few settings are baked in for good, so choose carefully.
           </p>
           <div className="mt-4 flex items-center gap-2">
@@ -237,22 +238,22 @@ export function SetupWizard({
                       i === step
                         ? "bg-emerald-600 text-white"
                         : i < step
-                          ? "bg-emerald-100 text-emerald-700"
-                          : "bg-slate-100 text-slate-400"
+                          ? "bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400"
+                          : "bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500"
                     }`}
                   >
-                    {i < step ? "✓" : i + 1}
+                    {i < step ? <Check className="size-4" /> : i + 1}
                   </span>
                   <span
                     className={`hidden text-xs font-medium sm:inline ${
-                      i === step ? "text-slate-800" : "text-slate-400"
+                      i === step ? "text-slate-800 dark:text-slate-100" : "text-slate-400 dark:text-slate-500"
                     }`}
                   >
                     {label}
                   </span>
                 </div>
                 {i < STEPS.length - 1 ? (
-                  <div className="h-px flex-1 bg-slate-200" />
+                  <div className="h-px flex-1 bg-slate-200 dark:bg-slate-700" />
                 ) : null}
               </div>
             ))}
@@ -262,7 +263,7 @@ export function SetupWizard({
         {/* Body. */}
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           {error ? (
-            <div className="mb-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            <div className="mb-4 rounded border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 px-3 py-2 text-xs text-red-700 dark:text-red-400">
               {error}
             </div>
           ) : null}
@@ -270,7 +271,7 @@ export function SetupWizard({
           {/* Step 1: Environment. */}
           {step === 0 ? (
             <div className="space-y-4">
-              <p className="text-sm text-slate-600">
+              <p className="text-sm text-slate-600 dark:text-slate-300">
                 rmng drives your local Docker daemon over its unix socket. Confirm the environment
                 is ready, then pick the private subnet for the clone network.
               </p>
@@ -290,11 +291,11 @@ export function SetupWizard({
                   className={input}
                 />
                 {subnet.trim() && !subnetOk ? (
-                  <span className="mt-1 block text-[11px] text-red-600">
+                  <span className="mt-1 block text-[11px] text-red-600 dark:text-red-400">
                     must be an IPv4 CIDR with a /16–/24 prefix, e.g. 10.99.0.0/24
                   </span>
                 ) : (
-                  <span className="mt-0.5 block text-xs text-slate-400">
+                  <span className="mt-0.5 block text-xs text-slate-400 dark:text-slate-500">
                     <code>.1</code> gateway, <code>.2</code> control-server, <code>.10+</code>{" "}
                     clone pool.
                   </span>
@@ -306,7 +307,7 @@ export function SetupWizard({
           {/* Step 2: Server. */}
           {step === 1 ? (
             <div className="space-y-4">
-              <p className="text-sm text-slate-600">
+              <p className="text-sm text-slate-600 dark:text-slate-300">
                 Server-side layout and defaults for the fleet.
               </p>
 
@@ -318,7 +319,7 @@ export function SetupWizard({
                   spellCheck={false}
                   className={input}
                 />
-                <span className="mt-0.5 block text-xs text-slate-400">
+                <span className="mt-0.5 block text-xs text-slate-400 dark:text-slate-500">
                   Prepended to derived clone hostnames — e.g.{" "}
                   <code>{hostnamePrefix || "pega-"}</code>dev-123.
                 </span>
@@ -346,7 +347,7 @@ export function SetupWizard({
               </div>
 
               <div>
-                <span className="mb-1 block text-xs font-medium text-slate-500">Monitors</span>
+                <span className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">Monitors</span>
                 <MonitorsEditor monitors={monitors} onChange={setMonitors} />
               </div>
 
@@ -372,13 +373,14 @@ export function SetupWizard({
               </Field>
 
               {/* Ports — collapsed by default. */}
-              <div className="border-t border-slate-100 pt-3">
+              <div className="border-t border-slate-100 dark:border-slate-800 pt-3">
                 <button
                   type="button"
                   onClick={() => setPortsOpen((o) => !o)}
-                  className="text-xs font-medium text-slate-500 hover:text-slate-700"
+                  className="flex items-center gap-1 text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
                 >
-                  {portsOpen ? "▾ Hide" : "▸ Show"} ports
+                  {portsOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+                  {portsOpen ? "Hide" : "Show"} ports
                 </button>
                 {portsOpen ? (
                   <div className="mt-2 grid grid-cols-2 gap-3">
@@ -411,7 +413,7 @@ export function SetupWizard({
           {/* Step 3: Download template. */}
           {step === 2 ? (
             <div className="space-y-4">
-              <p className="text-sm text-slate-600">
+              <p className="text-sm text-slate-600 dark:text-slate-300">
                 Pull the pre-built clone template (Ubuntu 26.04, the base our patched GNOME is
                 built for) from Docker Hub and tag it locally under <code>rmng/template</code>.
                 You can skip this and pull it later from the Images panel.
@@ -423,9 +425,9 @@ export function SetupWizard({
                   placeholder={initialConfig.docker.templateReference}
                   spellCheck={false}
                   disabled={imgRunning || imgDone}
-                  className={`${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                  className={`${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
                 />
-                <span className="mt-0.5 block text-xs text-slate-400">
+                <span className="mt-0.5 block text-xs text-slate-400 dark:text-slate-500">
                   Docker Hub <code>repo:tag</code> the template is pulled from.
                 </span>
               </Field>
@@ -436,15 +438,15 @@ export function SetupWizard({
                   placeholder={DEFAULT_IMAGE_NAME}
                   spellCheck={false}
                   disabled={imgRunning || imgDone}
-                  className={`${input} disabled:bg-slate-50 disabled:text-slate-400`}
+                  className={`${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
                 />
                 {!imageLabelOk ? (
-                  <span className="mt-1 block text-[11px] text-red-600">
+                  <span className="mt-1 block text-[11px] text-red-600 dark:text-red-400">
                     lowercase letters, digits and hyphens only (no leading/trailing hyphen, ≤63
                     chars)
                   </span>
                 ) : (
-                  <span className="mt-0.5 block text-xs text-slate-400">
+                  <span className="mt-0.5 block text-xs text-slate-400 dark:text-slate-500">
                     → <code>rmng/template:{imageNameTrim || DEFAULT_IMAGE_NAME}</code>
                   </span>
                 )}
@@ -452,7 +454,7 @@ export function SetupWizard({
 
               {imgOp ? <OperationProgress op={imgOp} /> : null}
               {imgDone ? (
-                <p className="text-xs font-medium text-emerald-600">
+                <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
                   ✓ Template “{pullTarget}” pulled.
                 </p>
               ) : null}
@@ -470,7 +472,7 @@ export function SetupWizard({
                   <button
                     type="button"
                     onClick={next}
-                    className="text-xs font-medium text-slate-500 underline-offset-2 hover:text-slate-700 hover:underline"
+                    className="text-xs font-medium text-slate-500 dark:text-slate-400 underline-offset-2 hover:text-slate-700 dark:hover:text-slate-200 hover:underline"
                   >
                     Skip for now
                   </button>
@@ -482,11 +484,11 @@ export function SetupWizard({
           {/* Step 4: Finish. */}
           {step === 3 ? (
             <div className="space-y-4">
-              <p className="text-sm text-slate-600">
+              <p className="text-sm text-slate-600 dark:text-slate-300">
                 Review your configuration, then finish setup. The one-time subnet latches and the{" "}
                 <code>rmng</code> network is ensured when you click Finish.
               </p>
-              <dl className="divide-y divide-slate-100 rounded border border-slate-200 text-sm">
+              <dl className="divide-y divide-slate-100 dark:divide-slate-800 rounded border border-slate-200 dark:border-slate-700 text-sm">
                 {(
                   [
                     ["Clone network subnet", subnet || "—"],
@@ -503,8 +505,8 @@ export function SetupWizard({
                   ] as const
                 ).map(([k, v]) => (
                   <div key={k} className="flex justify-between gap-3 px-3 py-2">
-                    <dt className="text-slate-500">{k}</dt>
-                    <dd className="text-right font-medium text-slate-800">{v}</dd>
+                    <dt className="text-slate-500 dark:text-slate-400">{k}</dt>
+                    <dd className="text-right font-medium text-slate-800 dark:text-slate-100">{v}</dd>
                   </div>
                 ))}
               </dl>
@@ -513,12 +515,12 @@ export function SetupWizard({
         </div>
 
         {/* Footer: Back / Next / Finish. */}
-        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-slate-100 bg-white px-6 py-3">
+        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-800 px-6 py-3">
           <button
             type="button"
             onClick={back}
             disabled={step === 0 || saving}
-            className="rounded border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+            className="rounded border border-slate-300 dark:border-slate-600 px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40"
           >
             Back
           </button>

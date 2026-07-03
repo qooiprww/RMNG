@@ -13,6 +13,7 @@ import {
   sortableKeyboardCoordinates,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
+import { Settings } from "lucide-react";
 
 import { ClaudeAccountsPanel } from "~/components/ClaudeAccountsPanel";
 import { OperationProgress } from "~/components/OperationProgress";
@@ -48,24 +49,6 @@ export interface SidebarProps {
   onChangeAccountHost: (host: Host) => void;
   /** New host id order after a drag-reorder. */
   onReorder: (nextIds: string[]) => void;
-}
-
-function SettingsIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 20 20"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.6"
-      strokeLinecap="round"
-      aria-hidden
-    >
-      <circle cx="10" cy="10" r="3" />
-      <path d="M10 1.5v2M10 16.5v2M18.5 10h-2M3.5 10h-2M15.6 4.4l-1.4 1.4M5.8 14.2l-1.4 1.4M15.6 15.6l-1.4-1.4M5.8 5.8 4.4 4.4" />
-    </svg>
-  );
 }
 
 /** The left host-selection panel: Claude accounts, the drag-reorderable host list,
@@ -113,12 +96,12 @@ export function Sidebar({
 
   return (
     <aside
-      className={`fixed inset-y-0 left-0 z-40 flex w-96 max-w-[90vw] shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-slate-50 p-3 shadow-xl transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 lg:shadow-none ${
+      className={`fixed inset-y-0 left-0 z-40 flex w-96 max-w-[90vw] shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-slate-50 p-3 shadow-xl transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 lg:shadow-none dark:border-slate-700 dark:bg-slate-900 ${
         open ? "translate-x-0" : "-translate-x-full"
       }`}
     >
       <div className="flex items-center justify-between px-1">
-        <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+        <span className="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
           rmng control
         </span>
         <button
@@ -126,9 +109,9 @@ export function Sidebar({
           onClick={onOpenSettings}
           title="Settings"
           aria-label="Settings"
-          className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600"
+          className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300"
         >
-          <SettingsIcon />
+          <Settings className="size-4" />
         </button>
       </div>
 
@@ -140,7 +123,7 @@ export function Sidebar({
 
       <div>
         <div className="mb-1 flex items-center justify-between px-1">
-          <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+          <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
             Hosts ({hosts.length})
           </h2>
           <button
@@ -148,13 +131,13 @@ export function Sidebar({
             onClick={onOpenClone}
             disabled={runningClone}
             title="Create a new clone from a source image"
-            className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40"
+            className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300"
           >
             + Clone
           </button>
         </div>
         {hosts.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-slate-300 bg-white p-4 text-center text-xs text-slate-400">
+          <p className="rounded-lg border border-dashed border-slate-300 bg-white p-4 text-center text-xs text-slate-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-500">
             No hosts yet.
           </p>
         ) : (
@@ -190,7 +173,7 @@ export function Sidebar({
 
       {operations.length > 0 ? (
         <div className="space-y-2">
-          <h2 className="px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+          <h2 className="px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
             Activity
           </h2>
           {[...operations]

@@ -1,3 +1,4 @@
+import { Menu } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 
 import { ChangeAccountModal } from "~/components/ChangeAccountModal";
@@ -98,7 +99,7 @@ export default function Home({ loaderData }: Route.ComponentProps) {
 
   if (!cfg) {
     return (
-      <div className="flex h-screen items-center justify-center text-sm text-slate-400">
+      <div className="flex h-screen items-center justify-center text-sm text-slate-400 dark:text-slate-500">
         Loading…
       </div>
     );
@@ -200,45 +201,34 @@ function Dashboard({
   return (
     <div className="flex h-screen flex-col">
       {error ? (
-        <div className="shrink-0 border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
+        <div className="shrink-0 border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400">
           {error}
         </div>
       ) : null}
 
       {/* Mobile top bar: hamburger + context. Hidden once the sidebar is static. */}
-      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 py-2 lg:hidden">
+      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 py-2 lg:hidden dark:border-slate-700 dark:bg-slate-800">
         <button
           type="button"
           onClick={() => setSidebarOpen(true)}
           aria-label="Open menu"
-          className="rounded-md p-1.5 text-slate-600 hover:bg-slate-100"
+          className="rounded-md p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-700"
         >
-          <svg
-            width="20"
-            height="20"
-            viewBox="0 0 20 20"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            aria-hidden
-          >
-            <path d="M3 5h14M3 10h14M3 15h14" />
-          </svg>
+          <Menu className="size-4" />
         </button>
-        <span className="min-w-0 flex-1 break-words text-sm font-semibold text-slate-800">
+        <span className="min-w-0 flex-1 break-words text-sm font-semibold text-slate-800 dark:text-slate-100">
           {selectedHost ? selectedHost.id : "rmng control"}
         </span>
         {/* Notes/Chat toggle lives here on mobile — the only header < lg. */}
         {selectedHost ? (
-          <div className="flex shrink-0 gap-0.5 rounded-md bg-slate-100 p-0.5 text-xs font-medium">
+          <div className="flex shrink-0 gap-0.5 rounded-md bg-slate-100 p-0.5 text-xs font-medium dark:bg-slate-800">
             <button
               type="button"
               onClick={() => setPane("notes")}
               className={`rounded px-3 py-1 ${
                 pane === "notes"
-                  ? "bg-white text-slate-900 shadow-sm"
-                  : "text-slate-500 hover:text-slate-700"
+                  ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100"
+                  : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
               }`}
             >
               Notes
@@ -248,8 +238,8 @@ function Dashboard({
               onClick={() => setPane("chat")}
               className={`rounded px-3 py-1 ${
                 pane === "chat"
-                  ? "bg-white text-slate-900 shadow-sm"
-                  : "text-slate-500 hover:text-slate-700"
+                  ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100"
+                  : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
               }`}
             >
               Chat
@@ -262,7 +252,7 @@ function Dashboard({
         {/* Backdrop behind the drawer (mobile only, when open). */}
         {sidebarOpen ? (
           <div
-            className="fixed inset-0 z-30 bg-slate-900/40 lg:hidden"
+            className="fixed inset-0 z-30 bg-slate-900/40 lg:hidden dark:bg-black/60"
             onClick={() => setSidebarOpen(false)}
             aria-hidden
           />
@@ -298,29 +288,29 @@ function Dashboard({
         />
 
         {/* Right: per-host editor */}
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-white">
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-slate-900">
           {selectedHost ? (
             <>
               {/* Per-host header — only ≥ lg; on mobile the top bar shows id + tabs. */}
-              <div className="hidden shrink-0 items-center gap-3 border-b border-slate-100 px-4 py-3 sm:px-6 lg:flex">
-                <h2 className="min-w-0 break-words text-base font-semibold text-slate-900">
+              <div className="hidden shrink-0 items-center gap-3 border-b border-slate-100 px-4 py-3 sm:px-6 lg:flex dark:border-slate-800">
+                <h2 className="min-w-0 break-words text-base font-semibold text-slate-900 dark:text-slate-100">
                   {selectedHost.id}
                 </h2>
-                <span className="shrink-0 text-xs text-slate-400">
+                <span className="shrink-0 text-xs text-slate-400 dark:text-slate-500">
                   {selectedHost.host}:{selectedHost.port}
                 </span>
               </div>
               <div className="flex min-h-0 flex-1">
                 {/* Notes editor — full width < lg when its tab is active, else beside chat. */}
                 <div
-                  className={`min-w-0 flex-1 overflow-y-auto py-4 lg:block lg:border-r lg:border-slate-200 ${
+                  className={`min-w-0 flex-1 overflow-y-auto py-4 lg:block lg:border-r lg:border-slate-200 dark:lg:border-slate-700 ${
                     pane === "notes" ? "block" : "hidden"
                   }`}
                 >
                   <ClientOnly>
                     <Suspense
                       fallback={
-                        <div className="p-6 text-sm text-slate-400">Loading editor…</div>
+                        <div className="p-6 text-sm text-slate-400 dark:text-slate-500">Loading editor…</div>
                       }
                     >
                       <HostEditor key={selectedHost.id} hostId={selectedHost.id} />
@@ -330,14 +320,14 @@ function Dashboard({
                 {/* Agent chat — full width < lg when its tab is active, else a fixed column
                     (a touch narrower at the tight lg width so the editor keeps room). */}
                 <div
-                  className={`w-full shrink-0 flex-col overflow-hidden bg-slate-50/50 lg:flex lg:w-80 xl:w-[400px] ${
+                  className={`w-full shrink-0 flex-col overflow-hidden bg-slate-50/50 lg:flex lg:w-80 xl:w-[400px] dark:bg-slate-900/50 ${
                     pane === "chat" ? "flex" : "hidden"
                   }`}
                 >
                   <ClientOnly>
                     <Suspense
                       fallback={
-                        <div className="p-4 text-sm text-slate-400">Loading chat…</div>
+                        <div className="p-4 text-sm text-slate-400 dark:text-slate-500">Loading chat…</div>
                       }
                     >
                       <ChatPanel key={selectedHost.id} hostId={selectedHost.id} />
@@ -347,7 +337,7 @@ function Dashboard({
               </div>
             </>
           ) : (
-            <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-400">
+            <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-400 dark:text-slate-500">
               Select a host to open its notes.
             </div>
           )}

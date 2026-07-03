@@ -26,7 +26,7 @@ const meta = {
     (Story) => (
       <DndContext>
         <SortableContext items={hostIds} strategy={verticalListSortingStrategy}>
-          <div className="w-96 rounded-lg bg-slate-50 p-3">
+          <div className="w-96 rounded-lg bg-slate-50 p-3 dark:bg-slate-900">
             <Story />
           </div>
         </SortableContext>

@@ -19,7 +19,9 @@ function Bubble({ m }: { m: ChatMessage }) {
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
         className={`max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm ${
-          isUser ? "bg-emerald-600 text-white" : "border border-slate-200 bg-white text-slate-800"
+          isUser
+            ? "bg-emerald-600 text-white"
+            : "border border-slate-200 bg-white text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
         }`}
       >
         {m.text}
@@ -122,9 +124,9 @@ export default function ChatPanel({ hostId }: { hostId: string }) {
         className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3"
       >
         {loading ? (
-          <p className="text-sm text-slate-400">Loading…</p>
+          <p className="text-sm text-slate-400 dark:text-slate-500">Loading…</p>
         ) : messages.length === 0 ? (
-          <p className="text-sm text-slate-400">
+          <p className="text-sm text-slate-400 dark:text-slate-500">
             Ask the agent anything — it can control this host's desktop.
           </p>
         ) : (
@@ -132,11 +134,11 @@ export default function ChatPanel({ hostId }: { hostId: string }) {
         )}
         {busy ? (
           <div className="flex justify-start">
-            <div className="max-w-[88%] rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm">
-              <span className="text-slate-400">agent is working…</span>
+            <div className="max-w-[88%] rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800">
+              <span className="text-slate-400 dark:text-slate-500">agent is working…</span>
               {activity ? (
                 <span
-                  className="mt-1 block break-words font-mono text-xs leading-snug text-slate-500"
+                  className="mt-1 block break-words font-mono text-xs leading-snug text-slate-500 dark:text-slate-400"
                   title={activity}
                 >
                   {activity}
@@ -148,13 +150,13 @@ export default function ChatPanel({ hostId }: { hostId: string }) {
       </div>
 
       {error ? (
-        <div className="border-t border-red-200 bg-red-50 px-3 py-1.5 text-xs text-red-700">
+        <div className="border-t border-red-200 bg-red-50 px-3 py-1.5 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400">
           {error}
         </div>
       ) : null}
 
       <form
-        className="flex items-end gap-2 border-t border-slate-200 p-2"
+        className="flex items-end gap-2 border-t border-slate-200 p-2 dark:border-slate-700"
         onSubmit={(e) => {
           e.preventDefault();
           send();
@@ -172,14 +174,14 @@ export default function ChatPanel({ hostId }: { hostId: string }) {
           rows={2}
           placeholder="Message the agent…  (Enter to send)"
           disabled={busy}
-          className="min-w-0 flex-1 resize-none rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none disabled:opacity-60"
+          className="min-w-0 flex-1 resize-none rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none disabled:opacity-60 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500"
         />
         <button
           type="button"
           onClick={() => send("monitor")}
           disabled={busy}
           title="Tell the agent to start monitoring this desktop (track working vs idle)"
-          className="shrink-0 rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700 hover:bg-amber-100 disabled:opacity-40"
+          className="shrink-0 rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700 hover:bg-amber-100 disabled:opacity-40 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-400 dark:hover:bg-amber-900/40"
         >
           Monitor
         </button>

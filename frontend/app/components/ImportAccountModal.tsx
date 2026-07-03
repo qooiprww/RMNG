@@ -11,7 +11,7 @@ import type { Host } from "~/lib/types";
 type Account = { email: string; orgName: string | null; subscriptionType: string | null };
 
 const input =
-  "mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none";
+  "mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500";
 
 export function ImportAccountModal({
   hosts,
@@ -66,24 +66,24 @@ export function ImportAccountModal({
       onClick={onClose}
     >
       <div
-        className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-xl"
+        className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-800"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === "Escape") onClose();
         }}
       >
-        <h3 className="text-sm font-semibold text-slate-900">Import Claude account</h3>
-        <p className="mt-1 text-xs text-slate-500">
+        <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Import Claude account</h3>
+        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
           Harvest a Claude account from a clone that's signed in to Claude Code via claude.ai.
         </p>
 
         {clones.length === 0 ? (
-          <p className="mt-4 rounded-md border border-dashed border-slate-300 p-3 text-center text-xs text-slate-400">
+          <p className="mt-4 rounded-md border border-dashed border-slate-300 p-3 text-center text-xs text-slate-400 dark:border-slate-600 dark:text-slate-500">
             No clones available to import from.
           </p>
         ) : (
           <>
-            <label className="mt-4 block text-xs font-medium text-slate-600">
+            <label className="mt-4 block text-xs font-medium text-slate-600 dark:text-slate-300">
               Clone
               <select
                 value={hostId}
@@ -101,9 +101,9 @@ export function ImportAccountModal({
             {/* Login status for the selected clone. */}
             <div className="mt-2 min-h-[1.25rem] text-xs">
               {checking ? (
-                <span className="text-slate-400">Checking Claude login…</span>
+                <span className="text-slate-400 dark:text-slate-500">Checking Claude login…</span>
               ) : account ? (
-                <span className="text-emerald-700">
+                <span className="text-emerald-700 dark:text-emerald-400">
                   Signed in: <span className="font-medium">{account.email}</span>
                   {account.subscriptionType ? ` · ${account.subscriptionType}` : ""}
                 </span>
@@ -113,14 +113,14 @@ export function ImportAccountModal({
         )}
 
         {error ? (
-          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-600">{error}</p>
+          <p className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-950/40 dark:text-rose-400">{error}</p>
         ) : null}
 
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
+            className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
           >
             Cancel
           </button>

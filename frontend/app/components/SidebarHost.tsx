@@ -1,5 +1,6 @@
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { EllipsisVertical } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import claudeLogo from "../assets/claude.png";
@@ -11,9 +12,9 @@ import { workspaceBadge } from "~/lib/workspace";
 // the next task / needs you), `offline` rose. The state note carries the color; there
 // is no longer a status dot (the unread dot took its place on the title row).
 const AGENT_STATUS: Record<NonNullable<Host["monitorState"]>, { text: string; label: string }> = {
-  working: { text: "text-sky-600", label: "working" },
-  idle: { text: "text-amber-700", label: "idle" },
-  offline: { text: "text-rose-500", label: "offline" },
+  working: { text: "text-sky-600 dark:text-sky-400", label: "working" },
+  idle: { text: "text-amber-700 dark:text-amber-400", label: "idle" },
+  offline: { text: "text-rose-500 dark:text-rose-400", label: "offline" },
 };
 
 function effectiveStatus(host: Host): { text: string; label: string } {
@@ -107,16 +108,6 @@ export interface SidebarHostProps {
   onChangeAccount: () => void;
 }
 
-function DotsIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-      <circle cx="8" cy="3" r="1.4" />
-      <circle cx="8" cy="8" r="1.4" />
-      <circle cx="8" cy="13" r="1.4" />
-    </svg>
-  );
-}
-
 /** The per-host overflow menu (⋯) — collapses the commit / change-account / delete
  *  actions. Unmanaged rows (no container) only get Remove. Every trigger/item stops
  *  propagation so opening or invoking an action never selects or drags the row. */
@@ -165,7 +156,9 @@ function OverflowMenu({
         onClick();
       }}
       className={`block w-full cursor-pointer px-3 py-1.5 text-left text-xs ${
-        danger ? "text-red-600 hover:bg-red-50" : "text-slate-600 hover:bg-slate-100"
+        danger
+          ? "text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40"
+          : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-700"
       }`}
     >
       {label}
@@ -185,22 +178,22 @@ function OverflowMenu({
           e.stopPropagation();
           setOpen((o) => !o);
         }}
-        className={`cursor-pointer rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-0 ${
-          open ? "bg-slate-200 text-slate-600" : ""
+        className={`cursor-pointer rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-0 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300 ${
+          open ? "bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300" : ""
         }`}
       >
-        <DotsIcon />
+        <EllipsisVertical className="size-4" />
       </button>
       {open ? (
         <div
           role="menu"
-          className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg"
+          className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg dark:border-slate-700 dark:bg-slate-800"
         >
           {managed ? (
             <>
               {item("Commit to image…", onCommit)}
               {item("Change account…", onChangeAccount)}
-              <div className="my-1 h-px bg-slate-100" />
+              <div className="my-1 h-px bg-slate-100 dark:bg-slate-700" />
             </>
           ) : null}
           {item(managed ? "Delete" : "Remove", onDelete, true)}
@@ -254,17 +247,17 @@ export function SidebarHost({
       aria-pressed={selected}
       onClick={onSelect}
       title={`${host.id} · ${host.host}:${host.port}`}
-      className={`group flex touch-none cursor-grab items-start gap-1 border-b border-b-slate-200 border-l-2 border-l-transparent px-1.5 py-1.5 last:border-b-0 active:cursor-grabbing ${
+      className={`group flex touch-none cursor-grab items-start gap-1 border-b border-b-slate-200 border-l-2 border-l-transparent px-1.5 py-1.5 last:border-b-0 active:cursor-grabbing dark:border-b-slate-700 ${
         // Per-side borders (explicit colors so they never collide): a slate-200 bottom
         // divider between rows + a left accent for the selected row. Exactly one
         // background wins (dragging ▸ selected ▸ default); the default is a solid
         // slate-50 (not transparent) so a dragged card fully hides the rows under it.
         // While dragging the card lifts out as a rounded, divider-less floating card.
         isDragging
-          ? "rounded-md border-b-transparent bg-white shadow-lg ring-1 ring-slate-300"
+          ? "rounded-md border-b-transparent bg-white shadow-lg ring-1 ring-slate-300 dark:bg-slate-800 dark:ring-slate-600"
           : selected
-            ? "border-l-emerald-400 bg-emerald-50"
-            : "bg-slate-50 hover:bg-slate-100"
+            ? "border-l-emerald-400 bg-emerald-50 dark:bg-emerald-950"
+            : "bg-slate-50 hover:bg-slate-100 dark:bg-slate-900 dark:hover:bg-slate-800"
       }`}
     >
       <div className="min-w-0 flex-1">
@@ -274,19 +267,19 @@ export function SidebarHost({
           <div className="mb-0.5 flex items-center gap-2 text-[10px]">
             {claudeSel ? (
               <span
-                className="flex min-w-0 flex-1 items-center gap-1 text-slate-400"
+                className="flex min-w-0 flex-1 items-center gap-1 text-slate-400 dark:text-slate-500"
                 title={selTitle(claudeSel)}
               >
                 <img src={claudeLogo} alt="" className="h-3 w-3 shrink-0 object-contain" />
                 {selBadge(claudeSel) ? (
-                  <span className="shrink-0 rounded bg-slate-100 px-1 text-[9px] font-semibold text-slate-500">
+                  <span className="shrink-0 rounded bg-slate-100 px-1 text-[9px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
                     {selBadge(claudeSel)}
                   </span>
                 ) : null}
                 {claudeSel.email ? (
                   <span className="truncate">{claudeSel.email}</span>
                 ) : claudeSel.mode === "none" ? (
-                  <span className="italic text-slate-300">no token</span>
+                  <span className="italic text-slate-300 dark:text-slate-600">no token</span>
                 ) : null}
               </span>
             ) : (
@@ -297,10 +290,10 @@ export function SidebarHost({
                 className="flex shrink-0 items-baseline gap-1 tabular-nums"
                 title="live container CPU (% of clone allowance) · memory used"
               >
-                <span className="font-medium text-slate-400">CPU</span>
-                <span className="w-8 text-right font-semibold text-slate-700">{usage.cpu}</span>
-                <span className="ml-1 font-medium text-slate-400">MEM</span>
-                <span className="w-8 text-right font-semibold text-slate-700">{usage.mem}</span>
+                <span className="font-medium text-slate-400 dark:text-slate-500">CPU</span>
+                <span className="w-8 text-right font-semibold text-slate-700 dark:text-slate-200">{usage.cpu}</span>
+                <span className="ml-1 font-medium text-slate-400 dark:text-slate-500">MEM</span>
+                <span className="w-8 text-right font-semibold text-slate-700 dark:text-slate-200">{usage.mem}</span>
               </span>
             ) : null}
           </div>
@@ -310,7 +303,7 @@ export function SidebarHost({
             flows back to the left edge on the next line (the badge doesn't indent it).
             While busy, show the op step in place of the title row. */}
         {!busy ? (
-          <p className="break-words text-sm font-medium leading-snug text-slate-800">
+          <p className="break-words text-sm font-medium leading-snug text-slate-800 dark:text-slate-100">
             {host.unread && !selected ? (
               <span
                 className="mr-1 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-red-500 align-middle text-[10px] font-bold leading-none text-white"
@@ -333,10 +326,10 @@ export function SidebarHost({
           </p>
         ) : (
           <div className="flex items-center gap-2">
-            <span className="min-w-0 flex-1 break-words text-sm font-medium text-slate-800">
+            <span className="min-w-0 flex-1 break-words text-sm font-medium text-slate-800 dark:text-slate-100">
               {host.displayName ?? host.id}
             </span>
-            <span className="shrink-0 text-[10px] font-medium text-sky-600">
+            <span className="shrink-0 text-[10px] font-medium text-sky-600 dark:text-sky-400">
               {op?.kind === "delete" ? "deleting…" : op?.step}
             </span>
           </div>

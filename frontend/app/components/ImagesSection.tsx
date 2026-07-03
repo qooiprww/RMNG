@@ -4,6 +4,8 @@
 // image is in use (a live clone's `source` points at it). A "+ Pull template" action
 // pulls the configured (or overridden) registry reference and tags it locally
 // (prompts for the reference, then a DNS-label local name).
+import { X } from "lucide-react";
+
 import { formatBytes, relativeAge } from "~/lib/format";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
 
@@ -51,7 +53,7 @@ export function ImagesSection({
   return (
     <div>
       <div className="mb-1 flex items-center justify-between px-1">
-        <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+        <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
           Images ({images.length})
         </h2>
         <button
@@ -59,18 +61,18 @@ export function ImagesSection({
           onClick={pull}
           disabled={pullBusy}
           title="Pull the clone template (Ubuntu 26.04) from Docker Hub"
-          className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40"
+          className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300"
         >
           + Pull template
         </button>
       </div>
 
       {loading && images.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-slate-300 bg-white p-3 text-center text-xs text-slate-400">
+        <p className="rounded-lg border border-dashed border-slate-300 bg-white p-3 text-center text-xs text-slate-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-500">
           Loading images…
         </p>
       ) : images.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-slate-300 bg-white p-4 text-center text-xs text-slate-400">
+        <p className="rounded-lg border border-dashed border-slate-300 bg-white p-4 text-center text-xs text-slate-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-500">
           No images yet. Pull the template to start cloning.
         </p>
       ) : (
@@ -80,21 +82,21 @@ export function ImagesSection({
             return (
               <div
                 key={img.reference}
-                className="group flex items-center gap-1 rounded-lg border border-transparent px-1.5 py-1.5 hover:bg-slate-100"
+                className="group flex items-center gap-1 rounded-lg border border-transparent px-1.5 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800"
                 title={img.reference}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800">
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800 dark:text-slate-100">
                       {img.reference}
                     </span>
                     {img.base ? (
-                      <span className="shrink-0 rounded bg-emerald-100 px-1 py-0.5 text-[9px] font-semibold leading-none text-emerald-700">
+                      <span className="shrink-0 rounded bg-emerald-100 px-1 py-0.5 text-[9px] font-semibold leading-none text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400">
                         base
                       </span>
                     ) : null}
                   </div>
-                  <p className="mt-0.5 truncate text-[11px] text-slate-400">
+                  <p className="mt-0.5 truncate text-[11px] text-slate-400 dark:text-slate-500">
                     {formatBytes(img.sizeBytes)} · {relativeAge(img.createdAt)}
                     {inUse > 0 ? ` · ${inUse} clone${inUse === 1 ? "" : "s"}` : ""}
                   </p>
@@ -113,9 +115,9 @@ export function ImagesSection({
                   disabled={inUse > 0}
                   aria-label={`delete image ${img.reference}`}
                   title={inUse > 0 ? `in use by ${inUse} clone(s)` : "delete image"}
-                  className="rounded px-1 text-base leading-none text-slate-400 opacity-0 hover:text-red-600 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:text-slate-400"
+                  className="rounded px-1 text-slate-400 opacity-0 hover:text-red-600 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:text-slate-400 dark:text-slate-500 dark:hover:text-red-400 dark:disabled:hover:text-slate-500"
                 >
-                  ×
+                  <X className="size-4" />
                 </button>
               </div>
             );

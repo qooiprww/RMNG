@@ -15,6 +15,8 @@ import {
 } from "@blocknote/react";
 import { useEffect, useRef, useState } from "react";
 
+import { useColorScheme } from "~/lib/useColorScheme";
+
 async function uploadFile(file: File): Promise<string> {
   const fd = new FormData();
   fd.append("file", file);
@@ -33,6 +35,8 @@ function Editor({
   hostId: string;
   initialContent: PartialBlock[] | undefined;
 }) {
+  // Follow the OS light/dark setting (BlockNote themes via a JS prop, not CSS).
+  const scheme = useColorScheme();
   const editor = useCreateBlockNote({
     initialContent: initialContent && initialContent.length ? initialContent : undefined,
     uploadFile,
@@ -95,7 +99,7 @@ function Editor({
   return (
     <BlockNoteView
       editor={editor}
-      theme="light"
+      theme={scheme}
       // Replace the default formatting toolbar with one that omits the "create
       // link" button, so there's no way to add links manually (incl. Ctrl+K).
       formattingToolbar={false}
@@ -141,7 +145,7 @@ export default function HostEditor({ hostId }: { hostId: string }) {
   }, [hostId]);
 
   if (initial === "loading") {
-    return <div className="p-6 text-sm text-slate-400">Loading…</div>;
+    return <div className="p-6 text-sm text-slate-400 dark:text-slate-500">Loading…</div>;
   }
   return <Editor key={hostId} hostId={hostId} initialContent={initial} />;
 }

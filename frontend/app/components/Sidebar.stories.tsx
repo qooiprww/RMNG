@@ -11,8 +11,8 @@ const meta = {
   parameters: { layout: "fullscreen" },
   decorators: [
     (Story) => (
-      // Full-height white shell so the static (≥ lg) panel sits against the app bg.
-      <div className="h-screen bg-white">
+      // Full-height shell so the static (≥ lg) panel sits against the app bg.
+      <div className="h-screen bg-white dark:bg-slate-950">
         <Story />
       </div>
     ),
