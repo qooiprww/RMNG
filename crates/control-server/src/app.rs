@@ -18,6 +18,8 @@ pub struct App {
     pub http: reqwest::Client,
     /// Claude secret store + usage cache.
     pub claude: Arc<ClaudeStore>,
+    /// Codex secret store + usage cache (sibling of `claude`).
+    pub codex: Arc<crate::codex::CodexStore>,
     /// Per-host chat fan-out + in-flight state.
     pub chat: Arc<ChatState>,
     /// Media plane shared state (clone conns + latest frames).
@@ -38,6 +40,7 @@ pub struct App {
 impl App {
     pub fn new(store: Arc<StateStore>, cfg: AppConfig) -> Self {
         let claude = Arc::new(ClaudeStore::load(&cfg.data_dir));
+        let codex = Arc::new(crate::codex::CodexStore::load(&cfg.data_dir));
         // `DockerCtl::connect` is infallible and I/O-free: even a missing socket FILE
         // (bare `docker run` without the sock bind) boots the server — the failure is
         // surfaced per call and by `self_setup`'s env report, so the wizard shows it.
@@ -50,6 +53,7 @@ impl App {
                 .build()
                 .expect("reqwest client"),
             claude,
+            codex,
             chat: Arc::new(ChatState::default()),
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
             docker,

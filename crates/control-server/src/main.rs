@@ -10,6 +10,7 @@ mod binswap;
 mod chat;
 mod claude;
 mod clone_ops;
+mod codex;
 mod config;
 mod docker;
 mod files;
