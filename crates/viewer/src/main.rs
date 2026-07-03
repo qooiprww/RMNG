@@ -27,6 +27,7 @@
 //! and widgets live on the GTK main thread; the net thread only ships AU bytes over a queue.
 
 mod config;
+mod forward;
 mod glunpack;
 mod headless;
 mod pointer_lock;
