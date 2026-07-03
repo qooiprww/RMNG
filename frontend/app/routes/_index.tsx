@@ -40,6 +40,7 @@ import {
 } from "~/lib/api";
 import { type ControlState, type Host, emptyState } from "~/lib/types";
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
+import type { ContainerStats } from "~/lib/wire/ContainerStats";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
 
 import type { Route } from "./+types/_index";
@@ -65,9 +66,12 @@ export function clientLoader() {
   return emptyState();
 }
 
-/** Initial state from the SSR loader, kept live by the SSE stream. */
+/** Initial state from the SSR loader, kept live by the SSE stream. The same connection
+ *  carries the persisted `ControlState` (default event) and a volatile per-host CPU/RAM
+ *  map (named `stats` event) — the latter never touches `state.json`. */
 function useLiveState(initial: ControlState) {
   const [state, setState] = useState(initial);
+  const [stats, setStats] = useState<Record<string, ContainerStats>>({});
   useEffect(() => {
     const es = new EventSource("/events");
     es.onmessage = (e) => {
@@ -77,15 +81,22 @@ function useLiveState(initial: ControlState) {
         // ignore malformed frame
       }
     };
+    es.addEventListener("stats", (e) => {
+      try {
+        setStats(JSON.parse((e as MessageEvent).data));
+      } catch {
+        // ignore malformed frame
+      }
+    });
     return () => es.close();
   }, []);
-  return state;
+  return { state, stats };
 }
 
 export default function Home({ loaderData }: Route.ComponentProps) {
   // The live SSE state powers both the wizard (template-provision progress) and the
-  // dashboard, so it lives here at the gate.
-  const state = useLiveState(loaderData);
+  // dashboard, so it lives here at the gate. `stats` is the volatile per-host usage map.
+  const { state, stats } = useLiveState(loaderData);
   // First-run gate: hold the config (null while loading). Render a minimal centered
   // "Loading…" until it resolves so the dashboard never flashes before the wizard
   // decision; render the wizard INSTEAD of the dashboard while setup isn't complete.
@@ -110,10 +121,18 @@ export default function Home({ loaderData }: Route.ComponentProps) {
   if (!cfg.setupComplete) {
     return <SetupWizard state={state} initialConfig={cfg} onDone={refetchConfig} />;
   }
-  return <Dashboard state={state} templateRef={cfg.docker.templateReference} />;
+  return <Dashboard state={state} stats={stats} templateRef={cfg.docker.templateReference} />;
 }
 
-function Dashboard({ state, templateRef }: { state: ControlState; templateRef: string }) {
+function Dashboard({
+  state,
+  stats,
+  templateRef,
+}: {
+  state: ControlState;
+  stats: Record<string, ContainerStats>;
+  templateRef: string;
+}) {
   const [error, setError] = useState<string | null>(null);
   const [cloneOpen, setCloneOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -348,6 +367,7 @@ function Dashboard({ state, templateRef }: { state: ControlState; templateRef: s
                       <SidebarHost
                         key={host.id}
                         host={host}
+                        stats={stats[host.id]}
                         selected={state.selected === host.id}
                         op={opForHost(host.id)}
                         onSelect={() => {

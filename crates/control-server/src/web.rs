@@ -111,17 +111,37 @@ pub async fn serve(app: App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `GET /events` — full `ControlState` on connect, then on every change; 20s ping.
+/// `GET /events` — two multiplexed streams on one connection:
+///   - the persisted `ControlState` as the default (unnamed) event → the client's
+///     `onmessage`: full snapshot on connect, then one frame per change;
+///   - the volatile per-host CPU/RAM map as a named `stats` event → the client's
+///     `addEventListener("stats")`: latest snapshot on connect, then one per poll tick.
+///
+/// Stats ride a separate SSE-only bus ([`crate::monitor::StatsBus`]) so they never enter
+/// `ControlState` / `state.json` (which persists on every mutation). 20s keep-alive ping.
 async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (snapshot, rx) = app.store.subscribe();
-    let initial = futures::stream::once(async move { Ok(Event::default().data(snapshot)) });
-    let updates = BroadcastStream::new(rx).filter_map(|r| async move {
+    let state_initial = futures::stream::once(async move { Ok(Event::default().data(snapshot)) });
+    let state_updates = BroadcastStream::new(rx).filter_map(|r| async move {
         match r {
             Ok(json) => Some(Ok(Event::default().data(json))),
             Err(_) => None, // lagged: next snapshot resyncs
         }
     });
-    Sse::new(initial.chain(updates))
+    let state_stream = state_initial.chain(state_updates);
+
+    let (stats_snapshot, stats_rx) = app.stats.subscribe();
+    let stats_initial =
+        futures::stream::once(async move { Ok(Event::default().event("stats").data(stats_snapshot)) });
+    let stats_updates = BroadcastStream::new(stats_rx).filter_map(|r| async move {
+        match r {
+            Ok(json) => Some(Ok(Event::default().event("stats").data(json))),
+            Err(_) => None, // lagged: next tick resyncs
+        }
+    });
+    let stats_stream = stats_initial.chain(stats_updates);
+
+    Sse::new(futures::stream::select(state_stream, stats_stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)).text("ping"))
 }
 

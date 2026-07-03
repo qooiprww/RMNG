@@ -3,6 +3,7 @@ import { CSS } from "@dnd-kit/utilities";
 
 import claudeLogo from "../assets/claude.png";
 import type { Host, Operation } from "~/lib/types";
+import type { ContainerStats } from "~/lib/wire/ContainerStats";
 import { workspaceBadge } from "~/lib/workspace";
 
 // Visual style per host state. A running host is `working` (sky, pulsing) or
@@ -45,6 +46,23 @@ function selBadge(sel: ClaudeSel): string | null {
   return null; // specific
 }
 
+/** Compact live-usage string for the row, e.g. `2.4 cpu · 5.1 / 16.0 GiB`. CPU is shown
+ *  in "cores" (the wire value is percent-of-one-core, so ÷100); RAM as used / limit GiB,
+ *  one decimal each. Returns null when there's nothing usable to show — no stats sampled
+ *  yet, a stopped/unmanaged host (no entry), or no memory limit — so the row shows nothing
+ *  rather than a `0.0 / 0.0` placeholder. `mem*` are typed bigint by ts-rs but arrive as
+ *  JSON numbers, hence the `Number()` coercion. */
+function usageLine(stats?: ContainerStats): string | null {
+  if (!stats) return null;
+  const memLimit = Number(stats.memLimit);
+  if (memLimit <= 0) return null;
+  const GiB = 1024 ** 3;
+  const cores = (stats.cpuPct / 100).toFixed(1);
+  const used = (Number(stats.memUsed) / GiB).toFixed(1);
+  const limit = (memLimit / GiB).toFixed(1);
+  return `${cores} cpu · ${used} / ${limit} GiB`;
+}
+
 function selTitle(sel: ClaudeSel): string {
   switch (sel.mode) {
     case "group":
@@ -60,6 +78,9 @@ function selTitle(sel: ClaudeSel): string {
 
 export interface SidebarHostProps {
   host: Host;
+  /** Live CPU/RAM usage for this host's container, pushed over the `stats` SSE event.
+   *  Absent for a stopped/unmanaged host or before the first sample — renders nothing. */
+  stats?: ContainerStats;
   selected: boolean;
   /** A running operation targeting this host (delete, or a clone finishing its
    *  post-add `wait-swap` step), if any. */
@@ -124,6 +145,7 @@ function AccountIcon() {
 
 export function SidebarHost({
   host,
+  stats,
   selected,
   op,
   onSelect,
@@ -137,6 +159,7 @@ export function SidebarHost({
   const managed = host.managed === true;
   const status = effectiveStatus(host);
   const claudeSel = claudeSelection(host);
+  const usage = usageLine(stats);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: host.id, disabled: busy });
 
@@ -240,6 +263,14 @@ export function SidebarHost({
             title={host.stateNote || status.label}
           >
             {[host.linearLabel, host.stateNote || status.label].filter(Boolean).join(" · ")}
+          </p>
+        ) : null}
+        {!busy && usage ? (
+          <p
+            className="mt-0.5 text-[10px] tabular-nums text-slate-400"
+            title="live container CPU (cores) · memory used / limit"
+          >
+            {usage}
           </p>
         ) : null}
       </div>

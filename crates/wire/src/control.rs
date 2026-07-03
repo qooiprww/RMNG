@@ -190,6 +190,27 @@ pub struct Operation {
     pub finished_at: Option<i64>,
 }
 
+/// Live per-container resource usage, sampled by the monitor poller each tick and pushed
+/// to the frontend as a named `stats` SSE event carrying a `{ hostId: ContainerStats }`
+/// map. Deliberately NOT a field of [`ControlState`] / [`Host`]: it changes every tick, so
+/// routing it through the state store would rewrite `state.json` every few seconds (every
+/// `ControlState` mutation persists — see the control-server's `state.rs`). It rides the
+/// same `/events` stream on a separate SSE-only bus instead.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct ContainerStats {
+    /// CPU use as a percentage of ONE core (100 == a single fully-used core; a container
+    /// busy across several cores reads > 100). The frontend divides by 100 to display
+    /// "cores".
+    pub cpu_pct: f64,
+    /// Resident memory in bytes, docker-CLI semantics (`usage` minus reclaimable
+    /// `inactive_file` page cache).
+    pub mem_used: u64,
+    /// Memory limit in bytes; 0 when the daemon reports none.
+    pub mem_limit: u64,
+}
+
 /// 0–100 utilization for a rolling usage window + when it resets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

@@ -29,6 +29,10 @@ pub struct App {
     /// Automatic hash-based binary hot-swap engine state (worker channel + expected
     /// hashes + per-host swap guards). Empty until [`crate::binswap::spawn`] warms it.
     pub swap: Arc<crate::binswap::SwapState>,
+    /// Volatile per-host CPU/RAM usage bus. The monitor poller publishes a stats map each
+    /// tick; `/events` fans it out as a named `stats` SSE event. SSE-only — never persisted
+    /// to `state.json` (see [`crate::monitor::StatsBus`]).
+    pub stats: Arc<crate::monitor::StatsBus>,
 }
 
 impl App {
@@ -50,6 +54,7 @@ impl App {
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
             docker,
             swap: Arc::new(crate::binswap::SwapState::default()),
+            stats: Arc::new(crate::monitor::StatsBus::new()),
         }
     }
 
