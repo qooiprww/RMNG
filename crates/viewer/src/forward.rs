@@ -14,19 +14,27 @@ use std::time::Duration;
 
 use wire::forward::{ForwardHeader, ForwardRule, ForwardState, ForwardStatusMsg};
 
+// The whole public surface (`ForwardManager` + the listener/tunnel/splice helpers) gains
+// its caller in the net-thread wiring task, which invokes `ForwardManager::new` +
+// `reconcile`; the transitional `#[allow(dead_code)]`s below (and the matching ones on the
+// free fns) keep the crate warning-free until then and are removed by that task.
 /// Reports a rule's status back toward the server (the net thread frames it as tag 2).
+#[allow(dead_code)]
 pub type StatusReport = Arc<dyn Fn(ForwardStatusMsg) + Send + Sync>;
 
+#[allow(dead_code)]
 struct ListenerHandle {
     rule: ForwardRule,
     stop: Arc<AtomicBool>,
 }
 
+#[allow(dead_code)]
 pub struct ForwardManager {
     report: StatusReport,
     active: Mutex<HashMap<String, ListenerHandle>>, // rule id → its listener
 }
 
+#[allow(dead_code)]
 impl ForwardManager {
     pub fn new(report: StatusReport) -> Self {
         Self { report, active: Mutex::new(HashMap::new()) }
@@ -63,6 +71,7 @@ impl ForwardManager {
     }
 }
 
+#[allow(dead_code)]
 fn run_listener(rule: ForwardRule, forward_addr: String, report: StatusReport, stop: Arc<AtomicBool>) {
     let bind = format!("127.0.0.1:{}", rule.local_port);
     let listener = match TcpListener::bind(&bind) {
@@ -101,6 +110,7 @@ fn run_listener(rule: ForwardRule, forward_addr: String, report: StatusReport, s
     }
 }
 
+#[allow(dead_code)]
 fn tunnel(local: TcpStream, forward_addr: String, rule: ForwardRule) {
     let mut up = match TcpStream::connect(&forward_addr) {
         Ok(s) => s,
@@ -124,6 +134,7 @@ fn tunnel(local: TcpStream, forward_addr: String, rule: ForwardRule) {
     splice(local, up);
 }
 
+#[allow(dead_code)]
 fn splice(a: TcpStream, b: TcpStream) {
     let (mut a_rd, mut b_wr) = match (a.try_clone(), b.try_clone()) {
         (Ok(x), Ok(y)) => (x, y),
