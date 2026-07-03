@@ -9,7 +9,7 @@ import { ImagesSection } from "~/components/ImagesSection";
 import { MonitorsEditor, type Mon } from "~/components/MonitorsEditor";
 
 const input =
-  "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none";
+  "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none dark:bg-slate-800 dark:text-slate-100";
 
 /** When a changed setting takes effect. Placed on section headers / fields to set
  *  expectations: `immediate` applies on save, `restart` needs a control-server
@@ -437,7 +437,7 @@ export function SettingsPanel({
                         onChange={(e) => setPresetField(i, "labels", e.target.value)}
                         placeholder="Linear ticket labels, comma-separated (auto-selects this preset)"
                         spellCheck={false}
-                        className="w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none"
+                        className="w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500"
                       />
                     </div>
                     <div className="mt-1.5">
@@ -456,7 +456,7 @@ export function SettingsPanel({
                             onChange={(e) => setVar(i, k, "key", e.target.value)}
                             placeholder="KEY"
                             spellCheck={false}
-                            className="w-2/5 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 font-mono text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none"
+                            className="w-2/5 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 font-mono text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500"
                           />
                           <span className="text-slate-400 dark:text-slate-500">=</span>
                           <input
@@ -464,7 +464,7 @@ export function SettingsPanel({
                             onChange={(e) => setVar(i, k, "value", e.target.value)}
                             placeholder="value"
                             spellCheck={false}
-                            className="flex-1 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 font-mono text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none"
+                            className="flex-1 rounded border border-slate-300 dark:border-slate-600 px-2 py-1 font-mono text-xs focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500"
                           />
                           <button
                             type="button"

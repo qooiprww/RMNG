@@ -201,7 +201,7 @@ export function CloneModal({
               }}
               placeholder="https://linear.app/…/issue/WE-142  or  WE-142"
               spellCheck={false}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
             />
             {ticket && !parsed ? (
               <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">
@@ -231,7 +231,7 @@ export function CloneModal({
                 onChange={(e) => setTeam(e.target.value)}
                 placeholder="we"
                 spellCheck={false}
-                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
               />
               <span className="mt-0.5 block text-[11px] font-normal text-slate-400 dark:text-slate-500">
                 The Linear team the ticket is created in (WE-… → “we”), using the
@@ -248,7 +248,7 @@ export function CloneModal({
                   if (e.key === "Enter") submit();
                 }}
                 placeholder="Short ticket title"
-                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
               />
             </label>
             <label className="block text-xs font-medium text-slate-500 dark:text-slate-400">
@@ -258,7 +258,7 @@ export function CloneModal({
                 onChange={(e) => setDescription(e.target.value)}
                 rows={3}
                 placeholder="Optional — what needs doing"
-                className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
               />
             </label>
           </div>
@@ -274,7 +274,7 @@ export function CloneModal({
                   if (e.key === "Enter") submit();
                 }}
                 placeholder="Container title"
-                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
               />
             </label>
             <label className="block text-xs font-medium text-slate-500 dark:text-slate-400">
@@ -284,7 +284,7 @@ export function CloneModal({
                 onChange={(e) => setMessage(e.target.value)}
                 rows={3}
                 placeholder="Optional — leave empty to not auto-send a first message"
-                className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
               />
             </label>
           </div>
@@ -299,7 +299,7 @@ export function CloneModal({
               value={account}
               onChange={setAccount}
               recommended={recommended}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
             />
           </label>
         ) : null}
@@ -310,7 +310,7 @@ export function CloneModal({
             <select
               value={preset}
               onChange={(e) => setPreset(e.target.value)}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
             >
               {mode === "existing" ? (
                 <option value="">Auto (from ticket labels)</option>
@@ -350,7 +350,7 @@ export function CloneModal({
                   placeholder={
                     'Appended to the default ("Follow your \"Implementing a ticket\" procedure"); takes precedence where they conflict.'
                   }
-                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
                 />
               </label>
               <label className="block font-medium text-slate-500 dark:text-slate-400">
@@ -362,7 +362,7 @@ export function CloneModal({
                   placeholder={
                     "Appended to the default (pull latest → switch to the feature branch → setup docs → implement); takes precedence where they conflict."
                   }
-                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
                 />
               </label>
             </div>

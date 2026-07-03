@@ -17,7 +17,7 @@ import type { ChromaMode } from "~/lib/wire/ChromaMode";
 import type { ControlState } from "~/lib/types";
 
 const input =
-  "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none";
+  "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none dark:bg-slate-800 dark:text-slate-100";
 
 /** Default local name for the pulled template image. Names are bare DNS labels — the
  *  server itself prepends the repo (`base` → `rmng/template:base`). */

@@ -41,13 +41,17 @@ function LayoutPreview({ monitors }: { monitors: Mon[] }) {
               height={Math.max(2, h)}
               rx={3}
               strokeWidth={1.5}
-              className={m.primary ? "fill-emerald-100 stroke-emerald-500" : "fill-white stroke-slate-400"}
+              className={
+                m.primary
+                  ? "fill-emerald-100 stroke-emerald-500 dark:fill-emerald-900 dark:stroke-emerald-500"
+                  : "fill-white stroke-slate-400 dark:fill-slate-800 dark:stroke-slate-600"
+              }
             />
-            <text x={x + w / 2} y={y + h / 2 - 3} textAnchor="middle" className="fill-slate-600 text-[11px] font-semibold">
+            <text x={x + w / 2} y={y + h / 2 - 3} textAnchor="middle" className="fill-slate-600 text-[11px] font-semibold dark:fill-slate-100">
               {i}
               {m.primary ? " ★" : ""}
             </text>
-            <text x={x + w / 2} y={y + h / 2 + 10} textAnchor="middle" className="fill-slate-400 text-[9px]">
+            <text x={x + w / 2} y={y + h / 2 + 10} textAnchor="middle" className="fill-slate-400 text-[9px] dark:fill-slate-300">
               {m.width}×{m.height}
             </text>
           </g>
@@ -112,7 +116,7 @@ export function MonitorsEditor({
                 value={m[k]}
                 min={k === "width" || k === "height" ? 1 : 0}
                 onChange={(e) => setMon(i, k, Number(e.target.value) || 0)}
-                className="w-[4.5rem] rounded border border-slate-300 px-1.5 py-1 text-sm focus:border-slate-400 focus:outline-none dark:border-slate-600 dark:focus:border-slate-500"
+                className="w-[4.5rem] rounded border border-slate-300 px-1.5 py-1 text-sm focus:border-slate-400 focus:outline-none dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:focus:border-slate-500"
               />
             ))}
             <input

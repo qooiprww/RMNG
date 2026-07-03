@@ -62,7 +62,7 @@ export function CommitImageModal({
             }}
             placeholder="my-snapshot"
             spellCheck={false}
-            className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100 dark:placeholder:text-slate-500"
+            className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500"
           />
           {trimmed && !labelOk ? (
             <p className="mt-1 text-[11px] font-normal text-red-600 dark:text-red-400">
