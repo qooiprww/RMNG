@@ -1303,6 +1303,13 @@ impl DockerCtl {
             mounts: if mounts.is_empty() { None } else { Some(mounts) },
             network_mode: Some("none".to_string()),
             auto_remove: Some(false),
+            // The control-server itself runs `--privileged` (which bypasses AppArmor). This
+            // helper is deliberately unprivileged (it only needs docker.sock + /data), but in
+            // RMNG's nested-Docker-in-LXC deployment the host denies loading the docker-default
+            // AppArmor profile ("apparmor_parser … Access denied"), so an unprivileged container
+            // is stuck in `Created` and never starts. Opt out of AppArmor so the helper starts
+            // wherever the privileged main container does. No-op on hosts without AppArmor.
+            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
             ..Default::default()
         };
         let body = ContainerCreateBody {
