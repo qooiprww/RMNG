@@ -5,10 +5,13 @@
 // credentials file so its Claude Code can't rotate the refresh token.
 import { useEffect, useState } from "react";
 
-import { checkClaudeImport, importClaudeAccount } from "~/lib/api";
+import {
+  checkClaudeImport,
+  checkCodexImport,
+  importClaudeAccount,
+  importCodexAccount,
+} from "~/lib/api";
 import type { Host } from "~/lib/types";
-
-type Account = { email: string; orgName: string | null; subscriptionType: string | null };
 
 const input =
   "mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none";
@@ -24,35 +27,42 @@ export function ImportAccountModal({
 }) {
   // Only managed containers (clones) can be imported from.
   const clones = hosts.filter((h) => h.managed);
+  const [provider, setProvider] = useState<"claude" | "codex">("claude");
   const [hostId, setHostId] = useState(() => clones[0]?.id ?? "");
-  const [account, setAccount] = useState<Account | null>(null);
+  const [info, setInfo] = useState<{ email: string; plan: string | null } | null>(null);
   const [checking, setChecking] = useState(false);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Re-check the selected clone's Claude login whenever it changes.
+  // Re-check the selected clone's login whenever it or the provider changes.
   useEffect(() => {
     if (!hostId) return;
     let cancelled = false;
-    setAccount(null);
+    setInfo(null);
     setError(null);
     setChecking(true);
-    checkClaudeImport(hostId)
-      .then((a) => !cancelled && setAccount(a))
+    const check = provider === "codex" ? checkCodexImport : checkClaudeImport;
+    check(hostId)
+      .then((r) => {
+        // codex returns { email, plan }, claude returns { email, subscriptionType }.
+        const plan = "plan" in r ? r.plan : (r as { subscriptionType: string | null }).subscriptionType;
+        if (!cancelled) setInfo({ email: r.email, plan });
+      })
       .catch((e: Error) => !cancelled && setError(e.message))
       .finally(() => !cancelled && setChecking(false));
     return () => {
       cancelled = true;
     };
-  }, [hostId]);
+  }, [hostId, provider]);
 
-  const canImport = !!account && !importing;
+  const canImport = !!info && !importing;
 
   function submit() {
     if (!canImport) return;
     setImporting(true);
     setError(null);
-    importClaudeAccount(hostId)
+    const doImport = provider === "codex" ? importCodexAccount : importClaudeAccount;
+    doImport(hostId)
       .then((r) => onImported(r.email))
       .catch((e: Error) => {
         setError(e.message);
@@ -72,10 +82,28 @@ export function ImportAccountModal({
           if (e.key === "Escape") onClose();
         }}
       >
-        <h3 className="text-sm font-semibold text-slate-900">Import Claude account</h3>
+        <h3 className="text-sm font-semibold text-slate-900">
+          {provider === "codex" ? "Import Codex account" : "Import Claude account"}
+        </h3>
         <p className="mt-1 text-xs text-slate-500">
           Harvest a Claude account from a clone that's signed in to Claude Code via claude.ai.
         </p>
+
+        <div className="mb-3 flex gap-2">
+          {(["claude", "codex"] as const).map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => setProvider(p)}
+              className={
+                "rounded px-3 py-1 text-sm " +
+                (provider === p ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-600")
+              }
+            >
+              {p === "claude" ? "Claude" : "Codex"}
+            </button>
+          ))}
+        </div>
 
         {clones.length === 0 ? (
           <p className="mt-4 rounded-md border border-dashed border-slate-300 p-3 text-center text-xs text-slate-400">
@@ -101,11 +129,11 @@ export function ImportAccountModal({
             {/* Login status for the selected clone. */}
             <div className="mt-2 min-h-[1.25rem] text-xs">
               {checking ? (
-                <span className="text-slate-400">Checking Claude login…</span>
-              ) : account ? (
+                <span className="text-slate-400">Checking {provider === "codex" ? "Codex" : "Claude"} login…</span>
+              ) : info ? (
                 <span className="text-emerald-700">
-                  Signed in: <span className="font-medium">{account.email}</span>
-                  {account.subscriptionType ? ` · ${account.subscriptionType}` : ""}
+                  Signed in: <span className="font-medium">{info.email}</span>
+                  {info.plan ? ` · ${info.plan}` : ""}
                 </span>
               ) : null}
             </div>
