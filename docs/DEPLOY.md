@@ -241,7 +241,10 @@ clone restarts (the PID changes) and prunes stopped/deleted clones. Reach it thr
 - **From the Docker host** (the same symlink path resolves there, since `/proc/<pid>/root` is
   the clone's rootfs): `/var/lib/docker/volumes/rmng-data/_data/data/hosts/<id>`.
 - **Over sshfs** to the host: mount with `-o follow_symlinks` so the `/proc/*` targets
-  resolve.
+  resolve, e.g.:
+  ```sh
+  sshfs -o follow_symlinks root@<docker-host>:/var/lib/docker/volumes/rmng-data/_data/data/hosts ~/rmng-hosts
+  ```
 - **`docker exec`** into the control-server container and browse `data/hosts/`.
 
 Omit `--pid host` and this feature is simply off (the server logs a one-time hint per clone);

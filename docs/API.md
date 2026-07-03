@@ -18,7 +18,7 @@ disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}
 
 | Method | Path | Purpose | Success |
 |---|---|---|---|
-| GET | `/events` | Global state SSE (snapshot + diffs) | 200 SSE `ControlState` |
+| GET | `/events` | Global state SSE (snapshot + diffs) + named `stats` event | 200 SSE `ControlState` |
 | POST | `/api/activate` | Select the host shown in the viewer | 200 `ControlState` |
 | POST | `/api/reorder` | Reorder the host list | 200 `ControlState` |
 | POST | `/api/clone` | Start a clone from an image (Linear ticket / new ticket / plain) | 200 `{ok, op}` |
@@ -80,6 +80,19 @@ row), the `source` image reference, the assigned
 `Operation` carries `id`, `kind` (clone/delete/pull/commit — a persisted legacy `"bootstrap"`
 op still loads, aliased onto `pull`), `target`, `source`, `status`, `step`, `pct`, a rolling
 `log`, and timestamps.
+
+### `stats` event
+The same `/events` connection multiplexes a second, named SSE event: `stats`, a live
+`{ <hostId>: ContainerStats }` map for running **managed** clones only (a stopped or
+unmanaged host contributes no entry). `ContainerStats` ([control.rs](../crates/wire/src/control.rs)):
+`cpuPct` (percentage of ONE core — 100 == a single fully-used core, so a container busy
+across several cores reads > 100; docker-CLI convention), `memUsed`/`memLimit` (bytes,
+docker-CLI semantics). Sampled by the monitor poller alongside its 4 s `/status` probe
+([monitor.rs](../crates/control-server/src/monitor.rs)); a new subscriber gets the latest
+map immediately, then one push per tick — but only when the map actually changed (deduped
+by value, not serialization, so an idle fleet doesn't wake subscribers). Deliberately kept
+out of `ControlState`/`state.json`: these numbers move every tick, and every `ControlState`
+mutation persists the file, so folding stats in would rewrite it every 4 s.
 
 ---
 
