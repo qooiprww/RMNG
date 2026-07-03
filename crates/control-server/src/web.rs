@@ -58,6 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/api/config/test", post(config_test))
         .route("/api/setup/env", get(setup_env))
         .route("/api/server/version", get(server_version))
+        .route("/api/server/update", post(server_update))
         .route("/api/images", get(images_list))
         .route("/api/images/pull", post(images_pull))
         .route("/api/images/commit", post(images_commit))
@@ -828,6 +829,16 @@ async fn server_version(State(app): State<App>) -> Json<wire::UpdateStatus> {
     let reference = app.config().docker.server_image;
     let self_id = app.docker.env().await.self_container;
     Json(app.docker.check_update(&reference, self_id.as_deref()).await)
+}
+
+/// `POST /api/server/update` — pull `config.docker.serverImage` and swap the running
+/// control-server container onto it. Returns the driving Operation (kind `update`); the
+/// server restarts mid-op, and the rebooted server's reconcile finalizes it.
+async fn server_update(State(app): State<App>) -> Result<Json<Operation>, (StatusCode, String)> {
+    let reference = app.config().docker.server_image;
+    jobs::start_update(&app, &reference)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
 }
 
 // --- Claude accounts -------------------------------------------------------

@@ -26,6 +26,7 @@ import {
   reorder,
   swapClaudeAccount,
   testConfig,
+  updateServer,
 } from "~/lib/api";
 import { type ControlState, type Host, emptyState } from "~/lib/types";
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
@@ -399,6 +400,7 @@ function Dashboard({
           testConfig={testConfig}
           applyMonitors={applyMonitors}
           getUpdateStatus={getUpdateStatus}
+          updateServer={updateServer}
           images={images}
           imagesLoading={imagesLoading}
           pullBusy={state.operations.some(

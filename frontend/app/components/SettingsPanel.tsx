@@ -112,6 +112,8 @@ export interface SettingsPanelProps {
   applyMonitors: () => Promise<{ ok: boolean; applied: string[]; errors: string[] }>;
   /** Read the control-server's own version + update-available status. */
   getUpdateStatus: () => Promise<UpdateStatus>;
+  /** Pull the latest control-server image and swap the running container onto it. */
+  updateServer: () => Promise<unknown>;
   // --- clone-source images (moved here from the sidebar) ---
   images: ImageInfo[];
   imagesLoading: boolean;
@@ -129,6 +131,7 @@ export function SettingsPanel({
   testConfig,
   applyMonitors,
   getUpdateStatus,
+  updateServer,
   images,
   imagesLoading,
   pullBusy,
@@ -161,6 +164,16 @@ export function SettingsPanel({
       const s = await getUpdateStatus();
       setServerStatus(s);
       setServerMsg(s.error ? `⚠ ${s.error}` : s.available ? "update available" : "up to date");
+    } catch (e) {
+      setServerMsg(`✗ ${(e as Error).message}`);
+    }
+  }
+
+  async function doUpdate() {
+    if (!confirm("Update the control-server now?\n\nIt will pull the latest image and restart itself. The UI will briefly disconnect and reconnect; running clones are unaffected.")) return;
+    setServerMsg("updating… the server will restart shortly");
+    try {
+      await updateServer();
     } catch (e) {
       setServerMsg(`✗ ${(e as Error).message}`);
     }
@@ -546,6 +559,14 @@ export function SettingsPanel({
                     className="rounded border border-slate-300 dark:border-slate-600 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                   >
                     Check for updates
+                  </button>
+                  <button
+                    type="button"
+                    onClick={doUpdate}
+                    disabled={!serverStatus?.available}
+                    className="rounded bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                  >
+                    Update
                   </button>
                   {serverStatus ? (
                     <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${serverStatus.available ? "bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400" : "bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400"}`}>

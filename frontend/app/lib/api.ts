@@ -1,6 +1,7 @@
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
 import type { ConfigPutResponse } from "~/lib/wire/ConfigPutResponse";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
+import type { Operation } from "~/lib/wire/Operation";
 import type { SetupEnv } from "~/lib/wire/SetupEnv";
 import type { UpdateStatus } from "~/lib/wire/UpdateStatus";
 
@@ -81,6 +82,9 @@ export const deleteImage = (reference: string) =>
 export const getSetupEnv = () => getJson("/api/setup/env") as Promise<SetupEnv>;
 /** The control-server's own version + whether Hub has a newer image (no pull). */
 export const getUpdateStatus = () => getJson("/api/server/version") as Promise<UpdateStatus>;
+/** Pull the latest control-server image and swap the running container onto it. Returns the
+ *  driving Operation (kind `update`); the server restarts mid-op. */
+export const updateServer = () => postJson("/api/server/update", {}) as Promise<Operation>;
 
 /** Force an immediate Claude usage poll (refresh tokens + fetch 5h/7d). */
 export const refreshClaudeUsage = () => postJson("/api/claude/refresh", {});

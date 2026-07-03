@@ -37,6 +37,7 @@ const meta = {
     testConfig: testConfig(),
     applyMonitors: applyMonitors(),
     getUpdateStatus: getUpdateStatus(),
+    updateServer: fn(),
     images,
     imagesLoading: false,
     pullBusy: false,
