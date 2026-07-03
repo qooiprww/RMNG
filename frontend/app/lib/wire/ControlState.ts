@@ -14,10 +14,6 @@ export type ControlState = {
  */
 selected: string | null, monitors: Array<MonitorSpec>, hosts: Array<Host>, operations: Array<Operation>, 
 /**
- * Host ids that are templates: not deletable; cloned instead.
- */
-templates: Array<string>, 
-/**
  * Per-Claude-account usage view (no tokens).
  */
 claudeAccounts: Array<ClaudeUsage>, };

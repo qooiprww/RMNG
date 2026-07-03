@@ -60,9 +60,10 @@ pub enum MonitorState {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../frontend/app/lib/wire/")]
 pub struct Host {
-    /// Stable id; equals the Proxmox container hostname for cloneable hosts.
+    /// Stable id; equals the Docker container name for cloneable hosts.
     pub id: String,
-    /// RDP/media server hostname or IP.
+    /// Endpoint hostname/IP for unmanaged rows. Display-only on managed clones (it
+    /// records the container name == `id`; dials resolve via Docker DNS / inspect).
     pub host: String,
     /// Port (defaults to 3389 for the legacy RDP path).
     #[serde(default = "default_rdp_port")]
@@ -91,8 +92,13 @@ pub struct Host {
     pub gdm_password: Option<String>,
 
     // --- server-only extras (camelCase) ---
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ctid: Option<u32>,
+    /// True for a managed clone: a Docker container whose *name equals this host's id*
+    /// backs it (every Docker call addresses it by that name — no stored container id).
+    /// False is a plain unmanaged row (legacy/hand-added, deletable in the UI). Old
+    /// `state.json` rows carrying the retired `ctid`/`container` keys load as
+    /// unmanaged — serde drops the stale keys.
+    #[serde(default)]
+    pub managed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +148,13 @@ pub struct Host {
 pub enum OperationKind {
     Clone,
     Delete,
+    /// Pull the clone template from a registry (replaced the retired in-product
+    /// `Bootstrap` build). The `bootstrap` alias keeps a persisted legacy op loadable:
+    /// `state.rs::read_from_disk` falls back to an EMPTY state on any parse error, so a
+    /// stored `"kind":"bootstrap"` op without this alias would wipe every host.
+    #[serde(alias = "bootstrap")]
+    Pull,
+    Commit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -172,11 +185,30 @@ pub struct Operation {
     /// Rolling log lines for the operation.
     #[serde(default)]
     pub log: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ctid: Option<u32>,
     pub started_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+}
+
+/// Live per-container resource usage, sampled by the monitor poller each tick and pushed
+/// to the frontend as a named `stats` SSE event carrying a `{ hostId: ContainerStats }`
+/// map. Deliberately NOT a field of [`ControlState`] / [`Host`]: it changes every tick, so
+/// routing it through the state store would rewrite `state.json` every few seconds (every
+/// `ControlState` mutation persists — see the control-server's `state.rs`). It rides the
+/// same `/events` stream on a separate SSE-only bus instead.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct ContainerStats {
+    /// CPU use as a percentage of ONE core (100 == a single fully-used core; a container
+    /// busy across several cores reads > 100). The frontend divides by 100 to display
+    /// "cores".
+    pub cpu_pct: f64,
+    /// Resident memory in bytes, docker-CLI semantics (`usage` minus reclaimable
+    /// `inactive_file` page cache).
+    pub mem_used: u64,
+    /// Memory limit in bytes; 0 when the daemon reports none.
+    pub mem_limit: u64,
 }
 
 /// 0–100 utilization for a rolling usage window + when it resets.
@@ -243,9 +275,6 @@ pub struct ControlState {
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub operations: Vec<Operation>,
-    /// Host ids that are templates: not deletable; cloned instead.
-    #[serde(default)]
-    pub templates: Vec<String>,
     /// Per-Claude-account usage view (no tokens).
     #[serde(default)]
     pub claude_accounts: Vec<ClaudeUsage>,
@@ -310,8 +339,27 @@ mod tests {
         assert_eq!(state.hosts[0].port, 3389); // default
         assert_eq!(state.hosts[1].port, 3390);
         assert!(state.operations.is_empty());
-        assert!(state.templates.is_empty());
         assert!(state.claude_accounts.is_empty());
+    }
+
+    #[test]
+    fn legacy_state_loads_unmanaged() {
+        // Old `state.json` shapes: Proxmox-era hosts carry the retired `ctid` key (plus
+        // the top-level `templates` list); early docker-port hosts carry the retired
+        // `container` id. All are stale and dropped by serde; such hosts load as plain
+        // unmanaged rows (`managed: false`).
+        let json = r#"{
+            "hosts": [
+                { "id": "pega-old", "host": "10.0.0.9", "username": "u", "password": "p", "ctid": 5 },
+                { "id": "pega-mid", "host": "10.99.0.10", "username": "u", "password": "p",
+                  "container": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+            ],
+            "templates": ["rmng-template"]
+        }"#;
+        let state: ControlState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.hosts.len(), 2);
+        assert!(!state.hosts[0].managed);
+        assert!(!state.hosts[1].managed);
     }
 
     #[test]
@@ -343,6 +391,31 @@ mod tests {
         let d = <Host as ts_rs::TS>::decl();
         assert!(d.contains("gdm_username"), "binding lost gdm_username: {d}");
         assert!(!d.contains("gdmUsername"), "binding camelCased gdm_username: {d}");
+    }
+
+    #[test]
+    fn operation_kind_serde_and_bootstrap_alias() {
+        // Canonical serialization is the lowercase variant name.
+        assert_eq!(serde_json::to_string(&OperationKind::Pull).unwrap(), "\"pull\"");
+        assert_eq!(
+            serde_json::from_str::<OperationKind>("\"pull\"").unwrap(),
+            OperationKind::Pull
+        );
+        // Legacy persisted ops used `"bootstrap"`; the alias keeps them loadable so a
+        // stored op never trips `read_from_disk`'s parse-error → empty-state fallback.
+        assert_eq!(
+            serde_json::from_str::<OperationKind>("\"bootstrap\"").unwrap(),
+            OperationKind::Pull
+        );
+        // A whole Operation carrying the legacy kind deserializes with everything intact.
+        let legacy = r#"{
+            "id": "op_1", "kind": "bootstrap", "target": "my-base",
+            "status": "running", "step": "queued", "pct": 0.0, "message": "queued",
+            "startedAt": 1
+        }"#;
+        let op: Operation = serde_json::from_str(legacy).unwrap();
+        assert_eq!(op.kind, OperationKind::Pull);
+        assert_eq!(op.target, "my-base");
     }
 
     #[test]

@@ -2,18 +2,17 @@
 //! `tools/call`), the same simple transport the legacy `/mcp` used (curl-testable;
 //! no rmcp/SSE session machinery).
 //!
-//!   - **Port 3 (per-clone)**: the in-clone agent connects; the target clone is the
-//!     caller (matched by source IP). Tools: `set_state` + the desktop tools
-//!     (screenshot/click/… — those need the `media` build's clone conns; here they
-//!     report "media not enabled" until wired into `mediaplane`).
+//!   - **Port 3 (per-clone)**: the in-clone agent connects; the caller self-identifies
+//!     with its clone id in the `x-rmng-clone` header (clone IPs are dynamic Docker
+//!     IPAM now, so there is nothing to reverse-map a source IP against). Tools:
+//!     `set_state`.
 //!   - **Port 4 (global)**: every web-frontend action as a tool, plus the desktop
 //!     tools with an explicit `clone` argument. Replaces `control-server-ctl`.
 
-use std::net::SocketAddr;
-
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::State,
+    http::HeaderMap,
     routing::post,
 };
 use serde_json::{Value, json};
@@ -23,7 +22,7 @@ use crate::jobs::{self, CloneSpec};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Scope {
-    /// Port 3: the clone is the caller (by source IP); agent-facing desktop tools.
+    /// Port 3: the clone is the caller (self-identified via the `x-rmng-clone` header).
     PerClone,
     /// Port 4: global control; tools take an explicit `clone` + web actions.
     Global,
@@ -41,11 +40,11 @@ pub async fn serve(app: App, port: u16, scope: Scope) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let label = match scope {
-        Scope::PerClone => "port 3 (per-clone MCP, IP-routed)",
+        Scope::PerClone => "port 3 (per-clone MCP, header-routed)",
         Scope::Global => "port 4 (global MCP)",
     };
     tracing::info!("{label} on http://{addr}");
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -92,7 +91,7 @@ fn dtool(name: &str, desc: &str, mut props: Value, extra_required: &[&str]) -> V
 fn tools_for(scope: Scope) -> Value {
     let clone_arg = json!({ "clone": { "type": "string", "description": "target clone id" } });
     let mut tools = vec![];
-    // set_state — both scopes (PerClone derives the clone from the source IP).
+    // set_state — both scopes (PerClone derives the clone from the x-rmng-clone header).
     let set_state_props = if scope == Scope::Global {
         json!({ "clone": { "type": "string" }, "report": { "type": "string", "enum": ["working", "idle"] }, "note": { "type": "string" } })
     } else {
@@ -133,17 +132,11 @@ fn tools_for(scope: Scope) -> Value {
         tools.push(tool("select", "Select the host shown in the viewer", clone_arg.clone(), json!(["clone"])));
         tools.push(tool(
             "clone",
-            "Clone a source host (CoW)",
-            json!({ "source": { "type": "string" }, "hostname": { "type": "string" } }),
-            json!(["source", "hostname"]),
+            "Create a clone from a source image (rmng/template:<name>)",
+            json!({ "image": { "type": "string", "description": "clone-source image reference" }, "hostname": { "type": "string" } }),
+            json!(["image", "hostname"]),
         ));
         tools.push(tool("delete", "Delete a host", clone_arg.clone(), json!(["clone"])));
-        tools.push(tool(
-            "redeploy",
-            "Hot-swap a clone's clone-daemon (+ agent-wrapper unless daemonOnly) binaries from the embedded copies, without reprovisioning",
-            json!({ "clone": { "type": "string", "description": "target clone id" }, "daemonOnly": { "type": "boolean", "description": "skip the agent-wrapper (keeps its Claude session)" } }),
-            json!(["clone"]),
-        ));
         tools.push(tool("claude_recommended", "Recommended Claude account for a new clone", json!({}), json!([])));
         tools.push(tool(
             "claude_swap",
@@ -157,6 +150,21 @@ fn tools_for(scope: Scope) -> Value {
             }),
             json!(["clone", "account"]),
         ));
+        tools.push(tool(
+            "send_message",
+            "Send a chat message to a clone's host agent. Async: the agent works in the background — poll read_chat for its reply. Errors if a turn is already running for that clone.",
+            json!({
+                "clone": { "type": "string", "description": "target clone id" },
+                "text": { "type": "string", "description": "the message to send to the host agent" },
+            }),
+            json!(["clone", "text"]),
+        ));
+        tools.push(tool(
+            "read_chat",
+            "Read a clone's host-agent chat history + live working state: { busy, activity?, messages[] }. `busy` = a turn is running; `activity` = what it's doing right now.",
+            clone_arg.clone(),
+            json!(["clone"]),
+        ));
     }
     Value::Array(tools)
 }
@@ -169,10 +177,16 @@ fn merge(into: &mut Value, extra: &Value) {
     }
 }
 
-async fn rpc(State(st): State<McpState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(req): Json<Value>) -> Json<Value> {
+async fn rpc(State(st): State<McpState>, headers: HeaderMap, Json(req): Json<Value>) -> Json<Value> {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
+    // Per-clone self-identification: the agent-wrapper sends its clone id (hostname)
+    // on every request. Absent on the global port (and on stale in-clone builds).
+    let caller = headers
+        .get("x-rmng-clone")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     let result: Result<Value, String> = match method {
         "initialize" => Ok(json!({
@@ -185,7 +199,7 @@ async fn rpc(State(st): State<McpState>, ConnectInfo(peer): ConnectInfo<SocketAd
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            call_tool(&st, peer.ip().to_string(), name, args)
+            call_tool(&st, caller.as_deref(), name, args)
                 .await
                 .map(|content| json!({ "content": content }))
         }
@@ -198,11 +212,15 @@ async fn rpc(State(st): State<McpState>, ConnectInfo(peer): ConnectInfo<SocketAd
     }
 }
 
-/// Resolve which clone a call targets: per-clone scope → the caller's IP; global → `clone` arg.
-fn target_clone(st: &McpState, peer_ip: &str, args: &Value) -> Option<String> {
+/// Resolve which clone a call targets: per-clone scope → the caller's self-reported id
+/// (`x-rmng-clone` header), validated against the host list; global → `clone` arg.
+fn target_clone(st: &McpState, caller: Option<&str>, args: &Value) -> Option<String> {
     match st.scope {
         Scope::Global => args.get("clone").and_then(Value::as_str).map(str::to_string),
-        Scope::PerClone => st.app.store.get().hosts.into_iter().find(|h| h.host == peer_ip).map(|h| h.id),
+        Scope::PerClone => {
+            let id = caller?;
+            st.app.store.get().hosts.into_iter().find(|h| h.id == id).map(|h| h.id)
+        }
     }
 }
 
@@ -211,7 +229,7 @@ fn text(s: impl Into<String>) -> Value {
     json!([{ "type": "text", "text": s.into() }])
 }
 
-async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> Result<Value, String> {
+async fn call_tool(st: &McpState, caller: Option<&str>, name: &str, args: Value) -> Result<Value, String> {
     let app = &st.app;
     // Desktop + window tools → proxy to the target clone-daemon's MCP. Global only; the
     // in-clone agent calls its own clone-daemon directly (the per-clone MCP is set_state).
@@ -223,11 +241,11 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
         }
         let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
         let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-        return proxy_to_daemon(app, &host.host, name, &args).await;
+        return proxy_to_daemon(app, &host, name, &args).await;
     }
     match name {
         "set_state" => {
-            let clone = target_clone(st, &peer_ip, &args).ok_or("could not resolve target clone")?;
+            let clone = target_clone(st, caller, &args).ok_or("could not resolve target clone")?;
             let report = args.get("report").and_then(Value::as_str).map(str::to_string);
             let note = args.get("note").and_then(Value::as_str).map(str::to_string);
             app.store.mutate(|s| {
@@ -256,9 +274,9 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
             Ok(text(format!("selected {clone}")))
         }
         "clone" => {
-            let source = args.get("source").and_then(Value::as_str).ok_or("source required")?.to_string();
+            let image = args.get("image").and_then(Value::as_str).ok_or("image required")?.to_string();
             let hostname = args.get("hostname").and_then(Value::as_str).ok_or("hostname required")?.to_string();
-            let op = jobs::start_clone(app, CloneSpec { source_id: source, new_hostname: hostname, ..Default::default() })
+            let op = jobs::start_clone(app, CloneSpec { source_image: image, new_hostname: hostname, ..Default::default() })
                 .map_err(|e| e.to_string())?;
             Ok(text(format!("clone started: op {}", op.id)))
         }
@@ -267,19 +285,6 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
             let op = jobs::start_delete(app, clone).map_err(|e| e.to_string())?;
             Ok(text(format!("delete started: op {}", op.id)))
         }
-        "redeploy" => {
-            let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
-            let daemon_only = args.get("daemonOnly").and_then(Value::as_bool).unwrap_or(false);
-            let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-            let ctid = host.ctid.ok_or("clone has no container")?;
-            let cfg = app.config();
-            crate::orchestrate::redeploy_clone(&cfg, ctid, "pega", daemon_only, |step, msg| {
-                tracing::info!("redeploy CT {ctid} {step}: {msg}");
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(text(format!("redeployed {clone}{}", if daemon_only { " (daemon only)" } else { "" })))
-        }
         "claude_recommended" => {
             Ok(text(json!({ "email": crate::claude::recommend(app) }).to_string()))
         }
@@ -287,25 +292,27 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
             let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
             let account = args.get("account").and_then(Value::as_str).unwrap_or("auto");
             let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
-            let ctid = host.ctid.ok_or("clone has no container")?;
+            if !host.managed {
+                return Err("not a managed clone".into());
+            }
             let assignment = crate::claude::resolve_assignment(app, Some(account)).ok_or("no imported Claude accounts")?;
             let selection = crate::claude::normalize_selection(Some(account));
             let (group, email) = match assignment {
                 crate::claude::Assignment::None => {
-                    crate::claude::clear_clone_token(&app.config().proxmox.ssh, ctid)
+                    crate::claude::clear_clone_token(app, &host.id)
                         .await
                         .map_err(|e| e.to_string())?;
                     app.claude.forget_pushed(&host.id);
                     (None, None)
                 }
                 crate::claude::Assignment::Group { name, initial } => {
-                    crate::claude::push_account_to_clone(app, &host.id, ctid, &initial)
+                    crate::claude::push_account_to_clone(app, &host.id, &initial)
                         .await
                         .map_err(|e| e.to_string())?;
                     (Some(name), Some(initial))
                 }
                 crate::claude::Assignment::Account(a) => {
-                    crate::claude::push_account_to_clone(app, &host.id, ctid, &a)
+                    crate::claude::push_account_to_clone(app, &host.id, &a)
                         .await
                         .map_err(|e| e.to_string())?;
                     (None, Some(a))
@@ -326,16 +333,30 @@ async fn call_tool(st: &McpState, peer_ip: String, name: &str, args: Value) -> R
                 _ => format!("swapped {clone} → none (no token)"),
             }))
         }
+        "send_message" => {
+            let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
+            let msg = args.get("text").and_then(Value::as_str).ok_or("text required")?;
+            let host = app.store.get().hosts.into_iter().find(|h| h.id == clone).ok_or("unknown clone")?;
+            crate::chat::send_chat(app, &host, msg)?;
+            Ok(text(format!("message sent to {clone}; the host agent is now working — poll read_chat for its reply")))
+        }
+        "read_chat" => {
+            let clone = args.get("clone").and_then(Value::as_str).ok_or("clone required")?;
+            if !app.store.get().hosts.iter().any(|h| h.id == clone) {
+                return Err("unknown clone".into());
+            }
+            Ok(text(crate::chat::snapshot_json(app, clone)))
+        }
         other => Err(format!("unknown tool '{other}'")),
     }
 }
 
-/// Proxy a desktop/window `tools/call` to a clone's clone-daemon MCP (`http://{ip}:{daemon_mcp}`)
-/// and return its `result.content`. The full args (incl. `clone`) pass through; the daemon
-/// ignores the `clone` key.
-async fn proxy_to_daemon(app: &App, host_ip: &str, name: &str, args: &Value) -> Result<Value, String> {
+/// Proxy a desktop/window `tools/call` to a clone's clone-daemon MCP (dialed by container
+/// name via Docker DNS — `App::dial_host`) and return its `result.content`. The full args
+/// (incl. `clone`) pass through; the daemon ignores the `clone` key.
+async fn proxy_to_daemon(app: &App, host: &wire::Host, name: &str, args: &Value) -> Result<Value, String> {
     let port = app.config().listen.daemon_mcp;
-    let url = format!("http://{host_ip}:{port}/");
+    let url = format!("http://{}:{port}/", app.dial_host(host).await);
     let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
     let resp = app
         .http

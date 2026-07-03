@@ -1,122 +1,103 @@
 # Scripts reference
 
-Two families: **developer build/deploy** scripts (run by hand from your workstation) and
-**control-server orchestration** scripts (embedded in the binary via `include_str!` and run
-over SSH at runtime). Plus the gnome-patch build.
+The Docker port collapsed RMNG's script surface to almost nothing. The old
+**developer build/deploy** scripts (`provision-build-ct.sh` / `cs-build-ct.sh` /
+`provision-deploy-ct.sh` / `cs-deploy-ct.sh`) are gone — the build is a **Dockerfile**
+(`docker build`, see [DEPLOY.md](DEPLOY.md#the-image-build)), and deploy is `docker run` /
+`docker compose`. The old **SSH+`pct` orchestration** scripts (`bootstrap.sh` / `clone.sh` /
+`redeploy.sh` / `delete.sh`) are gone too — those flows are now pure Rust in
+[`provision.rs`](../crates/control-server/src/provision.rs), driving the bollard primitives in
+[`docker.rs`](../crates/control-server/src/docker.rs). The `P <step> <msg>` / `RESULT` bash
+protocol died with them: Rust emits progress directly through a `FnMut(&str, &str)` callback,
+and a guest script's own stdout lines are line-buffered into the Operation log. Clone binaries
+also no longer redeploy via a script + endpoint — the control-server hot-swaps them itself
+(hash check + `systemctl --user` bounce driven straight from Rust; see
+[DEPLOY.md#upgrades](DEPLOY.md#upgrades)).
+
+The in-product clone-source **build** is gone too: what used to be
+`crates/control-server/scripts/provision-clone.sh`, run inside a privileged build container
+over `docker exec`, is now [`template/setup/`](../template/setup/) — ordered phase scripts
+`RUN` directly by [`template/Dockerfile`](../template/Dockerfile) at `docker build` time,
+published as an image (`pegasis0/rmng-template`) instead of provisioned per install. See
+[DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template).
+
+What survives at **runtime** is **two in-container guest scripts** (`include_str!`'d into the
+control-server binary and streamed to a container over `docker exec bash -s` —
+`DockerCtl::exec_script`), plus the **template build scripts** and the **gnome-patch build**
+(both Dockerfile-stage/`RUN` steps, not `docker exec`).
 
 | Script | Runs where | Invoked by | Purpose |
 |---|---|---|---|
-| `scripts/provision-build-ct.sh` | workstation → node | operator | Create the **staging** control-server CT: build the binary, then run it (cs-deploy-ct.sh) |
-| `scripts/cs-build-ct.sh` | inside build CT | provision-build-ct.sh | Install toolchain, embed binaries+deb, build workspace (no GNOME/capture) |
-| `scripts/provision-deploy-ct.sh` | workstation → node | operator | Create the lean runtime CT, copy + run the binary |
-| `scripts/cs-deploy-ct.sh` | inside deploy CT | provision-deploy-ct.sh | Runtime deps + config + SSH key + systemd unit |
-| `crates/control-server/scripts/bootstrap.sh` | node (SSH) | `orchestrate::bootstrap_template` | Build a fresh template/clone CT from base image |
-| `crates/control-server/scripts/provision-clone.sh` | inside new clone CT | bootstrap.sh | Headless GNOME + clone-daemon + agent-wrapper + patched shell |
-| `crates/control-server/scripts/clone.sh` | node (SSH) | `orchestrate::clone_ct` | CoW (LVM-thin) snapshot of a template |
-| `crates/control-server/scripts/redeploy.sh` | node (SSH) | `orchestrate::redeploy_clone` | Hot-swap a clone's daemon/agent binaries |
-| `crates/control-server/scripts/delete.sh` | node (SSH) | `orchestrate::delete_ct` | Destroy a CT + its snapshot |
-| `crates/control-server/scripts/apply-monitors.sh` | node (SSH) | `orchestrate::apply_monitors` | Re-apply a monitor layout to a running clone |
-| `crates/control-server/scripts/claude-import.sh` | clone via node (`pct exec`) | `claude::{check_clone_auth,import_clone_account,apply_clone_token}` | Read `claude auth status` / the credentials file, clear it, or install a token |
-| `gnome-patch/build-shell-deb.sh` | inside build CT | cs-build-ct.sh | Build the patched gnome-shell `.deb` |
+| `crates/control-server/scripts/apply-monitors.sh` | in a clone container (`docker exec`) | `provision::apply_monitors` | Re-apply a monitor layout to a running clone without reprovisioning |
+| `crates/control-server/scripts/claude-import.sh` | in a clone container (`docker exec`) | `provision::run_clone_op` (`claude.rs`) | Read `claude auth status` / the credentials file, clear it, or install a token |
+| `template/setup/{lib,10-desktop,15-gnome-patch,20-toolbox,30-user}.sh` | in the template build (`RUN`) | `template/Dockerfile` | Provision the clone template rootfs: desktop, patched shell, dev toolbox, the clone user + its units (binaries themselves are `COPY`'d in by the Dockerfile after) |
+| `gnome-patch/build-shell-deb.sh` | the `gnome-build` stage of `template/Dockerfile` | `docker build` | Build the patched gnome-shell `.deb` |
 
-The orchestration scripts are baked into the control-server binary at compile time
-([orchestrate.rs:14-19](../crates/control-server/src/orchestrate.rs), [claude.rs:36](../crates/control-server/src/claude.rs))
-and streamed to the node over `ssh … bash -s --` at runtime — they are **not** pre-installed
-on the node. They emit `P <step> <msg>` progress lines and a final `RESULT …` line that
-`run_remote` parses.
+The two runtime guest scripts are baked in at compile time
+([provision.rs:32-33](../crates/control-server/src/provision.rs)) and fed to
+`bash -s -- <args…>` over the exec's stdin at runtime — they are **not** pre-installed in any
+container. Each emits its step lines as `    [ct] <message>`, which `provision.rs` strips for
+the operation message; other stdout/stderr becomes plain log context. The template build
+scripts, by contrast, are `COPY`'d into the build context and `RUN` by the Dockerfile itself —
+they never touch the control-server binary or a live container.
 
 ---
 
-## Developer build/deploy
+## In-container guest scripts
 
-### `provision-build-ct.sh [flags] <proxmox-ssh> [hostname=rmng-build]`
-Runs locally. Provisions the **staging** control-server CT. Packs `RMNG/` (incl. the vendored
-`agent-wrapper`), ships it to the node, creates an unprivileged Ubuntu CT (nesting/keyctl/fuse,
-render-node passthrough, apparmor unconfined, the `/srv/rmng-sock` clone-socket bind-mount),
-runs `cs-build-ct.sh` to build the binary, then runs `cs-deploy-ct.sh` and authorizes the CT's
-orchestration key on the node — so the CT comes up as a control-server orchestrating **real
-clones**, exactly like the production deploy CT but with the toolchain. The build CT does **not**
-run GNOME/capture. Flags (all optional, before the positionals): `--storage` (`local-lvm`),
-`--bridge` (`vmbr0`), `--template` (Ubuntu 26.04), `--cores` (8), `--memory` (12288),
-`--rootfs-gb` (40), `--sock-dir` (`/srv/rmng-sock`), `--proxmox-from-ct`. `--storage`/`--bridge`/
-`--sock-dir` are passed on to `cs-deploy-ct.sh`, which prefills them (and `cloneSocket =
-<sock-dir>/clones.sock`) into the CT's `config.json` so the first-run wizard matches the real
-infra. Prints `RESULT <ctid> <ip>`; dashboard at `:9000`.
+### `apply-monitors.sh <username> <monitors-csv>`
+Runs as root inside a **running clone** container. Rewrites the clone-daemon's `RMNG_MONITORS`
++ the `gnome-headless` dummy mode specs from the new layout, then restarts the headless GNOME
+session + the daemon (which re-creates the virtual monitors at startup). Talks to the target
+user's `systemd --user` manager via `runuser` + its `XDG_RUNTIME_DIR` / session-bus address.
+Driven by `POST /api/monitors/apply`.
 
-### `cs-build-ct.sh [src-dir=/root/RMNG]`
-Runs inside the build CT. **Build only — installs no GNOME/capture session.** Installs the
-toolchain (Rust, bun, GStreamer/VA/PipeWire/GTK4 *-dev*, plus the control-server's VA-API
-*encode* runtime) and the gnome-shell build-deps (deb-src + `apt build-dep gnome-shell` +
-`sassc dpkg-dev`). Then: builds `clone-daemon` (gzip → `embedded-bin/`), `bun build --compile`s
-the `agent-wrapper` (gzip → `embedded-bin/`), builds the patched gnome-shell deb via
-`gnome-patch/build-shell-deb.sh` (gzip → `embedded-bin/gnome-shell-deb.gz` — the deb is *built*;
-gnome-shell is never installed), builds the frontend (`bun run build`), then builds the whole
-workspace `--release` — `rust-embed` bakes the frontend + the three gzipped artifacts into
-`control-server`. Installs it to `/usr/local/bin/rmng-control-server`. Idempotent.
-`provision-build-ct.sh` runs `cs-deploy-ct.sh` afterward to start it as a control-server.
-
-### `provision-deploy-ct.sh [flags] <proxmox-ssh> [hostname=rmng-control] [build-ct=rmng-build]`
-Runs locally. Creates a **lean** runtime CT (runtime libs only, render passthrough, the
-`/srv/rmng-sock` host dir bind-mounted for the clone socket), copies `control-server` from the
-build CT, runs `cs-deploy-ct.sh` inside, and authorizes the CT's orchestration key on the
-node. Flags (all optional, before the positionals): same as `provision-build-ct.sh` —
-`--storage`/`--bridge`/`--template`/`--cores`/`--memory`/`--rootfs-gb`/`--sock-dir`/
-`--proxmox-from-ct` (sizing defaults 4 cores / 4 GB / 12 GB; `--sock-dir` `/srv/rmng-sock`).
-`--storage`/`--bridge`/`--sock-dir` are prefilled into the CT's config via `cs-deploy-ct.sh`.
-Prints `RESULT <ctid> <ip>`; dashboard at `:9000`.
-
-### `cs-deploy-ct.sh <proxmox-ssh-from-ct> [sock-dir=/srv/rmng-sock] [storage=local-lvm] [bridge=vmbr0]`
-Runs inside the deploy CT. Installs runtime deps, writes a minimal `config.json` (the
-Proxmox SSH target + the one-time infra settings — `proxmox.storage`, `proxmox.bridge`, and
-`cloneSocket = <sock-dir>/clones.sock` — **prefilled** from the args so the first-run wizard
-shows values matching the CT that was created, plus `setupComplete: false`), generates the
-`~/.ssh/id_ed25519` orchestration key, and installs + starts the `control-server` systemd unit.
-The provision scripts pass args 2-4 through; run by hand they default to the values shown.
+### `claude-import.sh <user> status|read|clear|apply [b64]`
+Runs inside the target **clone** container as the clone user, printing the raw result to
+stdout. `status` — `claude auth status` JSON (stderr merged so a logged-out clone still
+parses; never fails). `read` — the clone's `~/.claude/.credentials.json`. `clear` — delete
+it, print `CLEARED`. `apply <b64>` — write `~/.claude/.credentials.json` (0600) from the
+base64 JSON in `$3` (the current short-lived access token, refresh emptied). Backs
+`claude.rs`'s `{check_clone_auth, import_clone_account, apply_clone_token}`; hot-swaps a
+running clone's account with no restart (Claude Code re-reads creds per request).
 
 ---
 
-## Control-server orchestration (embedded, run over SSH)
+## Template build scripts
 
-### `bootstrap.sh <hostname> <template> <storage> <bridge> <prov_b64> [cd_bin] [aw_bin] [monitors] [shell_deb]`
-On the node. Creates a CT from the base image, configures render/apparmor + the `/srv/rmng-sock`
-bind-mount, starts it, waits for DHCP, `pct push`es the staged binaries (clone-daemon,
-agent-wrapper, patched gnome-shell deb) + the base64 `provision-clone.sh`, then runs it.
-`RESULT <ctid> <ip>`.
+Ordered phase scripts under [`template/setup/`](../template/setup/), each `COPY`'d in
+immediately before its own `RUN` in `template/Dockerfile` (not one bulk copy — see the
+Dockerfile's comments on why per-phase copies matter for layer caching). Rarest-changing
+first, so a `30-user.sh` tweak never re-runs the ~20-minute phase-10 apt layer. Every phase
+sources `lib.sh` first (`DEBIAN_FRONTEND=noninteractive` + `SYSTEMD_OFFLINE=1`, exported
+inside the script — never baked as image `ENV`, or it would leak into the booted clone).
 
-### `provision-clone.sh <username> <password> [monitors]`
-Inside the new CT. apt upgrade; remove snap + disable apparmor; install headless GNOME +
-Mutter + VA-API + PipeWire (no GDM/g-r-d); **install the patched gnome-shell deb** if pushed;
-create the user (sudo, render/video, linger); install `clone-daemon` + `agent-wrapper` + the
-standalone `claude` CLI; write + enable three `systemd --user` units (`gnome-headless`,
-`clone-daemon`, `agent-wrapper`). `RESULT ok`.
+| Script | Purpose |
+|---|---|
+| `lib.sh` | Shared env + `log()` helper; sourced (not run) by every phase |
+| `10-desktop.sh` | Locale/tz, headless GNOME + Mutter + VA-API + PipeWire (no gdm3/g-r-d/flatpak), the Recommends strip, container masks |
+| `15-gnome-patch.sh` | `dpkg -i` the patched gnome-shell `.deb` (from the `gnome-build` stage) over stock |
+| `20-toolbox.sh` | Best-effort dev toolbox: CLI tools, Docker, cloud CLIs, browsers, Cursor/VS Code, HMCL/Mission Center/Monaspace, dconf defaults |
+| `30-user.sh` | The uid-1000 clone user (groups, linger, fish), preset-PATH rc, keyring, shared `CLAUDE.md` + linear MCP, `claude`/`uv`/`rustup`/`nvm` toolchains, and the three `systemd --user` units (`gnome-headless`, `rmng-clone-daemon`, `agent-wrapper`) + wants symlinks |
 
-### `clone.sh <src-id> <new-hostname> <macprefix>`
-On the node. Locate the source CT by hostname, LVM-thin CoW-snapshot its rootfs, reset
-machine-id/hostname and regenerate each NIC's MAC (with `<macprefix>` — a snapshot inherits
-the template's MAC, which would collide on the shared bridge), start the clone, wait for its
-**eth0 (vmbr0)** DHCP lease. `RESULT <ctid> <ip>`. (CoW clones inherit everything baked into
-the template, incl. the patched shell. Single-NIC on vmbr0 — no internal subnet.)
-
-### `redeploy.sh <ctid> <username> <cd_bin|-> <aw_bin|->`
-On the node. Stop the clone's `clone-daemon` (+`agent-wrapper` unless `-`), `pct push` the new
-binaries, restart. The daemon reconnects to the socket.
-
-### `delete.sh <ctid>` · `apply-monitors.sh <ctid> <username> <monitors>`
-`delete.sh`: stop + destroy the CT and its thin snapshot. `apply-monitors.sh`: rewrite the
-clone's `RMNG_MONITORS` + dummy mode specs and restart its GNOME + daemon (re-creates the
-virtual monitors with new positions).
-
-### `claude-import.sh <ctid> <user> status|read|clear|apply [b64]`
-On the node, `pct exec` into the clone. `apply` writes `~/.claude/.credentials.json`
-(the account's current short-lived access token, refresh emptied — the control-server
-refreshes and re-pushes it) — hot-swaps a clone's Claude account live, no restart.
+`30-user.sh` creates `/opt/rmng/bin` (root:root, 0755); `template/Dockerfile` then `COPY
+--from`s the built `clone-daemon` + `agent-wrapper` straight into it as the last two layers —
+the same destination [`redeploy_clone`](../crates/control-server/src/provision.rs) hot-swaps
+into later (`REDEPLOY_UNITS`). Unlike the retired `provision-clone.sh`, these scripts never run
+inside a live container over `docker exec` — they're plain Dockerfile `RUN` steps executed
+once, at `template/Dockerfile` build time; see
+[DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template).
 
 ---
 
 ## gnome-patch build
 
 ### `gnome-patch/build-shell-deb.sh`
-Inside the build CT. Repack approach: applies shell-01 + shell-03 to the gnome-shell source,
-rebuilds only `libshell-<N>.so` (meson/ninja), swaps it into the stock `.deb`, bumps the
-version `+ngshell1`. Prints `DEB=<path>`. Cached (skips if the deb is newer than the patches;
-`FORCE=1` rebuilds). See [gnome-patch/README.md](../gnome-patch/README.md).
+Runs in the **`gnome-build` stage of `template/Dockerfile`** (`docker build`). Repack approach:
+applies shell-01 + shell-03 to the gnome-shell source, rebuilds only `libshell-<N>.so`
+(meson/ninja), swaps it into the stock `.deb`, and bumps the version `+ngshell1`. Prints
+`DEB=<path>` — `template/Dockerfile` copies that to `/tmp/gnome-shell.deb` in the final stage,
+where `15-gnome-patch.sh` `dpkg -i`s it directly into the template rootfs (it is **not** a
+control-server payload — nothing under `/usr/local/share/rmng/` ships it any more). Cached
+(skips if the deb is newer than the patches; `FORCE=1` rebuilds). See
+[gnome-patch/README.md](../gnome-patch/README.md).

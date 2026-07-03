@@ -137,13 +137,13 @@ fn tools_list() -> Value {
         tool("list_monitors", "List the clone's virtual monitors (id, size)", json!({}), json!([])),
         tool("screenshot", "Capture a PNG screenshot of a monitor", mon.clone(), json!([])),
         tool("mouse_move", "Move the pointer to (x,y) with a smooth glide", xy.clone(), json!(["x", "y"])),
-        tool("left_click", "Left-click (optionally move to x,y first)", xy.clone(), json!([])),
-        tool("right_click", "Right-click (optionally move to x,y first)", xy.clone(), json!([])),
-        tool("middle_click", "Middle-click (optionally move to x,y first)", xy.clone(), json!([])),
-        tool("left_double_click", "Double left-click (optionally move to x,y first)", xy.clone(), json!([])),
+        tool("left_click", "Left-click (optionally glide to x,y first)", xy.clone(), json!([])),
+        tool("right_click", "Right-click (optionally glide to x,y first)", xy.clone(), json!([])),
+        tool("middle_click", "Middle-click (optionally glide to x,y first)", xy.clone(), json!([])),
+        tool("left_double_click", "Double left-click (optionally glide to x,y first)", xy.clone(), json!([])),
         tool(
             "scroll",
-            "Scroll vertically by `amount` notches (positive = down); optional x,y to move first",
+            "Scroll vertically by `amount` notches (positive = down); optional x,y to glide to first",
             json!({ "amount": { "type": "integer" }, "x": { "type": "number" }, "y": { "type": "number" }, "monitor": { "type": "integer" } }),
             json!(["amount"]),
         ),
@@ -179,7 +179,7 @@ async fn call_tool(st: &McpState, name: &str, args: Value) -> Result<Value, Stri
         "scroll" => {
             let m = resolve_mon(st, &args)?;
             if n("x").is_some() && n("y").is_some() {
-                jump_move(st, &m, n("x").unwrap(), n("y").unwrap()).await?;
+                ease_move(st, &m, n("x").unwrap(), n("y").unwrap()).await?;
             }
             let amount = args.get("amount").and_then(Value::as_i64).unwrap_or(0).clamp(-15, 15);
             let step = if amount >= 0 { 1 } else { -1 };
@@ -224,7 +224,7 @@ async fn call_tool(st: &McpState, name: &str, args: Value) -> Result<Value, Stri
 async fn click(st: &McpState, args: &Value, button: i32, count: u32) -> Result<Value, String> {
     let m = resolve_mon(st, args)?;
     if let (Some(x), Some(y)) = (args.get("x").and_then(Value::as_f64), args.get("y").and_then(Value::as_f64)) {
-        jump_move(st, &m, x, y).await?;
+        ease_move(st, &m, x, y).await?;
     }
     for i in 0..count {
         if i > 0 {
@@ -251,15 +251,6 @@ async fn ease_move(st: &McpState, m: &Mon, tx: f64, ty: f64) -> Result<(), Strin
         sleep(MOVE_STEP_MS).await;
     }
     *st.last_pos.lock().unwrap().entry(m.id).or_default() = (tx, ty);
-    Ok(())
-}
-
-/// Move directly to (x,y) (used before a click) + emit a warp.
-async fn jump_move(st: &McpState, m: &Mon, x: f64, y: f64) -> Result<(), String> {
-    let (x, y) = clamp(m, x, y);
-    st.rd.notify_pointer_motion_absolute(&m.stream, x, y).await.map_err(e)?;
-    emit_warp(st, m.id, x, y);
-    *st.last_pos.lock().unwrap().entry(m.id).or_default() = (x, y);
     Ok(())
 }
 

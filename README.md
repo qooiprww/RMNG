@@ -5,12 +5,12 @@
 ![RMNG — a cloud GNOME desktop streamed to a native multi-monitor viewer](docs/hero.webp)
 
 A self-contained Rust system for running, viewing, and automating a fleet of cloud GNOME
-desktops. One **control-server** binary is the control plane, the media hub, and the fleet
-gateway: it orchestrates Proxmox **clones**, ingests each clone's GPU frames and
-hardware-encodes the selected one to a **native hardware-decode GTK viewer**, and brokers the
-desktop-automation **MCP** that per-clone Claude agents drive. Each clone runs a thin
-**clone-daemon** that captures dmabufs, injects input, bridges the clipboard, and serves its
-desktop-automation MCP.
+desktops. One **control-server** container is the control plane, the media hub, and the fleet
+gateway: it orchestrates **clone containers** on a local Docker daemon, ingests each clone's
+GPU frames and hardware-encodes the selected one to a **native hardware-decode GTK viewer**,
+and brokers the desktop-automation **MCP** that per-clone Claude agents drive. Each clone runs
+a thin **clone-daemon** that captures dmabufs, injects input, bridges the clipboard, and
+serves its desktop-automation MCP.
 
 It replaces an older split where a native RDP client connected directly to each clone's
 `gnome-remote-desktop`, and each clone ran a local `computer-use` stdio MCP.
@@ -23,7 +23,7 @@ The control-server exposes **four ports**; a fifth automation surface lives insi
 |---|---|---|---|
 | **1 — video** | `9001` | framed H.264 over TCP | the selected clone's monitors to the native GTK viewer, with input + clipboard + cursor back |
 | **2 — web API** | `9000` | HTTP + SSE (+ embedded frontend) | the React management UI: host selection, clone/Linear/Claude/chat orchestration, settings |
-| **3 — per-clone MCP** | `9002` | HTTP JSON-RPC, by source IP | the in-clone agent reports its verdict (`set_state`); clone resolved from the caller's IP |
+| **3 — per-clone MCP** | `9002` | HTTP JSON-RPC, header-routed | the in-clone agent reports its verdict (`set_state`); caller self-identifies via the `x-rmng-clone` header |
 | **4 — fleet MCP** | `9003` | HTTP JSON-RPC | every web action + every desktop/window tool (with a `clone` selector); desktop tools proxied to the clone's daemon MCP |
 | daemon MCP | `9004` | HTTP JSON-RPC (in each clone) | the full desktop-automation surface; the agent calls it on localhost, the fleet MCP proxies to it |
 | clone socket | `/srv/rmng-sock/clones.sock` | unix `SOCK_SEQPACKET` | clone-daemon ⇄ control-server: dmabuf frames (`SCM_RIGHTS`) out, input/clipboard in |
@@ -32,8 +32,11 @@ The control-server exposes **four ports**; a fifth automation surface lives insi
 `gnome-session` + the daemon); one capture feeds both the human viewer and the agent's
 screenshots; raw H.264-over-TCP into zero-copy VA-API decode gives RFX-class feel without RDP;
 media/input cross a host unix socket, not the network, so only the control-server is externally
-reachable. Deploy the control-server to one LXC, give it Proxmox SSH, and it builds the golden
-template and provisions clones itself — carrying even the patched gnome-shell `.deb` it installs.
+reachable. `docker run` the control-server container, open the browser, and the first-run
+setup wizard pulls the pre-built clone **template** — a separate published image
+(`pegasis0/rmng-template`) that already carries the patched gnome-shell + clone binaries — and
+finishes setup. Clone binaries then hot-swap themselves on every control-server upgrade; there's
+no manual redeploy step.
 
 ## Documentation
 
@@ -43,25 +46,26 @@ template and provisions clones itself — carrying even the patched gnome-shell 
 | [docs/MCP.md](docs/MCP.md) | All three MCP surfaces (per-clone 9002, fleet 9003, daemon 9004): JSON-RPC envelope + every tool + curl examples |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The port-1 video/input/clipboard/cursor wire protocol, the clone socket, the config schema, every env var, the clone-daemon CLI, and the per-crate public API |
 | [docs/SCRIPTS.md](docs/SCRIPTS.md) | Every script: what it does, where it runs, its args, and what invokes it |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | The build → deploy → provision flow end-to-end, day-2 ops, the patched-shell pipeline, and production cutover |
-| [docs/INFRA.md](docs/INFRA.md) | The provisioned CTs on the Proxmox node and how to reach each |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | The Docker build → run → wizard → images/clones flow, the image build, upgrades, clone-home browsing, and the dev loop |
+| [docs/PROXMOX-LXC.md](docs/PROXMOX-LXC.md) | Running the Docker host on an unprivileged Proxmox LXC CT (one hosting option) |
 
 ## Workspace map
 
 | Path | Kind | What |
 |---|---|---|
 | [crates/wire](crates/wire/README.md) | lib | shared types: control state, config, the clone socket + viewer protocols, MCP DTOs; ts-rs export for the frontend |
-| [crates/control-server](crates/control-server/README.md) | bin | the 4-port server: media plane, web API/SSE, per-clone + fleet MCP, orchestration, embedded frontend + binaries, template bootstrap |
+| [crates/control-server](crates/control-server/README.md) | bin | the 4-port server: media plane, web API/SSE, per-clone + fleet MCP, Docker orchestration (bollard), on-disk frontend + clone payloads, clone-template pull + automatic binary hot-swap |
 | [crates/media](crates/media/README.md) | lib | dmabuf ingest → VA-API H.264 per monitor + dmabuf→PNG screenshots + the clone-socket transport |
 | [crates/clone-daemon](crates/clone-daemon/README.md) | bin | the thin in-clone pipe: RecordVirtual capture, RemoteDesktop input inject, clipboard bridge, the desktop MCP (:9004), and the needs-human detector |
 | [crates/viewer](crates/viewer/README.md) | bin | the native GTK client (GUI + headless test mode): zero-copy VA-API decode, multi-monitor, client-drawn cursor, input + pointer-lock + clipboard |
 | [crates/control-client](crates/control-client/README.md) | lib | thin reqwest+SSE client for integration tests |
 | [frontend](frontend/README.md) | web app | React Router 7 management UI, ts-rs types from `wire`, served by the control-server |
-| [gnome-patch](gnome-patch/README.md) | tooling | builds the patched gnome-shell `.deb` (hide screen-share indicator + enable `Eval` for window-mgmt) embedded in the control-server |
+| [gnome-patch](gnome-patch/README.md) | tooling | builds the patched gnome-shell `.deb` (hide screen-share indicator + enable `Eval` for window-mgmt); built + installed by `template/Dockerfile`'s `gnome-build` stage into the published clone template — not a control-server payload |
 
 The per-clone **agent-wrapper** (Bun, Claude Agent SDK) is vendored at `agent-wrapper/`; the
-control-server embeds + deploys it and proxies chat to it. Its `desktop` MCP points at the
-clone-daemon (`http://127.0.0.1:9004`).
+clone template ships it pre-installed, the control-server hot-swaps it into running clones on
+upgrade, and proxies chat to it. Its `desktop` MCP points at the clone-daemon
+(`http://127.0.0.1:9004`).
 
 <a id="clean-room"></a>
 ## Clean-room
@@ -74,19 +78,23 @@ frontend works unchanged.
 
 ## Quick start
 
+Needs a Linux host with Docker and a GPU render node (`/dev/dri/renderD128`). Pull the
+published image (or `docker build -t rmng:latest .` from a checkout), then run the hub:
+
 ```sh
-# 1. Build/dev CT (full toolchain + headless GNOME + render passthrough) → builds the binary.
-./scripts/provision-build-ct.sh root@<proxmox>            # → rmng-build CT
-
-# 2. Lean runtime CT that runs the control-server.
-./scripts/provision-deploy-ct.sh root@<proxmox>           # → http://<ip>:9000
-
-# 3. From the dashboard/API, bootstrap the golden template, then CoW-clone from it.
-curl -X POST http://<deploy-ip>:9000/api/template/bootstrap -d '{"hostname":"rmng-template"}'
+docker run -d --name rmng --privileged --init --pid host --restart unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v rmng-data:/data -v rmng-sock:/srv/rmng-sock \
+  -p 9000-9003:9000-9003 pegasis0/rmng
+# …or, from a checkout: docker compose up -d --build
 ```
 
-Open `http://<ip>:9000` → **Settings** for Linear/Claude credentials. Full flow + the dev loop:
-[docs/DEPLOY.md](docs/DEPLOY.md); the CTs that already exist: [docs/INFRA.md](docs/INFRA.md).
+Open `http://<host>:9000` → the **first-run setup wizard** (environment checklist → server
+settings → download the clone template → finish) does the rest; then **Settings** for
+Linear/Claude credentials. There are zero `-e` config flags — everything is set in the UI. Full
+flow, the image build, publishing the template, upgrades, and the dev loop:
+[docs/DEPLOY.md](docs/DEPLOY.md). Running the Docker host on a Proxmox LXC CT:
+[docs/PROXMOX-LXC.md](docs/PROXMOX-LXC.md).
 
 ## Prerequisites
 
@@ -96,4 +104,6 @@ Rust (edition 2024), `bun`, `clang`/`libclang`; `libpipewire-0.3-dev`, `libva-de
 host *and* every clone. With those dev libs the **whole workspace compiles on a plain laptop**
 (a bare box without them builds only `wire`); the GPU box is only needed to *run* the
 capture/encode/server side — the **`viewer` builds *and* runs locally** (client-side decode).
-See the [dev loop](docs/DEPLOY.md#the-dev-loop). **Use the Ubuntu 26.04 CT template.**
+See the [dev loop](docs/DEPLOY.md#the-dev-loop). **The clone template is built on the
+`ubuntu:26.04` base OS** (the patched gnome-shell is compiled against 26.04's GNOME only) —
+see [Publishing the template](docs/DEPLOY.md#publishing-the-template).

@@ -1,9 +1,10 @@
 //! `AppConfig` — every setting, edited via the Settings UI (no hand-edited files).
 //!
-//! Secrets (proxmox ssh target, preset Linear keys) live only in the server's
-//! `config.json` (0600) and are **never** placed in `ControlState`
-//! or sent to the browser. `GET /api/config` returns [`AppConfigRedacted`]
-//! (secrets shown as set/unset); `PUT /api/config` takes write-only secret fields.
+//! Secrets (preset Linear keys) live only in the server's `config.json` (0600) and are
+//! **never** placed in `ControlState` or sent to the browser. `GET /api/config` returns
+//! [`AppConfigRedacted`] (secrets shown as set/unset); `PUT /api/config` takes write-only
+//! secret fields. The Docker backend has no secret (local unix socket), so
+//! [`DockerConfig`] passes through the redacted view intact.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -70,7 +71,8 @@ pub struct EnvVar {
 /// `~/.config/environment.d/30-rmng-preset.conf`; the Linear key is additionally
 /// injected as `LINEAR_API_KEY`, which auths the clone's `linear` MCP). Vars that must
 /// ALWAYS be present (e.g. `XDG_CURRENT_DESKTOP`) are NOT presets — they're baked into the
-/// template's base session env by `provision-clone.sh`, inherited by every clone.
+/// template's base session env by `template/setup/30-user.sh` at template build, inherited by
+/// every clone.
 /// NOT TS-exported: `linear_key` is a secret — the browser sees [`PresetRedacted`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -99,7 +101,7 @@ impl Preset {
 }
 
 /// A preset as shown to the browser: everything but the Linear key, which is
-/// replaced by a "is set" flag (write-only secret, like the proxmox ssh target).
+/// replaced by a "is set" flag (write-only secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../frontend/app/lib/wire/")]
@@ -124,44 +126,70 @@ pub struct CloneGroup {
     pub accounts: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Docker backend settings for the clone fleet. No secrets — the local daemon is
+/// reached over the unix socket, so (unlike the retired Proxmox SSH target) there is
+/// nothing to redact; the whole struct passes through into [`AppConfigRedacted`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct ProxmoxConfig {
-    /// SSH target for the Proxmox node, e.g. `root@10.0.0.100` (secret-ish).
-    #[serde(default)]
-    pub ssh: String,
-    /// Proxmox storage pool that backs freshly-provisioned CT volumes, e.g. `local-lvm`.
-    /// **One-time**: baked into the CT's volumes/bind-mounts at provision, so it can only
-    /// be set during first-run setup (changing it later wouldn't migrate existing CTs).
-    #[serde(default = "default_storage")]
-    pub storage: String,
-    /// Proxmox network bridge clone NICs attach to, e.g. `vmbr0`. **One-time**: baked into
-    /// the CT's netif at provision, so it can only be set during first-run setup.
-    #[serde(default = "default_bridge")]
-    pub bridge: String,
-    /// Prefix for derived clone hostnames, e.g. `pega-` → `pega-dev-123` / `pega-my-task`.
-    /// Sanitized to DNS-label-safe chars at use; blank in the UI keeps the stored value.
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct DockerConfig {
+    /// Docker daemon unix socket the control-server drives clones through, e.g.
+    /// `/var/run/docker.sock`. **Restart-required**: the bollard client is built at
+    /// startup.
+    #[serde(default = "default_docker_socket")]
+    pub socket: String,
+    /// CIDR for the user-defined `rmng` bridge network (`.1` gateway, `.2` control-server,
+    /// `.10+` clone pool). **One-time**: baked into the network + every clone's static IP
+    /// at first-run setup (validated `/16`–`/24` at config merge).
+    #[serde(default = "default_docker_subnet")]
+    pub subnet: String,
+    /// Prefix for derived clone hostnames/names, e.g. `pega-` → `pega-dev-123`. Sanitized
+    /// to DNS-label-safe chars at use; blank in the UI keeps the stored value. Immediate
+    /// (carried from the retired `proxmox.hostname_prefix`).
     #[serde(default = "default_hostname_prefix")]
     pub hostname_prefix: String,
+    /// CPU limit per clone (`nano_cpus` = `clone_cpus * 1e9`), matching LXC parity.
+    #[serde(default = "default_clone_cpus")]
+    pub clone_cpus: u32,
+    /// Memory limit per clone in MiB (+8 GiB swap), matching LXC parity.
+    #[serde(default = "default_clone_memory_mb")]
+    pub clone_memory_mb: u32,
+    /// Registry reference the setup wizard pulls the clone template from, then retags
+    /// locally to `rmng/template:<name>`. Short form (`repo:tag`) so it matches what the
+    /// pulled image's RepoTags will contain. Immediate-apply (read fresh per pull); no
+    /// secret (public image over the local daemon), so it passes through the redacted view.
+    #[serde(default = "default_template_reference")]
+    pub template_reference: String,
 }
 
-fn default_storage() -> String {
-    "local-lvm".into()
+fn default_docker_socket() -> String {
+    "/var/run/docker.sock".into()
 }
-fn default_bridge() -> String {
-    "vmbr0".into()
+fn default_docker_subnet() -> String {
+    "10.99.0.0/24".into()
 }
 fn default_hostname_prefix() -> String {
     "pega-".into()
 }
+fn default_clone_cpus() -> u32 {
+    16
+}
+fn default_clone_memory_mb() -> u32 {
+    32768
+}
+fn default_template_reference() -> String {
+    "pegasis0/rmng-template:latest".into()
+}
 
-impl Default for ProxmoxConfig {
+impl Default for DockerConfig {
     fn default() -> Self {
         Self {
-            ssh: String::new(),
-            storage: default_storage(),
-            bridge: default_bridge(),
+            socket: default_docker_socket(),
+            subnet: default_docker_subnet(),
             hostname_prefix: default_hostname_prefix(),
+            clone_cpus: default_clone_cpus(),
+            clone_memory_mb: default_clone_memory_mb(),
+            template_reference: default_template_reference(),
         }
     }
 }
@@ -200,7 +228,8 @@ pub struct AppConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
     /// Built frontend bundle directory served on the web port. Empty (the default) serves
-    /// the frontend embedded in the binary; a non-empty path serves the bundle from disk.
+    /// the installed frontend (`/usr/local/share/rmng/static` in the image, else the repo
+    /// dev build); a non-empty path overrides it (dev hot-reload without a rebuild).
     /// Restart-required (the static-file service is wired at startup).
     #[serde(default = "default_static_dir")]
     pub static_dir: String,
@@ -212,15 +241,15 @@ pub struct AppConfig {
     #[serde(default = "default_clone_socket")]
     pub clone_socket: String,
     /// Latched `true` by the first-run setup wizard once setup is complete; gates the
-    /// frontend until then. A `config.json` missing this key entirely is grandfathered to
-    /// `true` at load time when a proxmox ssh target is already configured (see
-    /// `control-server::config::load`).
+    /// frontend until then. The Proxmox-era grandfather rule is gone: an old `config.json`
+    /// re-runs the wizard (new machine, no network / base image), so this stays `false`
+    /// unless the wizard set it.
     #[serde(default)]
     pub setup_complete: bool,
     #[serde(default)]
     pub monitors: Vec<MonitorSpec>,
     #[serde(default)]
-    pub proxmox: ProxmoxConfig,
+    pub docker: DockerConfig,
     #[serde(default)]
     pub claude: ClaudeConfig,
     /// Named account pools a clone can be bound to for rotation (members are
@@ -254,7 +283,7 @@ impl Default for AppConfig {
             clone_socket: default_clone_socket(),
             setup_complete: false,
             monitors: Vec::new(),
-            proxmox: ProxmoxConfig::default(),
+            docker: DockerConfig::default(),
             claude: ClaudeConfig::default(),
             clone_groups: Vec::new(),
             presets: Vec::new(),
@@ -304,10 +333,7 @@ impl AppConfig {
             clone_socket: self.clone_socket.clone(),
             setup_complete: self.setup_complete,
             monitors: self.monitors.clone(),
-            proxmox_ssh_set: !self.proxmox.ssh.is_empty(),
-            proxmox_storage: self.proxmox.storage.clone(),
-            proxmox_bridge: self.proxmox.bridge.clone(),
-            proxmox_hostname_prefix: self.proxmox.hostname_prefix.clone(),
+            docker: self.docker.clone(),
             claude: self.claude.clone(),
             clone_groups: self.clone_groups.clone(),
             presets: self.presets.iter().map(Preset::redacted).collect(),
@@ -330,10 +356,7 @@ pub struct AppConfigRedacted {
     pub clone_socket: String,
     pub setup_complete: bool,
     pub monitors: Vec<MonitorSpec>,
-    pub proxmox_ssh_set: bool,
-    pub proxmox_storage: String,
-    pub proxmox_bridge: String,
-    pub proxmox_hostname_prefix: String,
+    pub docker: DockerConfig,
     pub claude: ClaudeConfig,
     pub clone_groups: Vec<CloneGroup>,
     pub presets: Vec<PresetRedacted>,
@@ -352,6 +375,55 @@ pub struct ConfigPutResponse {
     pub restart_required: bool,
 }
 
+/// One row of the setup wizard's environment preflight (`GET /api/setup/env`): a named
+/// check (Docker socket reachable, kernel features, etc.) with its pass/fail verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct EnvCheckRow {
+    /// Stable machine id for the check (e.g. `dockerSocket`).
+    pub id: String,
+    /// Human-readable label shown in the wizard.
+    pub label: String,
+    /// Whether the check passed.
+    pub ok: bool,
+    /// Detail / diagnostic line shown under the label (empty when nothing to add).
+    pub detail: String,
+    /// Whether a failure blocks setup (vs. an advisory warning).
+    pub required: bool,
+}
+
+/// Response body for `GET /api/setup/env`: the environment preflight rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct SetupEnv {
+    pub rows: Vec<EnvCheckRow>,
+}
+
+/// A clone-source image (labeled `rmng.image=1`) as shown to the browser
+/// (`GET /api/images`). Images replace the retired host-id templates: any clone can be
+/// committed to one, and clone creation picks from these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct ImageInfo {
+    /// Full image id (`sha256:…`).
+    pub id: String,
+    /// Repo tag reference, e.g. `rmng/template:my-base`.
+    pub reference: String,
+    pub size_bytes: i64,
+    /// ISO timestamp the image was created.
+    pub created_at: String,
+    /// True for the wizard-built base image (`rmng.base=1`).
+    pub base: bool,
+    /// Lineage: the reference this image was committed from (`rmng.created-from`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_from: Option<String>,
+    /// Host ids of live clones currently running on this image.
+    pub in_use_by: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,19 +435,23 @@ mod tests {
         assert_eq!(c.listen.video, 9001);
         assert_eq!(c.agent_port, 4096);
         // New one-time / restart-required fields carry their documented defaults.
-        assert_eq!(c.static_dir, ""); // empty = embedded frontend
+        assert_eq!(c.static_dir, ""); // empty = installed/default frontend dir
         assert_eq!(c.clone_socket, "/srv/rmng-sock/clones.sock");
         assert!(!c.setup_complete); // wizard latches this true
-        assert_eq!(c.proxmox.storage, "local-lvm");
-        assert_eq!(c.proxmox.bridge, "vmbr0");
-        assert_eq!(c.proxmox.hostname_prefix, "pega-");
+        assert_eq!(c.docker.socket, "/var/run/docker.sock");
+        assert_eq!(c.docker.subnet, "10.99.0.0/24");
+        assert_eq!(c.docker.hostname_prefix, "pega-");
+        assert_eq!(c.docker.clone_cpus, 16);
+        assert_eq!(c.docker.clone_memory_mb, 32768);
+        assert_eq!(c.docker.template_reference, "pegasis0/rmng-template:latest");
         // Missing keys fall back to the same defaults (older config.json stays valid).
         let d: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(d.static_dir, "");
         assert_eq!(d.clone_socket, "/srv/rmng-sock/clones.sock");
         assert!(!d.setup_complete);
-        assert_eq!(d.proxmox.storage, "local-lvm");
-        assert_eq!(d.proxmox.bridge, "vmbr0");
+        assert_eq!(d.docker.socket, "/var/run/docker.sock");
+        assert_eq!(d.docker.subnet, "10.99.0.0/24");
+        assert_eq!(d.docker.template_reference, "pegasis0/rmng-template:latest");
         let mons = c.effective_monitors();
         assert_eq!(mons.len(), 2);
         assert_eq!((mons[0].width, mons[0].height, mons[0].x), (2560, 1440, 2560));
@@ -429,10 +505,10 @@ mod tests {
         let c = AppConfig {
             clone_socket: "/srv/rmng-sock/clones.sock".into(),
             setup_complete: true,
-            proxmox: ProxmoxConfig {
-                ssh: "root@10.0.0.100".into(),
-                storage: "fast-nvme".into(),
-                bridge: "vmbr1".into(),
+            docker: DockerConfig {
+                subnet: "10.42.0.0/24".into(),
+                hostname_prefix: "dev-".into(),
+                template_reference: "pegasis0/rmng-template:v9".into(),
                 ..Default::default()
             },
             presets: vec![
@@ -455,11 +531,12 @@ mod tests {
         assert_eq!(r.presets[0].labels, vec!["Backend"]); // labels/vars pass through
         assert_eq!(r.presets[0].vars.len(), 1);
         assert!(!r.presets[1].linear_key_set);
-        assert!(r.proxmox_ssh_set);
-        // New non-secret fields pass through verbatim.
+        // Non-secret fields pass through verbatim; the Docker backend has no secret.
         assert_eq!(r.clone_socket, "/srv/rmng-sock/clones.sock");
         assert!(r.setup_complete);
-        assert_eq!(r.proxmox_storage, "fast-nvme");
-        assert_eq!(r.proxmox_bridge, "vmbr1");
+        assert_eq!(r.docker.subnet, "10.42.0.0/24");
+        assert_eq!(r.docker.hostname_prefix, "dev-");
+        // template_reference is non-secret — it passes through the redacted view intact.
+        assert_eq!(r.docker.template_reference, "pegasis0/rmng-template:v9");
     }
 }

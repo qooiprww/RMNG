@@ -18,4 +18,4 @@ pct: number, message: string,
 /**
  * Rolling log lines for the operation.
  */
-log: Array<string>, ctid: number | null, startedAt: bigint, finishedAt: bigint | null, };
+log: Array<string>, startedAt: bigint, finishedAt: bigint | null, };

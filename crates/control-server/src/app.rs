@@ -7,6 +7,7 @@ use wire::AppConfig;
 
 use crate::chat::ChatState;
 use crate::claude::ClaudeStore;
+use crate::docker::DockerCtl;
 use crate::state::StateStore;
 
 #[derive(Clone)]
@@ -21,11 +22,26 @@ pub struct App {
     pub chat: Arc<ChatState>,
     /// Media plane shared state (clone conns + latest frames).
     pub media: Arc<crate::mediaplane::MediaHandle>,
+    /// The Docker fleet backend (bollard). Constructed I/O-free at startup; every call
+    /// surfaces its own daemon-connection failure, so the server still boots the wizard
+    /// even when Docker is down.
+    pub docker: Arc<DockerCtl>,
+    /// Automatic hash-based binary hot-swap engine state (worker channel + expected
+    /// hashes + per-host swap guards). Empty until [`crate::binswap::spawn`] warms it.
+    pub swap: Arc<crate::binswap::SwapState>,
+    /// Volatile per-host CPU/RAM usage bus. The monitor poller publishes a stats map each
+    /// tick; `/events` fans it out as a named `stats` SSE event. SSE-only — never persisted
+    /// to `state.json` (see [`crate::monitor::StatsBus`]).
+    pub stats: Arc<crate::monitor::StatsBus>,
 }
 
 impl App {
     pub fn new(store: Arc<StateStore>, cfg: AppConfig) -> Self {
         let claude = Arc::new(ClaudeStore::load(&cfg.data_dir));
+        // `DockerCtl::connect` is infallible and I/O-free: even a missing socket FILE
+        // (bare `docker run` without the sock bind) boots the server — the failure is
+        // surfaced per call and by `self_setup`'s env report, so the wizard shows it.
+        let docker = Arc::new(DockerCtl::connect(&cfg.docker));
         Self {
             store,
             cfg: Arc::new(RwLock::new(cfg)),
@@ -36,11 +52,35 @@ impl App {
             claude,
             chat: Arc::new(ChatState::default()),
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
+            docker,
+            swap: Arc::new(crate::binswap::SwapState::default()),
+            stats: Arc::new(crate::monitor::StatsBus::new()),
         }
     }
 
     /// A cheap snapshot of the current config.
     pub fn config(&self) -> AppConfig {
         self.cfg.read().unwrap().clone()
+    }
+
+    /// What to dial a host's in-clone services at (agent-wrapper `/status`+chat, the
+    /// clone-daemon MCP). Managed clones are addressed by container name (== host id):
+    /// Docker's embedded DNS serves it on the rmng bridge. In dev mode the server runs
+    /// on the Docker host, which can't use that resolver — so resolve the clone's bridge
+    /// IP via an inspect instead (host processes can route to bridge IPs directly).
+    /// Unmanaged rows keep their literal `host` endpoint.
+    pub async fn dial_host(&self, host: &wire::Host) -> String {
+        if !host.managed {
+            return host.host.clone();
+        }
+        if self.docker.env().await.self_container.is_some() {
+            return host.id.clone();
+        }
+        match self.docker.inspect_ip(&host.id).await {
+            Ok(Some(ip)) => ip,
+            // Stopped/gone or daemon hiccup: fall back to the name — the dial will fail
+            // with a connection error, which callers already treat as offline.
+            _ => host.id.clone(),
+        }
     }
 }

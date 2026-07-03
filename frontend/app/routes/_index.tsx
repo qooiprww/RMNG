@@ -1,42 +1,32 @@
-import {
-  closestCenter,
-  DndContext,
-  type DragEndEvent,
-  KeyboardSensor,
-  PointerSensor,
-  useSensor,
-  useSensors,
-} from "@dnd-kit/core";
-import {
-  arrayMove,
-  SortableContext,
-  sortableKeyboardCoordinates,
-  verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
 import { lazy, Suspense, useEffect, useState } from "react";
 
 import { ChangeAccountModal } from "~/components/ChangeAccountModal";
-import { ClaudeAccountsPanel } from "~/components/ClaudeAccountsPanel";
 import { CloneModal } from "~/components/CloneModal";
+import { CommitImageModal } from "~/components/CommitImageModal";
 import { ImportAccountModal } from "~/components/ImportAccountModal";
-import { NewTemplateModal } from "~/components/NewTemplateModal";
-import { OperationProgress } from "~/components/OperationProgress";
 import { SettingsPanel } from "~/components/SettingsPanel";
 import { SetupWizard } from "~/components/SetupWizard";
-import { SidebarHost } from "~/components/SidebarHost";
+import { Sidebar } from "~/components/Sidebar";
 import {
   activate,
-  bootstrapTemplate,
+  applyMonitors,
   cloneHost,
+  commitImage,
   deleteHost,
+  deleteImage,
   getConfig,
-  redeployClone,
+  listImages,
+  pullTemplate,
+  putConfig,
   refreshClaudeUsage,
   reorder,
   swapClaudeAccount,
+  testConfig,
 } from "~/lib/api";
 import { type ControlState, type Host, emptyState } from "~/lib/types";
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
+import type { ContainerStats } from "~/lib/wire/ContainerStats";
+import type { ImageInfo } from "~/lib/wire/ImageInfo";
 
 import type { Route } from "./+types/_index";
 
@@ -61,9 +51,12 @@ export function clientLoader() {
   return emptyState();
 }
 
-/** Initial state from the SSR loader, kept live by the SSE stream. */
+/** Initial state from the SSR loader, kept live by the SSE stream. The same connection
+ *  carries the persisted `ControlState` (default event) and a volatile per-host CPU/RAM
+ *  map (named `stats` event) — the latter never touches `state.json`. */
 function useLiveState(initial: ControlState) {
   const [state, setState] = useState(initial);
+  const [stats, setStats] = useState<Record<string, ContainerStats>>({});
   useEffect(() => {
     const es = new EventSource("/events");
     es.onmessage = (e) => {
@@ -73,15 +66,22 @@ function useLiveState(initial: ControlState) {
         // ignore malformed frame
       }
     };
+    es.addEventListener("stats", (e) => {
+      try {
+        setStats(JSON.parse((e as MessageEvent).data));
+      } catch {
+        // ignore malformed frame
+      }
+    });
     return () => es.close();
   }, []);
-  return state;
+  return { state, stats };
 }
 
 export default function Home({ loaderData }: Route.ComponentProps) {
   // The live SSE state powers both the wizard (template-provision progress) and the
-  // dashboard, so it lives here at the gate.
-  const state = useLiveState(loaderData);
+  // dashboard, so it lives here at the gate. `stats` is the volatile per-host usage map.
+  const { state, stats } = useLiveState(loaderData);
   // First-run gate: hold the config (null while loading). Render a minimal centered
   // "Loading…" until it resolves so the dashboard never flashes before the wizard
   // decision; render the wizard INSTEAD of the dashboard while setup isn't complete.
@@ -106,18 +106,44 @@ export default function Home({ loaderData }: Route.ComponentProps) {
   if (!cfg.setupComplete) {
     return <SetupWizard state={state} initialConfig={cfg} onDone={refetchConfig} />;
   }
-  return <Dashboard state={state} />;
+  return <Dashboard state={state} stats={stats} cloneCpus={cfg.docker.cloneCpus} />;
 }
 
-function Dashboard({ state }: { state: ControlState }) {
+function Dashboard({
+  state,
+  stats,
+  cloneCpus,
+}: {
+  state: ControlState;
+  stats: Record<string, ContainerStats>;
+  cloneCpus: number;
+}) {
   const [error, setError] = useState<string | null>(null);
-  const [cloneSource, setCloneSource] = useState<string | null>(null);
+  const [cloneOpen, setCloneOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [newTemplateOpen, setNewTemplateOpen] = useState(false);
-  const [bootstrapping, setBootstrapping] = useState(false);
+  const [commitHost, setCommitHost] = useState<Host | null>(null);
+  const [committing, setCommitting] = useState(false);
   const [changeHost, setChangeHost] = useState<Host | null>(null);
   const [changing, setChanging] = useState(false);
+
+  // Clone-source images (from /api/images) — fetched on mount and refetched
+  // whenever a pull/commit/delete op leaves `running` (the image set changed).
+  const [images, setImages] = useState<ImageInfo[]>([]);
+  const [imagesLoading, setImagesLoading] = useState(true);
+  const refreshImages = () => {
+    setImagesLoading(true);
+    listImages()
+      .then(setImages)
+      .catch(() => {
+        /* keep the last-known list on a transient error */
+      })
+      .finally(() => setImagesLoading(false));
+  };
+  useEffect(() => {
+    refreshImages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Responsive state. Below `lg` the sidebar is an off-canvas drawer; below `xl`
   // the notes editor and agent chat share the main pane via this tab toggle.
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -140,32 +166,36 @@ function Dashboard({ state }: { state: ControlState }) {
     return h ? [h] : [];
   });
   const selectedHost = state.selected ? hostsById.get(state.selected) ?? null : null;
-  const templates = new Set(state.templates);
+
+  // Refetch images when an image-mutating op (pull/commit/delete) leaves the
+  // running set — that's when the image list changed. Keyed on the set of running
+  // op ids so it fires on each transition, not on every SSE frame.
+  const imgOpsRunning = state.operations
+    .filter(
+      (o) =>
+        o.status === "running" &&
+        (o.kind === "pull" || o.kind === "commit" || o.kind === "delete"),
+    )
+    .map((o) => o.id)
+    .join(",");
+  useEffect(() => {
+    refreshImages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imgOpsRunning]);
 
   const run = (p: Promise<unknown>) =>
     p.then(() => setError(null)).catch((e: Error) => setError(e.message));
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
-
-  function onDragEnd(event: DragEndEvent) {
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
-    const oldIndex = order.indexOf(String(active.id));
-    const newIndex = order.indexOf(String(over.id));
-    if (oldIndex < 0 || newIndex < 0) return;
-    const next = arrayMove(order, oldIndex, newIndex);
-    setOrder(next); // optimistic; SSE confirms after the server persists
+  // Drag-reorder: optimistically adopt the new order (smooth UI), then persist —
+  // the SSE frame confirms after the server writes it.
+  const onReorder = (next: string[]) => {
+    setOrder(next);
     run(reorder(next));
-  }
+  };
 
   const runningClone = state.operations.some(
     (o) => o.kind === "clone" && o.status === "running",
   );
-  const opForHost = (id: string) =>
-    state.operations.find((o) => o.target === id && o.status === "running");
 
   return (
     <div className="flex h-screen flex-col">
@@ -196,7 +226,7 @@ function Dashboard({ state }: { state: ControlState }) {
             <path d="M3 5h14M3 10h14M3 15h14" />
           </svg>
         </button>
-        <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-800">
+        <span className="min-w-0 flex-1 break-words text-sm font-semibold text-slate-800">
           {selectedHost ? selectedHost.id : "rmng control"}
         </span>
         {/* Notes/Chat toggle lives here on mobile — the only header < lg. */}
@@ -238,121 +268,34 @@ function Dashboard({ state }: { state: ControlState }) {
           />
         ) : null}
 
-        {/* Left: host selection sidebar. Off-canvas drawer < lg, static ≥ lg. */}
-        <aside
-          className={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-slate-200 bg-slate-50 p-3 shadow-xl transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 lg:shadow-none ${
-            sidebarOpen ? "translate-x-0" : "-translate-x-full"
-          }`}
-        >
-          <div className="flex items-center justify-between px-1">
-            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-              rmng control
-            </span>
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              title="Settings"
-              aria-label="Settings"
-              className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600"
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 20 20"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                strokeLinecap="round"
-                aria-hidden
-              >
-                <circle cx="10" cy="10" r="3" />
-                <path d="M10 1.5v2M10 16.5v2M18.5 10h-2M3.5 10h-2M15.6 4.4l-1.4 1.4M5.8 14.2l-1.4 1.4M15.6 15.6l-1.4-1.4M5.8 5.8 4.4 4.4" />
-              </svg>
-            </button>
-          </div>
-
-          <ClaudeAccountsPanel
-            accounts={state.claudeAccounts ?? []}
-            onRefresh={() => run(refreshClaudeUsage())}
-            onImport={() => setImportOpen(true)}
-          />
-
-          <div>
-            <div className="mb-1 flex items-center justify-between px-1">
-              <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                Hosts ({orderedHosts.length})
-              </h2>
-              <button
-                type="button"
-                onClick={() => setNewTemplateOpen(true)}
-                title="Provision a new template container (Ubuntu 26.04)"
-                className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600"
-              >
-                + Template
-              </button>
-            </div>
-            {orderedHosts.length === 0 ? (
-              <p className="rounded-lg border border-dashed border-slate-300 bg-white p-4 text-center text-xs text-slate-400">
-                No hosts yet.
-              </p>
-            ) : (
-              <DndContext
-                sensors={sensors}
-                collisionDetection={closestCenter}
-                onDragEnd={onDragEnd}
-              >
-                <SortableContext
-                  items={orderedHosts.map((h) => h.id)}
-                  strategy={verticalListSortingStrategy}
-                >
-                  <div className="space-y-0.5">
-                    {orderedHosts.map((host) => (
-                      <SidebarHost
-                        key={host.id}
-                        host={host}
-                        selected={state.selected === host.id}
-                        op={opForHost(host.id)}
-                        isTemplate={templates.has(host.id)}
-                        cloneBusy={runningClone}
-                        onSelect={() => {
-                          run(activate(host.id));
-                          setSidebarOpen(false);
-                        }}
-                        onClone={() => setCloneSource(host.id)}
-                        onDelete={() => {
-                          if (confirm(`Delete ${host.id}? This destroys its container.`))
-                            run(deleteHost(host.id));
-                        }}
-                        onRedeploy={() => {
-                          if (
-                            confirm(
-                              `Redeploy clone-daemon + agent-wrapper to ${host.id}?\n\nSwaps the binaries from the control-server's embedded copies and restarts both units (drops the agent's current Claude session). No reprovision.`,
-                            )
-                          )
-                            run(redeployClone(host.id));
-                        }}
-                        onChangeAccount={() => setChangeHost(host)}
-                      />
-                    ))}
-                  </div>
-                </SortableContext>
-              </DndContext>
-            )}
-          </div>
-
-          {state.operations.length > 0 ? (
-            <div className="space-y-2">
-              <h2 className="px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                Activity
-              </h2>
-              {[...state.operations]
-                .sort((a, b) => b.startedAt - a.startedAt)
-                .map((op) => (
-                  <OperationProgress key={op.id} op={op} />
-                ))}
-            </div>
-          ) : null}
-        </aside>
+        {/* Left: host selection sidebar. Off-canvas drawer < lg, static ≥ lg.
+            Presentational — every server call is a callback wired up here. */}
+        <Sidebar
+          open={sidebarOpen}
+          accounts={state.claudeAccounts ?? []}
+          hosts={orderedHosts}
+          stats={stats}
+          operations={state.operations}
+          selectedId={state.selected}
+          cloneCpus={cloneCpus}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenClone={() => setCloneOpen(true)}
+          onRefreshClaude={() => run(refreshClaudeUsage())}
+          onImportAccount={() => setImportOpen(true)}
+          onSelectHost={(host) => {
+            run(activate(host.id));
+            setSidebarOpen(false);
+          }}
+          onDeleteHost={(host) => {
+            const msg = host.managed
+              ? `Delete ${host.id}? This destroys its container.`
+              : `Remove ${host.id}? This unregisters the host.`;
+            if (confirm(msg)) run(deleteHost(host.id));
+          }}
+          onCommitHost={(host) => setCommitHost(host)}
+          onChangeAccountHost={(host) => setChangeHost(host)}
+          onReorder={onReorder}
+        />
 
         {/* Right: per-host editor */}
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-white">
@@ -360,12 +303,11 @@ function Dashboard({ state }: { state: ControlState }) {
             <>
               {/* Per-host header — only ≥ lg; on mobile the top bar shows id + tabs. */}
               <div className="hidden shrink-0 items-center gap-3 border-b border-slate-100 px-4 py-3 sm:px-6 lg:flex">
-                <h2 className="truncate text-base font-semibold text-slate-900">
+                <h2 className="min-w-0 break-words text-base font-semibold text-slate-900">
                   {selectedHost.id}
                 </h2>
                 <span className="shrink-0 text-xs text-slate-400">
                   {selectedHost.host}:{selectedHost.port}
-                  {selectedHost.ctid != null ? ` · ct ${selectedHost.ctid}` : ""}
                 </span>
               </div>
               <div className="flex min-h-0 flex-1">
@@ -412,17 +354,18 @@ function Dashboard({ state }: { state: ControlState }) {
         </main>
       </div>
 
-      {cloneSource ? (
+      {cloneOpen ? (
         <CloneModal
-          source={cloneSource}
+          images={images}
+          imagesLoading={imagesLoading}
           busy={runningClone}
           accounts={(state.claudeAccounts ?? []).filter(
             (a) => a.assignable && a.provider !== "codex",
           )}
-          onClose={() => setCloneSource(null)}
-          onClone={(payload) => {
-            run(cloneHost(cloneSource, payload));
-            setCloneSource(null);
+          onClose={() => setCloneOpen(false)}
+          onClone={(image, payload) => {
+            run(cloneHost(image, payload));
+            setCloneOpen(false);
           }}
         />
       ) : null}
@@ -433,22 +376,33 @@ function Dashboard({ state }: { state: ControlState }) {
             .filter((a) => a.provider !== "codex")
             .map((a) => a.email)}
           onClose={() => setSettingsOpen(false)}
+          getConfig={getConfig}
+          putConfig={putConfig}
+          testConfig={testConfig}
+          applyMonitors={applyMonitors}
+          images={images}
+          imagesLoading={imagesLoading}
+          pullBusy={state.operations.some(
+            (o) => o.kind === "pull" && o.status === "running",
+          )}
+          onPullTemplate={(name, reference) => run(pullTemplate(name, reference))}
+          onDeleteImage={(reference) => run(deleteImage(reference))}
         />
       ) : null}
 
-      {newTemplateOpen ? (
-        <NewTemplateModal
-          busy={bootstrapping}
-          existing={new Set(state.hosts.map((h) => h.id))}
-          onClose={() => setNewTemplateOpen(false)}
-          onCreate={(hostname, resources) => {
-            setBootstrapping(true);
-            bootstrapTemplate(hostname, resources)
+      {commitHost ? (
+        <CommitImageModal
+          hostId={commitHost.id}
+          busy={committing}
+          onClose={() => setCommitHost(null)}
+          onCommit={(name) => {
+            setCommitting(true);
+            commitImage(commitHost.id, name)
               .then(() => setError(null))
               .catch((e: Error) => setError(e.message))
               .finally(() => {
-                setBootstrapping(false);
-                setNewTemplateOpen(false);
+                setCommitting(false);
+                setCommitHost(null);
               });
           }}
         />

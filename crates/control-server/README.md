@@ -1,9 +1,13 @@
 # control-server
 
 The backend binary — one tokio service that is the **control plane**, the **media plane**,
-and the **fleet-automation plane**. It exposes **four ports** and is a single self-contained
-artifact (the frontend, the `clone-daemon`/`agent-wrapper` binaries, and the patched
-gnome-shell `.deb` are all embedded). Full references: [API](../../docs/API.md) ·
+and the **fleet-automation plane**. It exposes **four ports** and ships as a Docker image; the
+frontend and the `clone-daemon`/`agent-wrapper` binaries are plain on-disk payloads under
+`/usr/local/share/rmng/` (read at runtime, hot-swapped into running clones) — nothing is
+compiled into the binary. Clones themselves are created from a separately-published **template**
+image (`pegasis0/rmng-template`, built by `template/Dockerfile`), pulled by `POST
+/api/images/pull` — not built in-product, so the patched gnome-shell `.deb` isn't a
+control-server payload at all. Full references: [API](../../docs/API.md) ·
 [MCP](../../docs/MCP.md) · [PROTOCOL](../../docs/PROTOCOL.md) · [DEPLOY](../../docs/DEPLOY.md).
 
 | Port | Default | Transport | Serves |
@@ -18,11 +22,14 @@ gnome-shell `.deb` are all embedded). Full references: [API](../../docs/API.md) 
 `app` (shared state holder) · `state` (in-memory `ControlState` + atomic `state.json` persist
 + file-watch + SSE bus) · `config` (load/merge/redact `config.json` at 0600) · `web` (port 2
 routes + SSE + SPA) · `mediaplane` (port 1: clone-socket ingest → `media` encode → viewer;
-input routing; clipboard broker) · `mcp` (ports 3 + 4) · `orchestrate` (SSH `pct`/`lvcreate`
-scripts + Operation parse) · `jobs` (clone/delete/bootstrap Operation machine) · `linear` ·
-`claude` (usage poll + token refresh/push + assign/swap) · `chat` (agent-wrapper proxy + per-host SSE) ·
-`monitor` (host poller) · `mounts` (sshfs) · `files` (notes/uploads/detector-feedback) ·
-`embed` (the gzipped clone-daemon/agent-wrapper/gnome-shell-deb).
+input routing; clipboard broker) · `mcp` (ports 3 + 4) · `docker` (bollard primitives against
+the local daemon) · `provision` (clone/pull/commit/delete flows over those primitives) ·
+`jobs` (the clone/delete/pull/commit Operation machine) · `binswap` (automatic clone-binary
+hot-swap: hash-check on daemon `Hello` + a periodic sweep) · `linear` · `claude` (usage poll
++ token refresh/push + assign/swap) · `chat` (agent-wrapper proxy + per-host SSE) · `monitor`
+(host poller) · `homes` (clone-home symlinks under `data/hosts/`) · `files`
+(notes/uploads/detector-feedback) · `assets` (on-disk clone-daemon/agent-wrapper payloads + the
+served frontend).
 
 ## Port 1 — media plane (`mediaplane` → [media](../media/README.md))
 
@@ -37,21 +44,24 @@ the owner and bytes back to the requester, re-binding as `selected` changes.
 
 ## Port 2 — web API
 
-State store + SSE, all `/api/*` routes, the embedded SPA, and `/uploads`. Orchestration
-(clone/delete/bootstrap over Proxmox SSH, Linear, Claude, chat proxy, monitor poller, sshfs
-mounts). Every endpoint is documented in [API.md](../../docs/API.md). Config is edited via the
-Settings UI: `GET /api/config` returns a redacted view, `PUT` merges + persists 0600 +
-applies live, `POST /api/config/test` checks Proxmox SSH.
+State store + SSE, all `/api/*` routes, the served SPA, and `/uploads`. Orchestration
+(clone/delete/pull/commit + images over the local Docker daemon, Linear, Claude, chat proxy,
+monitor poller, clone-home reconciler). Every endpoint is documented in
+[API.md](../../docs/API.md). Config is edited via the Settings UI: `GET /api/config` returns a
+redacted view, `PUT` merges + persists 0600 + applies live, `POST /api/config/test {docker}`
+checks the Docker environment (mirrored row-by-row at `GET /api/setup/env`).
 
 ## Ports 3 & 4 — MCP (`mcp`)
 
 Hand-rolled JSON-RPC-over-HTTP (curl-testable; not `rmcp`).
 - **Port 3 (per-clone, IP-routed):** the one tool is `set_state` — the in-clone agent reports
   `working`/`idle` + a note; the clone is resolved from the caller's source IP.
-- **Port 4 (fleet):** web-action tools (`list_hosts`, `select`, `clone`, `delete`, `redeploy`,
-  `claude_*`, `set_state`) run locally; desktop/window tools (`screenshot`, `mouse_move`,
-  clicks, `scroll`, `key`, `type`, `list_windows`, `move_window`, `list_apps`, `launch_app`)
-  are **proxied** to the addressed clone's daemon MCP at `http://{host}:{daemon_mcp}`.
+- **Port 4 (fleet):** web-action tools (`list_hosts`, `select`, `clone`, `delete`, `claude_*`,
+  `set_state`, `send_message`, `read_chat`) run locally; desktop/window tools (`screenshot`,
+  `mouse_move`, clicks, `scroll`, `key`, `type`, `list_windows`, `move_window`, `list_apps`,
+  `launch_app`) are **proxied** to the addressed clone's daemon MCP at
+  `http://{host}:{daemon_mcp}`. There is no `redeploy` tool — clone binaries hot-swap
+  themselves (see below).
 
 The full desktop-automation surface lives in the **clone-daemon** (`:9004`), not here — the
 in-clone agent calls it directly on localhost and the fleet MCP proxies to it. Every tool +
@@ -67,34 +77,53 @@ it) — read at request time, so a **running** clone hot-swaps with no restart. 
 at clone time by usage+load score; **hot-swap** from the UI/`/api/claude/swap`/fleet MCP;
 **auto-swap** to the next-best account on exhaustion (`claude.auto_swap_on_exhaustion`).
 
-## Orchestration & self-bootstrap (`orchestrate`, `jobs`)
+## Orchestration (`docker`, `provision`, `jobs`)
 
-Clone/delete/bootstrap run the embedded shell scripts over `ssh … bash -s` and parse the
-`P step msg` / `RESULT …` line protocol into an `Operation` streamed over `/events`. Two clone
-paths: **CoW** (`clone.sh`, fast, the default) and **from-zero bootstrap** (`bootstrap.sh` +
-`provision-clone.sh`, used to build the golden template). The deployment promise: give the
-control-server Proxmox SSH and it builds the template + provisions clones — distributing the
-embedded `clone-daemon`, `agent-wrapper`, and patched gnome-shell deb. See
-[DEPLOY.md](../../docs/DEPLOY.md) and [SCRIPTS.md](../../docs/SCRIPTS.md).
+`docker` holds the bollard client + dumb primitives (create/start/stop/commit/exec/tar/network);
+`provision` stitches them into clone-create, template-pull, commit-from-clone, and delete
+flows, streaming progress through a `FnMut(&str, &str)` callback (the old `P step msg` /
+`RESULT` bash protocol is gone); `jobs` wraps each in an `Operation` streamed over `/events`.
+Clone sources are **images** (`rmng.image=1`, `rmng/template:<name>`) — no golden-CT / CoW
+model: the template is built + published ahead of time (`template/Dockerfile`, not by this
+crate — see [DEPLOY.md#publishing-the-template](../../docs/DEPLOY.md#publishing-the-template)),
+`pull_template` pulls + retags it locally, clones are `docker run` off an image, and any clone
+commits to a new image. In-container guest scripts (`apply-monitors.sh`, `claude-import.sh`)
+run over `docker exec bash -s`. See [DEPLOY.md](../../docs/DEPLOY.md) and
+[SCRIPTS.md](../../docs/SCRIPTS.md).
+
+## Automatic clone-binary hot-swap (`binswap`)
+
+Replaces the old manual per-host "redeploy": at [`main`](src/main.rs) startup `binswap::spawn`
+hashes the `clone-daemon`/`agent-wrapper` payloads this image ships (once), then a single
+worker task hashes each running clone's on-disk `/opt/rmng/bin/*` and bounces just the
+`systemd --user` unit(s) whose hash is stale — via [`provision::redeploy_clone`](src/provision.rs),
+which pushes the binary via tar and does the `systemctl --user stop/start` dance. Two
+enqueue paths: `mediaplane` calls `SwapState::request_check` on a clone's `Hello`, and a sweep
+loop enqueues every managed container 60 s after boot, then every 5 min. Failed swaps back off
+(`30s · 2^failures`, capped at 30 min); a payload that changed on disk *after* the hashes were
+warmed is refused with a WARN rather than risked into a swap loop. Details:
+[DEPLOY.md#upgrades](../../docs/DEPLOY.md#upgrades).
 
 ## Networking
 
-Only the control-server needs external reachability (tailscale, manual). Clones sit on an
-internal bridge reachable only *from* the control-server (SSH + the agent-wrapper chat proxy +
-the fleet-MCP→daemon-MCP proxy); media/input cross a host-bind-mounted unix socket
-(`/srv/rmng-sock`, SCM_RIGHTS), not the network. Exposure split: ports 1+2 operator-facing;
-port 3 internal bridge only (needs real peer IPs); port 4 most-privileged (localhost/token).
+Only the control-server needs external reachability (tailscale, manual). Clones sit on the
+user-defined `rmng` Docker bridge (static IPs: `.1` gateway, `.2` control-server, `.10+`
+clones), reachable *from* the control-server (the agent-wrapper chat proxy + the
+fleet-MCP→daemon-MCP proxy); media/input cross the shared `/srv/rmng-sock` named-volume unix
+socket (SCM_RIGHTS), not the network. Exposure split: ports 1+2 operator-facing; port 3
+internal bridge only (needs real peer IPs); port 4 most-privileged (localhost/token).
 
 ## Dependencies
 
 `axum`/`tokio`/`tower-http` (port 2 + the MCP HTTP servers + static files), `reqwest` (Linear,
-Claude, agent-wrapper, the daemon-MCP proxy — plain HTTP, no rustls/native-tls), `rust-embed`
-+ `flate2` (embedded frontend + binaries + deb), `notify` (file watch), `serde_json`,
-`tokio::process` (ssh), `wire`, `media`.
+Claude, agent-wrapper, the daemon-MCP proxy — plain HTTP, no rustls/native-tls), `bollard` +
+`tar` (Docker orchestration over the unix socket), `notify` (file watch), `serde_json`,
+`wire`, `media`.
 
 ## Tests
 
-`cargo test -p control-server` (run on the build CT — the crate links GStreamer): Operation
-state machine from canned `P…`/`RESULT…`, account scoring, config defaults/merge/redaction,
-source-IP→clone mapping, and the embed round-trip (the patched deb decompresses to a valid
-`.deb`).
+`cargo test -p control-server` (run where GStreamer links — the crate pulls in `media`): the
+subnet/IP allocator + image-reference canonicalization + step→percentage tables (`provision`/`docker`),
+account scoring, config defaults/merge/redaction + one-time/restart-required categories,
+source-IP→clone mapping, `in_use_by` accounting, and `binswap`'s `sha256sum`-output parsing +
+swap backoff progression.

@@ -1,0 +1,44 @@
+# RMNG control-server. `docker compose up -d --build` brings up the hub; open
+# http://localhost:9000 → the first-run wizard does the rest (subnet, prefix, monitors,
+# ports, limits, presets). By design there are ZERO `-e` configuration flags: config.json
+# (edited via the wizard / Settings) is the single source of truth (no-env-settings
+# invariant). The only ENV in play is RUST_LOG, baked into the image as a logging default.
+#
+# Equivalent one-liner (no registry needed):
+#   docker run -d --name rmng --privileged --init --pid host --restart unless-stopped \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     -v rmng-data:/data -v rmng-sock:/srv/rmng-sock \
+#     -p 9000-9003:9000-9003 rmng:latest
+
+services:
+  rmng:
+    image: rmng:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Privileged: the control-server orchestrates privileged clone containers (nested
+    # Docker) on the same daemon.
+    privileged: true
+    # PID 1 reaper — the server spawns short-lived exec/tar helpers.
+    init: true
+    # Share the Docker host's PID namespace so clone PIDs are visible: the clone-home
+    # reconciler symlinks data/hosts/<id> → /proc/<clone-pid>/root/home/rmng, letting you
+    # browse every clone's home in one place (adds no privilege beyond the docker socket).
+    pid: "host"
+    restart: unless-stopped
+    volumes:
+      # The daemon the control-server drives via bollard (unix socket).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # config.json + data/ (WORKDIR /data) — persists setup + state across restarts.
+      - rmng-data:/data
+      # The shared clone media socket dir. LOAD-BEARING: this exact named volume is
+      # mounted into every clone at /srv/rmng-sock, so clone-daemons can reach the
+      # control-server's media plane. Must be a named volume (not bind) so clones share it.
+      - rmng-sock:/srv/rmng-sock
+    ports:
+      # 9000 web/API, 9001 video, 9002 per-clone MCP, 9003 global MCP.
+      - "9000-9003:9000-9003"
+
+volumes:
+  rmng-data:
+  rmng-sock:

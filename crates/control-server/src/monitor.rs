@@ -6,15 +6,71 @@
 //!   dropped read self-heals.
 
 use std::collections::HashMap;
+use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
 use serde::Deserialize;
-use wire::{AgentReport, Host, MonitorState};
+use tokio::sync::broadcast;
+use wire::{AgentReport, ContainerStats, Host, MonitorState};
 
 use crate::app::App;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const FETCH_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Volatile per-host resource-usage bus. The monitor poller samples each running managed
+/// clone's CPU/RAM every tick and publishes the whole `{ hostId: ContainerStats }` map
+/// here; the `/events` handler fans it out to the frontend as a named `stats` SSE event.
+///
+/// Deliberately OUT of `ControlState` / `state.json`: these numbers move every tick, and
+/// every `ControlState` mutation persists the file atomically (see `state.rs::mutate`), so
+/// carrying stats there would rewrite `state.json` every 4 seconds. The bus is SSE-only —
+/// it never touches disk. A new subscriber gets the `latest` snapshot immediately, then
+/// live deltas; `publish` dedups logically-equal maps so a drained/idle fleet stops waking
+/// subscribers.
+pub struct StatsBus {
+    tx: broadcast::Sender<String>,
+    /// The latest published map + its serialization (the snapshot new subscribers get;
+    /// `"{}"` until the first tick). The dedupe compares the MAP (`HashMap: PartialEq`),
+    /// never the JSON bytes: `poll_once` builds a fresh `HashMap` each tick and
+    /// `RandomState` seeds iteration order per instance, so two logically-equal maps
+    /// routinely serialize with different key orders.
+    latest: StdRwLock<(HashMap<String, ContainerStats>, String)>,
+}
+
+impl StatsBus {
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(16);
+        Self { tx, latest: StdRwLock::new((HashMap::new(), "{}".to_string())) }
+    }
+
+    /// The latest published map (JSON) + a live receiver, for a new `/events` subscriber.
+    pub fn subscribe(&self) -> (String, broadcast::Receiver<String>) {
+        (self.latest.read().unwrap().1.clone(), self.tx.subscribe())
+    }
+
+    /// Publish a stats map, but only broadcast when it differs from the last one — an
+    /// empty/unchanged map (no running managed hosts) doesn't wake anyone. Equality is
+    /// on the map itself (order-independent), not its serialization.
+    fn publish(&self, map: &HashMap<String, ContainerStats>) {
+        let json = {
+            let mut latest = self.latest.write().unwrap();
+            if latest.0 == *map {
+                return;
+            }
+            let json = serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string());
+            *latest = (map.clone(), json.clone());
+            json
+        };
+        let _ = self.tx.send(json);
+    }
+}
+
+impl Default for StatsBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Deserialize)]
 struct StatusResp {
@@ -23,10 +79,10 @@ struct StatusResp {
 }
 
 /// One probe → the host's derived state.
-async fn probe_host(http: &reqwest::Client, host: &Host, agent_port: u16) -> MonitorState {
-    let url = format!("http://{}:{}/status", host.host, agent_port);
+async fn probe_host(app: &App, host: &Host, agent_port: u16) -> MonitorState {
+    let url = format!("http://{}:{}/status", app.dial_host(host).await, agent_port);
     let busy = async {
-        let resp = http.get(&url).timeout(FETCH_TIMEOUT).send().await.ok()?;
+        let resp = app.http.get(&url).timeout(FETCH_TIMEOUT).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -46,16 +102,52 @@ async fn probe_host(http: &reqwest::Client, host: &Host, agent_port: u16) -> Mon
 async fn poll_once(app: &App) {
     let hosts = app.store.get().hosts;
     if hosts.is_empty() {
+        // Clear any stale stats so a drained fleet stops showing numbers (deduped: a no-op
+        // once already empty).
+        app.stats.publish(&HashMap::new());
         return;
     }
     let agent_port = app.config().agent_port;
-    let http = &app.http;
-    // Probe concurrently.
-    let probes = futures::future::join_all(
-        hosts.iter().map(|h| async move { (h.id.clone(), probe_host(http, h, agent_port).await) }),
-    )
+    // Per host, probe the agent-wrapper `/status` AND sample container stats, all
+    // concurrently. Stats are sampled only for managed clones (a container named after the
+    // host id backs them); a stopped/missing container yields `None` and is simply skipped,
+    // so a stopped or unmanaged host contributes no stats entry (no UI churn). Cost: one
+    // `docker stats` call per managed host per tick — cheap, one-shot, and concurrent.
+    //
+    // Two bounds keep stats from ever holding the monitor state hostage:
+    // - the stats call gets the same FETCH_TIMEOUT as the /status probe — the shared
+    //   bollard client's own timeout is 1 h (sized for base-image commits), so an
+    //   unbounded call against a wedged container/daemon would freeze this `join_all`
+    //   (and with it ALL monitor-state updates) for up to an hour;
+    // - probe and stats run concurrently (`join!`), not sequentially, so even a healthy
+    //   tick's state application never waits on the daemon's ~1 s two-cycle sampling
+    //   (`one_shot=false` collects two CPU cycles before answering).
+    let probes = futures::future::join_all(hosts.iter().map(|h| async move {
+        let stats_fut = async {
+            if !h.managed {
+                return None;
+            }
+            tokio::time::timeout(FETCH_TIMEOUT, app.docker.container_stats(&h.id))
+                .await
+                .ok() // timed out → no sample this tick
+                .flatten()
+        };
+        let (state, stats) = tokio::join!(probe_host(app, h, agent_port), stats_fut);
+        (h.id.clone(), state, stats)
+    }))
     .await;
-    let next: HashMap<String, MonitorState> = probes.into_iter().collect();
+
+    let mut next: HashMap<String, MonitorState> = HashMap::with_capacity(probes.len());
+    let mut stats_map: HashMap<String, ContainerStats> = HashMap::new();
+    for (id, state, stats) in probes {
+        if let Some(s) = stats {
+            stats_map.insert(id.clone(), s);
+        }
+        next.insert(id, state);
+    }
+
+    // Volatile stats ride the SSE-only bus — never `state.json`.
+    app.stats.publish(&stats_map);
 
     // Keep a persistent autonomous-message listener on every reachable host.
     for h in &hosts {
@@ -98,5 +190,70 @@ pub async fn run(app: App) {
     loop {
         poll_once(&app).await;
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat(cpu: f64) -> ContainerStats {
+        ContainerStats { cpu_pct: cpu, mem_used: 1 << 30, mem_limit: 8u64 << 30 }
+    }
+
+    #[test]
+    fn stats_bus_new_subscriber_gets_empty_snapshot() {
+        let bus = StatsBus::new();
+        let (snap, _rx) = bus.subscribe();
+        assert_eq!(snap, "{}");
+    }
+
+    #[test]
+    fn stats_bus_publish_broadcasts_and_seeds_latest() {
+        let bus = StatsBus::new();
+        let (_snap, mut rx) = bus.subscribe();
+        let map = HashMap::from([("h1".to_string(), stat(120.0))]);
+        bus.publish(&map);
+        // Existing subscriber receives the frame...
+        let got = rx.try_recv().expect("a frame was broadcast");
+        assert!(got.contains("\"h1\""), "frame: {got}");
+        assert!(got.contains("\"cpuPct\":120"), "frame: {got}");
+        // ...and a fresh subscriber now snapshots the same published map.
+        let (snap2, _rx2) = bus.subscribe();
+        assert_eq!(snap2, got);
+    }
+
+    #[test]
+    fn stats_bus_dedups_equal_maps_regardless_of_key_order() {
+        // This dedup is what stops an idle fleet from waking SSE subscribers every tick.
+        // Crucially it must be ORDER-INDEPENDENT: `poll_once` builds a fresh `HashMap`
+        // each tick, and `RandomState` seeds iteration order per instance, so two
+        // logically-equal multi-key maps routinely serialize with different key orders —
+        // a byte-level JSON compare would never dedupe them. Hence: two separately
+        // constructed maps (opposite insertion orders) with equal content, and the second
+        // publish must not wake anyone.
+        let bus = StatsBus::new();
+        let (_snap, mut rx) = bus.subscribe();
+        let a: HashMap<String, ContainerStats> =
+            (0..8).map(|i| (format!("h{i}"), stat(i as f64))).collect();
+        let b: HashMap<String, ContainerStats> =
+            (0..8).rev().map(|i| (format!("h{i}"), stat(i as f64))).collect();
+        assert_eq!(a, b);
+        bus.publish(&a);
+        assert!(rx.try_recv().is_ok(), "first publish must broadcast");
+        bus.publish(&b); // equal content, freshly built → must NOT broadcast
+        assert!(rx.try_recv().is_err(), "logically-equal map must not re-broadcast");
+
+        // A changed map still gets through after the dedupe.
+        let mut c = a.clone();
+        c.insert("h0".to_string(), stat(99.0));
+        bus.publish(&c);
+        assert!(rx.try_recv().is_ok(), "a genuinely changed map must broadcast");
+
+        // An empty map over the never-populated empty latest is also a no-op.
+        let bus2 = StatsBus::new();
+        let (_s, mut rx2) = bus2.subscribe();
+        bus2.publish(&HashMap::new());
+        assert!(rx2.try_recv().is_err(), "empty republish over empty latest must not broadcast");
     }
 }

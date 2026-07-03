@@ -81,6 +81,15 @@ impl MediaHandle {
     }
     // NB: on-demand screenshots moved into the clone-daemon's own MCP (the fleet MCP
     // proxies to it); the control-server no longer encodes screenshots itself.
+
+    /// True when a clone-daemon session for `id` is live — i.e. its daemon has sent a
+    /// `Hello{clone_id}` (keyed by clone_id == the clone's hostname == its host id) and
+    /// the connection hasn't dropped. This is the readiness signal `provision.rs`'s
+    /// clone-container wait-ready poll watches: a clone is "up + registered" once its
+    /// daemon appears here.
+    pub fn is_connected(&self, id: &str) -> bool {
+        self.conns.lock().unwrap().contains_key(id)
+    }
 }
 
 type Viewer = Arc<Mutex<Option<TcpStream>>>;
@@ -448,6 +457,10 @@ fn serve_clone(
             Ok((DaemonMsg::Hello(h), _)) => {
                 tracing::info!("clone-daemon '{}' connected", h.clone_id);
                 handle.conns.lock().unwrap().insert(h.clone_id.clone(), conn.clone());
+                // Every Hello (clone create, daemon restart, control-server boot, or the
+                // unit bounce after a hot-swap) is exactly when a re-check belongs: it's
+                // also the post-swap success verification (re-Hello finds matching hashes).
+                app.swap.request_check(&h.clone_id);
                 clone_id = Some(h.clone_id);
             }
             Ok((DaemonMsg::Frame(f), fds)) => {
@@ -514,13 +527,36 @@ fn serve_clone(
             }
             Err(e) => {
                 if let Some(id) = &clone_id {
-                    handle.conns.lock().unwrap().remove(id);
-                    handle.latest.lock().unwrap().remove(id);
+                    teardown_if_current(&handle.conns, &handle.latest, id, &conn);
                     tracing::info!("clone-daemon '{id}' disconnected: {e}");
                 }
                 break;
             }
         }
+    }
+}
+
+/// Disconnect teardown for one clone session: remove `id` from `conns`/`latest` ONLY if
+/// the `conns` entry is still `this` exact connection (`Arc::ptr_eq`). A hot-swap bounces
+/// the daemon unit, so the replacement daemon can reconnect + `Hello` (re-inserting under
+/// the same id) before the old session's blocking `recv()` finally errors into this path
+/// — the identity check keeps that late teardown from clobbering the new session.
+///
+/// `latest` is removed while the `conns` lock is still held: a new session can only prime
+/// `latest[id]` after its `Hello` inserted into `conns` (which needs this lock), so no
+/// fresh frame can appear between the identity check and either removal. No other site
+/// nests these two locks (verified: `prime_viewer` holds `latest` in a scoped block that
+/// never touches `conns`), so the conns→latest order cannot invert.
+fn teardown_if_current(
+    conns: &Mutex<HashMap<String, Arc<Conn>>>,
+    latest: &Mutex<HashMap<String, HashMap<u32, LatestFrame>>>,
+    id: &str,
+    this: &Arc<Conn>,
+) {
+    let mut conns = conns.lock().unwrap();
+    if conns.get(id).is_some_and(|c| Arc::ptr_eq(c, this)) {
+        conns.remove(id);
+        latest.lock().unwrap().remove(id);
     }
 }
 
@@ -558,5 +594,62 @@ fn read_viewer_input(mut sock: TcpStream, handle: Arc<MediaHandle>, app: App, vi
             }
             _ => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Connect a SOCK_SEQPACKET client to `path` — the daemon side of an accept pair
+    /// (mirrors `clone-daemon`'s `Transport::connect`). The returned fd only has to stay
+    /// alive; the test never sends on it.
+    fn seq_connect(path: &str) -> OwnedFd {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+        let fd =
+            socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::empty(), None).unwrap();
+        connect(fd.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
+        fd
+    }
+
+    /// The disconnect-teardown guard: a LATE old-thread teardown (its `recv()` erroring
+    /// only after a replacement session already re-Hello'd under the same id) must leave
+    /// the new session's `conns`/`latest` entries intact; the current session's own
+    /// teardown still clears both maps.
+    #[test]
+    fn teardown_only_removes_own_connection() {
+        // Two real accepted connections, as two serve_clone threads would hold them:
+        // A = the old session (about to tear down late), B = the replacement.
+        let path = std::env::temp_dir().join(format!("rmng-mp-test-{}.sock", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let listener = Listener::bind(&path).unwrap();
+        let _client_a = seq_connect(&path);
+        let conn_a = Arc::new(listener.accept().unwrap());
+        let _client_b = seq_connect(&path);
+        let conn_b = Arc::new(listener.accept().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let conns: Mutex<HashMap<String, Arc<Conn>>> = Mutex::new(HashMap::new());
+        let latest: Mutex<HashMap<String, HashMap<u32, LatestFrame>>> =
+            Mutex::new(HashMap::new());
+        // B has re-Hello'd: both maps hold the NEW session's state under id "x".
+        conns.lock().unwrap().insert("x".into(), conn_b.clone());
+        latest.lock().unwrap().insert("x".into(), HashMap::new());
+
+        // Old thread A tears down late — B's entries must survive in BOTH maps.
+        teardown_if_current(&conns, &latest, "x", &conn_a);
+        assert!(
+            conns.lock().unwrap().get("x").is_some_and(|c| Arc::ptr_eq(c, &conn_b)),
+            "old-thread teardown clobbered the new session's conns entry"
+        );
+        assert!(
+            latest.lock().unwrap().contains_key("x"),
+            "old-thread teardown clobbered the new session's latest entry"
+        );
+
+        // The current session (B) tearing down removes both entries as before.
+        teardown_if_current(&conns, &latest, "x", &conn_b);
+        assert!(!conns.lock().unwrap().contains_key("x"));
+        assert!(!latest.lock().unwrap().contains_key("x"));
     }
 }

@@ -4,17 +4,26 @@ import type { MonitorState } from "./MonitorState";
 
 export type Host = { 
 /**
- * Stable id; equals the Proxmox container hostname for cloneable hosts.
+ * Stable id; equals the Docker container name for cloneable hosts.
  */
 id: string, 
 /**
- * RDP/media server hostname or IP.
+ * Endpoint hostname/IP for unmanaged rows. Display-only on managed clones (it
+ * records the container name == `id`; dials resolve via Docker DNS / inspect).
  */
 host: string, 
 /**
  * Port (defaults to 3389 for the legacy RDP path).
  */
-port: number, username: string, password: string, domain: string | null, gdm_username: string | null, gdm_password: string | null, ctid: number | null, source: string | null, claudeAccountEmail: string | null, 
+port: number, username: string, password: string, domain: string | null, gdm_username: string | null, gdm_password: string | null, 
+/**
+ * True for a managed clone: a Docker container whose *name equals this host's id*
+ * backs it (every Docker call addresses it by that name — no stored container id).
+ * False is a plain unmanaged row (legacy/hand-added, deletable in the UI). Old
+ * `state.json` rows carrying the retired `ctid`/`container` keys load as
+ * unmanaged — serde drops the stale keys.
+ */
+managed: boolean, source: string | null, claudeAccountEmail: string | null, 
 /**
  * Name of the Claude group this clone is balanced within (sticky — it moves only
  * when its account exhausts); `None` when bound to a single fixed account. When

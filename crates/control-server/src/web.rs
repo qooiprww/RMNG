@@ -3,44 +3,36 @@
 //! are ported.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Multipart, Path as AxPath, State},
-    http::{StatusCode, Uri, header},
+    extract::{Multipart, Path as AxPath, State},
+    http::{StatusCode, header},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures::stream::{Stream, StreamExt};
-use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-/// The built frontend (`bun run build` → `frontend/build/client`), embedded into
-/// the binary so the server is a single self-contained artifact. `build.rs`
-/// guarantees the folder exists (placeholder if the frontend wasn't built).
-#[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/../../frontend/build/client"]
-struct Frontend;
-
-/// Serve an embedded asset; SPA fallback to `index.html` for unknown paths.
-async fn static_handler(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
-    if let Some(f) = Frontend::get(path) {
-        return ([(header::CONTENT_TYPE, f.metadata.mimetype())], f.data.into_owned()).into_response();
-    }
-    match Frontend::get("index.html") {
-        Some(f) => ([(header::CONTENT_TYPE, "text/html")], f.data.into_owned()).into_response(),
-        None => (StatusCode::NOT_FOUND, "frontend not embedded").into_response(),
-    }
+/// 404 hint when no frontend dir resolves anywhere (image install missing AND no dev
+/// build) — the API stays up so this only ever surfaces in a broken/dev environment.
+async fn missing_frontend() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "frontend not installed: expected {}/static (image) or frontend/build/client \
+             (dev; run `bun run build` in frontend/)",
+            crate::assets::INSTALL_DIR
+        ),
+    )
+        .into_response()
 }
 use wire::{AppConfigRedacted, ConfigPutResponse, ControlState, Operation};
 
@@ -56,7 +48,6 @@ pub fn router(app: App) -> Router {
         .route("/api/activate", post(activate))
         .route("/api/reorder", post(reorder))
         .route("/api/clone", post(clone))
-        .route("/api/clone/redeploy", post(clone_redeploy))
         .route("/api/monitors/apply", post(monitors_apply))
         .route("/api/delete", post(delete))
         .route("/api/notes/:id", get(notes_get).post(notes_save))
@@ -65,7 +56,11 @@ pub fn router(app: App) -> Router {
         .route("/api/detector-feedback", post(detector_feedback))
         .route("/api/config", get(config_get).put(config_put))
         .route("/api/config/test", post(config_test))
-        .route("/api/template/bootstrap", post(template_bootstrap))
+        .route("/api/setup/env", get(setup_env))
+        .route("/api/images", get(images_list))
+        .route("/api/images/pull", post(images_pull))
+        .route("/api/images/commit", post(images_commit))
+        .route("/api/images/delete", post(images_delete))
         .route("/api/claude/import/check", post(claude_import_check))
         .route("/api/claude/import", post(claude_import))
         .route("/api/claude/refresh", post(claude_refresh))
@@ -76,19 +71,31 @@ pub fn router(app: App) -> Router {
         .route("/api/chat/:id/events", get(chat_events))
         .route("/api/chat/:id/abort", post(chat_abort));
 
-    // Frontend: embedded by default (self-contained binary). A non-empty
-    // `static_dir` serves from disk instead, for dev hot-reload without a rebuild.
-    // The router is built once at startup, so `static_dir` is restart-required by
-    // construction — no live re-read needed.
-    let dir = app.config().static_dir;
-    let routes = if !dir.is_empty() && Path::new(&dir).is_dir() {
-        let index = Path::new(&dir).join("index.html");
-        routes.fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(index)))
+    // Frontend from the filesystem: a non-empty `static_dir` overrides (dev hot-reload
+    // without a rebuild); otherwise the assets search path resolves it (the image's
+    // /usr/local/share/rmng/static, else the repo dev build). The router is built once
+    // at startup, so `static_dir` is restart-required by construction.
+    let cfg_dir = app.config().static_dir;
+    let dir = if !cfg_dir.is_empty() && Path::new(&cfg_dir).is_dir() {
+        Some(std::path::PathBuf::from(&cfg_dir))
     } else {
-        if !dir.is_empty() {
-            tracing::warn!("static_dir '{dir}' is not a directory; serving the embedded frontend");
+        if !cfg_dir.is_empty() {
+            tracing::warn!("static_dir '{cfg_dir}' is not a directory; using the installed frontend");
         }
-        routes.fallback(static_handler)
+        crate::assets::static_dir()
+    };
+    let routes = match dir {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            routes.fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(index)))
+        }
+        None => {
+            tracing::warn!(
+                "no frontend found ({}/static or the dev build) — web UI disabled, API still up",
+                crate::assets::INSTALL_DIR
+            );
+            routes.fallback(missing_frontend)
+        }
     };
 
     routes.layer(TraceLayer::new_for_http()).with_state(app)
@@ -100,22 +107,41 @@ pub async fn serve(app: App) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("port 2 (web API + SSE + static) on http://{addr}");
-    // ConnectInfo so /api/detector-feedback can map the caller's source IP → clone.
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
-/// `GET /events` — full `ControlState` on connect, then on every change; 20s ping.
+/// `GET /events` — two multiplexed streams on one connection:
+///   - the persisted `ControlState` as the default (unnamed) event → the client's
+///     `onmessage`: full snapshot on connect, then one frame per change;
+///   - the volatile per-host CPU/RAM map as a named `stats` event → the client's
+///     `addEventListener("stats")`: latest snapshot on connect, then one per poll tick.
+///
+/// Stats ride a separate SSE-only bus ([`crate::monitor::StatsBus`]) so they never enter
+/// `ControlState` / `state.json` (which persists on every mutation). 20s keep-alive ping.
 async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (snapshot, rx) = app.store.subscribe();
-    let initial = futures::stream::once(async move { Ok(Event::default().data(snapshot)) });
-    let updates = BroadcastStream::new(rx).filter_map(|r| async move {
+    let state_initial = futures::stream::once(async move { Ok(Event::default().data(snapshot)) });
+    let state_updates = BroadcastStream::new(rx).filter_map(|r| async move {
         match r {
             Ok(json) => Some(Ok(Event::default().data(json))),
             Err(_) => None, // lagged: next snapshot resyncs
         }
     });
-    Sse::new(initial.chain(updates))
+    let state_stream = state_initial.chain(state_updates);
+
+    let (stats_snapshot, stats_rx) = app.stats.subscribe();
+    let stats_initial =
+        futures::stream::once(async move { Ok(Event::default().event("stats").data(stats_snapshot)) });
+    let stats_updates = BroadcastStream::new(stats_rx).filter_map(|r| async move {
+        match r {
+            Ok(json) => Some(Ok(Event::default().event("stats").data(json))),
+            Err(_) => None, // lagged: next tick resyncs
+        }
+    });
+    let stats_stream = stats_initial.chain(stats_updates);
+
+    Sse::new(futures::stream::select(state_stream, stats_stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)).text("ping"))
 }
 
@@ -158,14 +184,15 @@ async fn reorder(State(app): State<App>, Json(req): Json<ReorderReq>) -> Json<Co
     Json(next)
 }
 
-/// `POST /api/clone` — start a CoW clone. Body is one of:
-///   `{ source, ticket }`                               — existing ticket (preset auto-selected
+/// `POST /api/clone` — start a clone from a source image. Body is one of:
+///   `{ image, ticket }`                               — existing ticket (preset auto-selected
 ///                                                        by the ticket's labels)
-///   `{ source, create: { team, title, description } }` — create a ticket first (preset required;
+///   `{ image, create: { team, title, description } }` — create a ticket first (preset required;
 ///                                                        its Linear key creates the issue)
-///   `{ source, plain: { title, message } }`            — no ticket (preset required if any exist)
+///   `{ image, plain: { title, message } }`            — no ticket (preset required if any exist)
 /// plus optional `preset` (name; absent/"auto" = label auto-select in ticket mode) /
-/// `claudeAccount` / `agentInstructions` / `claudeInstructions`.
+/// `claudeAccount` / `agentInstructions` / `claudeInstructions`. `image` is a clone-source
+/// image reference (`rmng/template:<name>`) from `GET /api/images`.
 async fn clone(
     State(app): State<App>,
     Json(body): Json<serde_json::Value>,
@@ -173,12 +200,12 @@ async fn clone(
     let bad = |m: String| (StatusCode::BAD_REQUEST, m);
     let str_field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 
-    let source = str_field("source").filter(|s| !s.is_empty()).ok_or_else(|| bad("body must include { source }".into()))?;
+    let image = str_field("image").filter(|s| !s.is_empty()).ok_or_else(|| bad("body must include { image }".into()))?;
     let claude_account = str_field("claudeAccount");
     let agent_instructions = str_field("agentInstructions");
     let claude_instructions = str_field("claudeInstructions");
     let cfg = app.config();
-    let prefix = cfg.proxmox.hostname_prefix.clone();
+    let prefix = cfg.docker.hostname_prefix.clone();
 
     // An explicitly chosen preset (by name); absent/"auto" means auto-select in
     // ticket mode and "required, so error" in plain/create mode (checked per mode).
@@ -214,7 +241,7 @@ async fn clone(
         };
         let (hostname, display) = derive(&app, &linear::plain_hostname_base(&prefix, &title), &title);
         let spec = CloneSpec {
-            source_id: source,
+            source_image: image,
             new_hostname: hostname,
             linear: Some(LinearMeta { display_name: Some(display), ..Default::default() }),
             claude_account,
@@ -244,7 +271,7 @@ async fn clone(
         label: issue.labels.first().cloned(),
     };
     let spec = CloneSpec {
-        source_id: source,
+        source_image: image,
         new_hostname: hostname,
         linear: Some(meta),
         claude_account,
@@ -329,32 +356,132 @@ async fn resolve_issue(
     Ok((issue, op_key, preset))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BootstrapReq {
-    hostname: String,
-    /// CT resources from the "New template" modal; omitted fields fall back to the
-    /// proven defaults (16 cores / 32 GB / 128 GB). The base image is fixed
-    /// ([`crate::orchestrate::BASE_IMAGE`]) — the patched GNOME only builds there.
-    cores: Option<u32>,
-    memory_mb: Option<u32>,
-    disk_gb: Option<u32>,
+// --- images (clone-source templates) ---------------------------------------
+
+/// `GET /api/images` — the clone-source images (`rmng.image=1`), each with the names of
+/// the managed containers created from it (`in_use_by`; container name == host id for
+/// clones). Both halves come from the daemon — Docker, not `state.json`, knows which
+/// containers reference which image. A daemon error surfaces as 502.
+async fn images_list(State(app): State<App>) -> Result<Json<Vec<wire::ImageInfo>>, (StatusCode, String)> {
+    let mut images = app
+        .docker
+        .list_rmng_images()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let containers = app
+        .docker
+        .list_managed_containers()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    fill_in_use_by(&mut images, &containers);
+    Ok(Json(images))
 }
 
-/// `POST /api/template/bootstrap` — build a template/clone from the fixed base image.
-async fn template_bootstrap(
+/// Fill each image's `in_use_by` with the names of managed containers whose creation
+/// image equals the image reference. Pure over (images, containers) so it's
+/// unit-testable independent of the daemon.
+fn fill_in_use_by(images: &mut [wire::ImageInfo], containers: &[crate::docker::ManagedContainer]) {
+    for img in images.iter_mut() {
+        img.in_use_by = containers
+            .iter()
+            .filter(|c| c.image == img.reference)
+            .map(|c| c.name.clone())
+            .collect();
+    }
+}
+
+#[derive(Deserialize)]
+struct PullReq {
+    /// DNS-label image name → local `rmng/template:<name>`.
+    name: String,
+    /// Registry reference to pull the template from. Absent/blank ⇒
+    /// `config.docker.templateReference` (the wizard's default).
+    #[serde(default)]
+    reference: Option<String>,
+}
+
+/// `POST /api/images/pull` — pull the clone template from a registry (`reference`, default
+/// `config.docker.templateReference`) and retag it locally as `rmng/template:<name>`.
+/// Returns the driving Operation (kind `pull`, which the wizard watches for). Replaces the
+/// retired in-product `/api/images/bootstrap` build.
+async fn images_pull(
     State(app): State<App>,
-    Json(req): Json<BootstrapReq>,
+    Json(req): Json<PullReq>,
 ) -> Result<Json<Operation>, (StatusCode, String)> {
-    let defaults = crate::orchestrate::BootstrapResources::default();
-    let res = crate::orchestrate::BootstrapResources {
-        cores: req.cores.unwrap_or(defaults.cores),
-        memory_mb: req.memory_mb.unwrap_or(defaults.memory_mb),
-        disk_gb: req.disk_gb.unwrap_or(defaults.disk_gb),
-    };
-    jobs::start_bootstrap(&app, &req.hostname, res)
+    let reference = req
+        .reference
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| app.config().docker.template_reference);
+    jobs::start_pull(&app, &req.name, &reference)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+#[derive(Deserialize)]
+struct CommitReq {
+    /// Host id of the managed clone to commit.
+    host: String,
+    /// DNS-label image name → `rmng/template:<name>`.
+    name: String,
+}
+
+/// `POST /api/images/commit` — commit a running clone to a new clone-source image
+/// `rmng/template:<name>`. Returns the driving Operation (kind `commit`).
+async fn images_commit(
+    State(app): State<App>,
+    Json(req): Json<CommitReq>,
+) -> Result<Json<Operation>, (StatusCode, String)> {
+    jobs::start_commit(&app, &req.host, &req.name)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+#[derive(Deserialize)]
+struct ImageDeleteReq {
+    /// Image reference or id to remove.
+    reference: String,
+}
+
+/// `POST /api/images/delete` — remove a clone-source image. 409 (Conflict) when the image is
+/// still referenced: a managed container was created from it (per the daemon — the same
+/// dependency that would make the daemon's own no-force removal fail, surfaced with the
+/// container names), OR a running op (clone/commit) uses it.
+async fn images_delete(
+    State(app): State<App>,
+    Json(req): Json<ImageDeleteReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let reference = req.reference.trim();
+    if reference.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "reference is required".into()));
+    }
+    let containers = app
+        .docker
+        .list_managed_containers()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let users: Vec<String> =
+        containers.iter().filter(|c| c.image == reference).map(|c| c.name.clone()).collect();
+    if !users.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("image is in use by {} clone(s): {}", users.len(), users.join(", ")),
+        ));
+    }
+    // A running clone-from-this-image or commit-to-this-reference also blocks removal.
+    let busy = app.store.get().operations.iter().any(|o| {
+        o.status == wire::OperationStatus::Running
+            && (o.source.as_deref() == Some(reference) || o.target == reference)
+    });
+    if busy {
+        return Err((StatusCode::CONFLICT, "image is in use by a running operation".into()));
+    }
+    app.docker
+        .remove_image(reference)
+        .await
+        // The daemon's no-force removal 409s when a container still holds it; surface as 409.
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
@@ -372,46 +499,17 @@ async fn delete(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RedeployReq {
-    id: String,
-    #[serde(default)]
-    daemon_only: bool,
-}
-
-/// `POST /api/clone/redeploy` — hot-swap a clone's `clone-daemon` (+ `agent-wrapper`
-/// unless `daemonOnly`) binaries from the embedded copies, without reprovisioning.
-async fn clone_redeploy(
-    State(app): State<App>,
-    Json(req): Json<RedeployReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let host = app.store.get().hosts.iter().find(|h| h.id == req.id).cloned();
-    let host = host.ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown host '{}'", req.id)))?;
-    let ctid = host
-        .ctid
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{}' has no container to redeploy", req.id)))?;
-    let cfg = app.config();
-    crate::orchestrate::redeploy_clone(&cfg, ctid, "rmng", req.daemon_only, |step, msg| {
-        tracing::info!("redeploy CT {ctid} {step}: {msg}");
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
 /// `POST /api/monitors/apply` — apply the saved monitor layout to every running clone
 /// (rewrites its `RMNG_MONITORS` + restarts its GNOME session + daemon). Restarts the
 /// clones' desktops, so it's an explicit button rather than part of Save.
 async fn monitors_apply(State(app): State<App>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let cfg = app.config();
-    let clones: Vec<(String, u32)> =
-        app.store.get().hosts.iter().filter_map(|h| h.ctid.map(|c| (h.id.clone(), c))).collect();
+    let clones: Vec<String> =
+        app.store.get().hosts.iter().filter(|h| h.managed).map(|h| h.id.clone()).collect();
     let mut applied = Vec::new();
     let mut errors = Vec::new();
-    for (id, ctid) in clones {
-        match crate::orchestrate::apply_monitors(&cfg, ctid, "rmng", |step, msg| {
-            tracing::info!("apply-monitors CT {ctid} {step}: {msg}");
+    for id in clones {
+        match crate::provision::apply_monitors(&app, &id, |step, msg| {
+            tracing::info!("apply-monitors {id} {step}: {msg}");
         })
         .await
         {
@@ -467,23 +565,14 @@ async fn uploads_serve(State(app): State<App>, AxPath(file): AxPath<String>) -> 
 }
 
 /// `POST /api/detector-feedback` — the clone's `clone-daemon report-detection` uploads a
-/// wrong needs-human verdict (multipart) for tuning. The caller is mapped to its clone by
-/// source IP. Mirrors the old Bun route + `computer-use`'s payload.
+/// wrong needs-human verdict (multipart) for tuning. The caller self-identifies with a
+/// `clone` field (its hostname — clone IPs are dynamic Docker IPAM now, so there is no
+/// source-IP mapping). Mirrors the old Bun route + `computer-use`'s payload.
 async fn detector_feedback(
     State(app): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut mp: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let peer_ip = peer.ip().to_string();
-    let host_id = app
-        .store
-        .get()
-        .hosts
-        .into_iter()
-        .find(|h| h.host == peer_ip)
-        .map(|h| h.id)
-        .ok_or((StatusCode::NOT_FOUND, format!("no host matches source ip {peer_ip}")))?;
-
+    let mut clone_field: Option<String> = None;
     let mut fb = files::DetectorFeedback {
         kind: String::new(),
         detector_verdict: "working".into(),
@@ -495,6 +584,7 @@ async fn detector_feedback(
     let mut screenshot: Option<Vec<u8>> = None;
     while let Some(field) = mp.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
         match field.name().unwrap_or("") {
+            "clone" => clone_field = field.text().await.ok().map(|s| s.trim().to_string()),
             "kind" => fb.kind = field.text().await.unwrap_or_default(),
             "detectorVerdict" => fb.detector_verdict = field.text().await.unwrap_or_default(),
             "detectorReason" => fb.detector_reason = field.text().await.unwrap_or_default(),
@@ -514,9 +604,20 @@ async fn detector_feedback(
     if fb.kind != "false-positive" && fb.kind != "false-negative" {
         return Err((StatusCode::BAD_REQUEST, "kind must be false-positive|false-negative".into()));
     }
+    let clone = clone_field
+        .filter(|c| !c.is_empty())
+        .ok_or((StatusCode::BAD_REQUEST, "missing 'clone' field (the caller's clone id)".into()))?;
+    let host_id = app
+        .store
+        .get()
+        .hosts
+        .into_iter()
+        .find(|h| h.id == clone)
+        .map(|h| h.id)
+        .ok_or((StatusCode::NOT_FOUND, format!("no host named '{clone}'")))?;
     let id = files::save_detector_feedback(&app.config().data_dir, &host_id, &fb, screenshot.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tracing::info!("detector-feedback from {host_id} ({peer_ip}): {} (id {id})", fb.kind);
+    tracing::info!("detector-feedback from {host_id}: {} (id {id})", fb.kind);
     Ok(Json(json!({ "ok": true, "id": id, "host": host_id })))
 }
 
@@ -533,14 +634,50 @@ async fn config_get(State(app): State<App>) -> Json<AppConfigRedacted> {
 async fn config_put(
     State(app): State<App>,
     Json(incoming): Json<serde_json::Value>,
-) -> Result<Json<ConfigPutResponse>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let old = app.config();
     let merged = config::merge_update(&old, incoming)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     config::save(&merged).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let restart_required = config::restart_required(&old, &merged);
+    // A wizard-finish flip (`setupComplete` false → true) is where the lazy `rmng` network is
+    // first materialized AND the control-server attaches itself at `.2` — both live in
+    // `self_setup` (gated on `setup_complete`, which was still false at startup, so this flip
+    // is the first run that does either). Re-running it here means a clone create later finds
+    // the network up and the baked `.2` control URL already resolving. A failure is NON-fatal
+    // (the config is already saved); `self_setup` records only a genuine network / self-attach
+    // failure in `network_detail` (failing *required* env rows were already gated by the env
+    // step and are not a wizard-finish failure), which we surface as `networkWarning` so the
+    // wizard can show it (the network also gets re-ensured on the first clone).
+    let mut network_warning: Option<String> = None;
+    if !old.setup_complete && merged.setup_complete {
+        // Bounded: the shared bollard client tolerates 1 h requests (commits); a wedged
+        // daemon must not hang this PUT for that long.
+        match tokio::time::timeout(std::time::Duration::from_secs(60), app.docker.self_setup(true))
+            .await
+        {
+            Ok(report) => {
+                if let Some(detail) = report.network_detail {
+                    tracing::warn!("self_setup network/self-attach at wizard finish failed: {detail}");
+                    network_warning = Some(detail);
+                }
+            }
+            Err(_) => {
+                let detail = "Docker self-setup timed out after 60s (daemon unresponsive?); \
+                              the rmng network will be re-ensured on the first clone"
+                    .to_string();
+                tracing::warn!("{detail}");
+                network_warning = Some(detail);
+            }
+        }
+    }
     *app.cfg.write().unwrap() = merged.clone();
-    Ok(Json(ConfigPutResponse { restart_required, config: merged.redacted() }))
+    let resp = ConfigPutResponse { restart_required, config: merged.redacted() };
+    let mut body = serde_json::to_value(&resp).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let (Some(obj), Some(w)) = (body.as_object_mut(), network_warning) {
+        obj.insert("networkWarning".into(), json!(w));
+    }
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]
@@ -548,29 +685,44 @@ struct TestReq {
     what: String,
 }
 
-/// `POST /api/config/test` — validate a setting from the UI.
+/// `POST /api/config/test` — validate a setting from the UI. `"docker"` re-runs the Docker
+/// self-setup probe and collapses the [`crate::docker::EnvReport`] into a single
+/// `(ok, message)` verdict (the row-by-row breakdown is `GET /api/setup/env`).
 async fn config_test(State(app): State<App>, Json(req): Json<TestReq>) -> Json<serde_json::Value> {
-    let cfg = app.config();
     let (ok, message) = match req.what.as_str() {
-        "proxmox" => test_ssh(&cfg.proxmox.ssh).await,
+        "docker" => {
+            let setup_complete = app.config().setup_complete;
+            let report = app.docker.self_setup(setup_complete).await;
+            collapse_env_report(&report)
+        }
         other => (false, format!("unknown test '{other}'")),
     };
     Json(json!({ "ok": ok, "message": message }))
 }
 
-async fn test_ssh(target: &str) -> (bool, String) {
-    if target.is_empty() {
-        return (false, "proxmox.ssh is not set".into());
+/// Collapse the self-setup report into a one-line `(ok, message)` verdict: `ok` iff nothing
+/// required failed; the message names the first failing required check (or a success line).
+fn collapse_env_report(report: &crate::docker::EnvReport) -> (bool, String) {
+    let env = report.to_setup_env();
+    let failing: Vec<&str> = env
+        .rows
+        .iter()
+        .filter(|r| r.required && !r.ok)
+        .map(|r| r.label.as_str())
+        .collect();
+    if failing.is_empty() {
+        let ver = report.daemon_version.as_deref().unwrap_or("reachable");
+        (true, format!("Docker {ver} — all required checks pass"))
+    } else {
+        (false, format!("failing: {}", failing.join(", ")))
     }
-    match tokio::process::Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, "true"])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => (true, "reachable".into()),
-        Ok(o) => (false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => (false, e.to_string()),
-    }
+}
+
+/// `GET /api/setup/env` — the setup wizard's environment preflight rows, from the cached
+/// self-setup report (`SetupEnv`: daemon reachability, self-container detection, sock mount,
+/// render node). The report is refreshed at startup + by `config_test("docker")`.
+async fn setup_env(State(app): State<App>) -> Json<wire::SetupEnv> {
+    Json(app.docker.env().await.to_setup_env())
 }
 
 // --- Claude accounts -------------------------------------------------------
@@ -654,28 +806,28 @@ async fn claude_swap(
         .into_iter()
         .find(|h| h.id == req.host)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
-    let ctid = host
-        .ctid
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{}' has no container", host.id)))?;
+    if !host.managed {
+        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", host.id)));
+    }
     let assignment = crate::claude::resolve_assignment(&app, Some(&req.account))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "no imported Claude accounts".into()))?;
     let selection = crate::claude::normalize_selection(Some(&req.account));
     let (group, email) = match assignment {
         crate::claude::Assignment::None => {
-            crate::claude::clear_clone_token(&app.config().proxmox.ssh, ctid)
+            crate::claude::clear_clone_token(&app, &host.id)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             app.claude.forget_pushed(&host.id);
             (None, None)
         }
         crate::claude::Assignment::Group { name, initial } => {
-            crate::claude::push_account_to_clone(&app, &host.id, ctid, &initial)
+            crate::claude::push_account_to_clone(&app, &host.id, &initial)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             (Some(name), Some(initial))
         }
         crate::claude::Assignment::Account(a) => {
-            crate::claude::push_account_to_clone(&app, &host.id, ctid, &a)
+            crate::claude::push_account_to_clone(&app, &host.id, &a)
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             (None, Some(a))
@@ -748,4 +900,124 @@ async fn chat_abort(State(app): State<App>, AxPath(id): AxPath<String>) -> Statu
         crate::chat::abort_chat(&app, &host).await;
     }
     StatusCode::NO_CONTENT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docker::ManagedContainer;
+    use wire::ImageInfo;
+
+    fn image(reference: &str) -> ImageInfo {
+        ImageInfo {
+            id: format!("sha256:{reference}"),
+            reference: reference.into(),
+            size_bytes: 0,
+            created_at: String::new(),
+            base: false,
+            created_from: None,
+            in_use_by: Vec::new(),
+        }
+    }
+    fn container_on(name: &str, image: &str) -> ManagedContainer {
+        ManagedContainer { name: name.into(), image: image.into(), running: true }
+    }
+
+    #[test]
+    fn in_use_by_maps_containers_by_creation_image() {
+        let mut images = vec![image("rmng/template:a"), image("rmng/template:b")];
+        let containers = vec![
+            container_on("h1", "rmng/template:a"),
+            container_on("h2", "rmng/template:a"),
+            container_on("h3", "rmng/template:b"),
+            container_on("h5", "rmng/template:z"), // image not in the list → ignored
+        ];
+        fill_in_use_by(&mut images, &containers);
+        assert_eq!(images[0].in_use_by, vec!["h1", "h2"]);
+        assert_eq!(images[1].in_use_by, vec!["h3"]);
+    }
+
+    #[test]
+    fn in_use_by_empty_when_no_containers_reference_it() {
+        let mut images = vec![image("rmng/template:a")];
+        let containers = vec![container_on("h1", "rmng/template:other")];
+        fill_in_use_by(&mut images, &containers);
+        assert!(images[0].in_use_by.is_empty());
+    }
+
+    // --- POST /api/images/pull (the endpoint that replaced /api/images/bootstrap) ---
+    //
+    // Handlers are called directly: `State`/`Json` are public tuple structs, so no HTTP
+    // harness is needed. Docker is absent in tests, so a `start_pull` that passes the guards
+    // spawns a background pull that fails later — but the test never yields (current-thread
+    // runtime), so the returned op is observed before that task runs.
+
+    use std::sync::Arc;
+
+    fn test_app() -> App {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rmng-web-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
+        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        App::new(store, cfg)
+    }
+
+    #[tokio::test]
+    async fn images_pull_rejects_bad_name() {
+        let app = test_app();
+        let err = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "Bad Name".into(), reference: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("DNS label"), "msg: {}", err.1);
+        // A rejected request registers no op.
+        assert!(app.store.get().operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn images_pull_registers_pull_op_and_defaults_reference() {
+        let app = test_app();
+        // `reference: None` → defaults to config.docker.template_reference (no panic; op made).
+        let op = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "my-base".into(), reference: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(op.kind, wire::OperationKind::Pull);
+        assert_eq!(op.target, "my-base");
+        assert_eq!(op.status, wire::OperationStatus::Running);
+        // The op is registered in state (the wizard watches it over /events).
+        assert!(app.store.get().operations.iter().any(|o| o.id == op.id));
+    }
+
+    #[tokio::test]
+    async fn images_pull_rejects_duplicate_in_flight() {
+        let app = test_app();
+        // A blank reference also defaults; the first pull registers a Running op.
+        let _first = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "dup".into(), reference: Some("   ".into()) }),
+        )
+        .await
+        .unwrap();
+        // A second pull for the same target is rejected while the first is in flight.
+        let err = images_pull(
+            State(app.clone()),
+            Json(PullReq { name: "dup".into(), reference: Some("pegasis0/rmng-template:latest".into()) }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("already being pulled"), "msg: {}", err.1);
+    }
 }

@@ -16,8 +16,10 @@
 //! we read `claude auth status` to confirm the login + identity, read the pair straight
 //! off the clone's `~/.claude/.credentials.json`, then **delete that file from the
 //! clone** so its Claude Code can never rotate (and thus invalidate) the refresh token
-//! the server now owns. All clone commands run via the Proxmox node (`pct exec`), like
-//! the rest of orchestration. (Codex accounts are out of scope here — TODO if needed.)
+//! the server now owns. All clone commands run over `docker exec` (via
+//! [`crate::provision::run_clone_op`]), replacing the retired Proxmox `pct exec` path — the
+//! clone is addressed by its container name (== host id). (Codex accounts are out of scope
+//! here — TODO if needed.)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,9 +54,6 @@ const ROTATE_MAX_FIVE_HOUR_PCT: f64 = 90.0;
 /// account switch always cold-starts the clone's Anthropic prompt cache, so staying
 /// put is cheaper than perfect spread.
 const ROTATE_SECS: u64 = 600;
-const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
-/// The user every clone runs Claude Code (and everything else) as.
-const CLONE_USER: &str = "rmng";
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -213,11 +212,6 @@ pub struct ImportResult {
     pub cleared: bool,
 }
 
-/// POSIX single-quote escaping (args reach the node's shell verbatim).
-fn sq(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 /// The `{…}` substring of `s` (login-shell noise can wrap the JSON), else trimmed `s`.
 fn extract_json(s: &str) -> &str {
     match (s.find('{'), s.rfind('}')) {
@@ -226,49 +220,14 @@ fn extract_json(s: &str) -> &str {
     }
 }
 
-/// Run one [`claude-import.sh`] op (`status`|`read`|`clear`|`apply`) inside clone
-/// `ctid` via the Proxmox node, returning its raw stdout. `extra` are extra positional
-/// args (e.g. the base64 credentials for `apply`). `status` never fails (stderr merged
-/// in); the others surface a non-zero exit as an error.
-async fn run_clone_op(ssh_target: &str, ctid: u32, op: &str, extra: &[&str]) -> Result<String> {
-    if ssh_target.is_empty() {
-        bail!("proxmox.ssh is not set; cannot reach the node to run a clone command");
-    }
-    let mut remote = format!("bash -s -- {} {} {}", ctid, sq(CLONE_USER), sq(op));
-    for a in extra {
-        remote.push(' ');
-        remote.push_str(&sq(a));
-    }
-    let mut child = tokio::process::Command::new("ssh")
-        .args([
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=15",
-            ssh_target, &remote,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    use tokio::io::AsyncWriteExt;
-    child.stdin.take().unwrap().write_all(IMPORT_SCRIPT.as_bytes()).await?;
-    let out = child.wait_with_output().await?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let tail = String::from_utf8_lossy(&out.stderr);
-        bail!("clone op '{op}' failed (exit {:?}): {}", out.status.code(), tail.trim());
-    }
-}
-
 /// Confirm clone `host` is signed in to Claude Code via **claude.ai** (not an API
 /// key) and return its account identity. Used both to validate up front (so the UI
 /// can show the account before the operator mints a token) and inside import.
 pub async fn check_clone_auth(app: &App, host: &Host) -> Result<AuthStatus> {
-    let ctid = host
-        .ctid
-        .with_context(|| format!("host '{}' has no container; only clones can be imported", host.id))?;
-    let raw = run_clone_op(&app.config().proxmox.ssh, ctid, "status", &[]).await?;
+    if !host.managed {
+        bail!("host '{}' is not a managed clone; only clones can be imported", host.id);
+    }
+    let raw = crate::provision::run_clone_op(app, &host.id, "status", &[]).await?;
     let status: AuthStatus = serde_json::from_str(extract_json(&raw)).map_err(|_| {
         anyhow::anyhow!(
             "couldn't read `claude auth status` on '{}' — is Claude Code installed and the clone running? (got: {})",
@@ -294,10 +253,9 @@ pub async fn check_clone_auth(app: &App, host: &Host) -> Result<AuthStatus> {
 /// store (by id), then **delete that file from the clone** so it can't rotate /
 /// invalidate the refresh token the server now owns.
 pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult> {
-    let ctid = host
-        .ctid
-        .with_context(|| format!("host '{}' has no container; only clones can be imported", host.id))?;
-    let ssh = app.config().proxmox.ssh;
+    if !host.managed {
+        bail!("host '{}' is not a managed clone; only clones can be imported", host.id);
+    }
 
     // 1. Confirm the login + learn the account identity (email / org).
     let status = check_clone_auth(app, host).await?;
@@ -305,7 +263,7 @@ pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult
     let org_uuid = status.org_id.clone().unwrap_or_default();
 
     // 2. Read the OAuth pair straight off the clone's disk.
-    let raw = run_clone_op(&ssh, ctid, "read", &[])
+    let raw = crate::provision::run_clone_op(app, &host.id, "read", &[])
         .await
         .with_context(|| format!("reading '{}' Claude credentials", host.id))?;
     let oauth = serde_json::from_str::<ClaudeCreds>(extract_json(&raw))
@@ -344,7 +302,7 @@ pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult
     //    token we just took ownership of. Best-effort: the account is already stored.
     //    Forget the clone's pushed record too — if it has an assigned account, the
     //    next reconcile pass restores that token over the file we just deleted.
-    let cleared = match run_clone_op(&ssh, ctid, "clear", &[]).await {
+    let cleared = match crate::provision::run_clone_op(app, &host.id, "clear", &[]).await {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!("import: clearing '{}' credentials failed: {e}", host.id);
@@ -855,10 +813,10 @@ pub async fn rotate_once(app: &App) {
     if cfg.clone_groups.is_empty() {
         return;
     }
-    // group name -> its bound clones (with a container)
+    // group name -> its bound managed clones
     let mut by_group: HashMap<String, Vec<Host>> = HashMap::new();
     for h in &app.store.get().hosts {
-        if let (Some(g), Some(_)) = (&h.claude_group, h.ctid) {
+        if let (Some(g), true) = (&h.claude_group, h.managed) {
             by_group.entry(g.clone()).or_default().push(h.clone());
         }
     }
@@ -880,8 +838,7 @@ pub async fn rotate_once(app: &App) {
             if host.claude_account_email.as_deref() == Some(email.as_str()) {
                 continue; // unchanged (sticky keep) → no rewrite
             }
-            let ctid = host.ctid.expect("filtered to Some(ctid)");
-            match push_account_to_clone(app, &host.id, ctid, &email).await {
+            match push_account_to_clone(app, &host.id, &email).await {
                 Ok(()) => {
                     tracing::info!(
                         "rotate: {} {} -> {}",
@@ -898,7 +855,7 @@ pub async fn rotate_once(app: &App) {
                 }
                 Err(e) => tracing::warn!("rotate: applying {email} to {} failed: {e}", host.id),
             }
-            tokio::time::sleep(STAGGER).await; // gentle on the node
+            tokio::time::sleep(STAGGER).await; // gentle on the daemon
         }
     }
 }
@@ -924,18 +881,18 @@ fn credentials_json(token: &str) -> String {
     )
 }
 
-/// Install an access token into clone `ctid`'s `~/.claude/.credentials.json` via the
-/// Proxmox node (`pct exec`, fish-proof). Hot-swaps a running clone with **no**
-/// agent-wrapper restart — Claude Code re-reads the file at request time. Best-effort;
-/// errors are returned to log. Low-level: callers that target an assigned host should
-/// go through [`push_account_to_clone`] / [`push_stale_tokens`] so the push is recorded.
-pub async fn apply_clone_token(ssh_target: &str, ctid: u32, token: &str) -> Result<()> {
+/// Install an access token into clone `host_id`'s `~/.claude/.credentials.json` over
+/// `docker exec` (via [`crate::provision::run_clone_op`], fish-proof). Hot-swaps a running
+/// clone with **no** agent-wrapper restart — Claude Code re-reads the file at request time.
+/// Best-effort; errors are returned to log. Low-level: callers that target an assigned host
+/// should go through [`push_account_to_clone`] / [`push_stale_tokens`] so the push is recorded.
+pub async fn apply_clone_token(app: &App, host_id: &str, token: &str) -> Result<()> {
     let token = token.trim();
     if !token.starts_with("sk-ant-") {
         bail!("refusing to apply a non-`sk-ant-` token");
     }
-    let b64 = crate::orchestrate::b64_encode(credentials_json(token).as_bytes());
-    let out = run_clone_op(ssh_target, ctid, "apply", &[&b64]).await?;
+    let b64 = crate::provision::b64_encode(credentials_json(token).as_bytes());
+    let out = crate::provision::run_clone_op(app, host_id, "apply", &[&b64]).await?;
     if out.contains("OK") {
         Ok(())
     } else {
@@ -943,11 +900,11 @@ pub async fn apply_clone_token(ssh_target: &str, ctid: u32, token: &str) -> Resu
     }
 }
 
-/// Remove clone `ctid`'s `~/.claude/.credentials.json` via the Proxmox node, leaving it
+/// Remove clone `host_id`'s `~/.claude/.credentials.json` over `docker exec`, leaving it
 /// with no Claude token. Used when a clone's account is set to "none" (unassigned) —
 /// callers should also [`ClaudeStore::forget_pushed`] the host.
-pub async fn clear_clone_token(ssh_target: &str, ctid: u32) -> Result<()> {
-    let out = run_clone_op(ssh_target, ctid, "clear", &[]).await?;
+pub async fn clear_clone_token(app: &App, host_id: &str) -> Result<()> {
+    let out = crate::provision::run_clone_op(app, host_id, "clear", &[]).await?;
     if out.contains("CLEARED") {
         Ok(())
     } else {
@@ -955,12 +912,12 @@ pub async fn clear_clone_token(ssh_target: &str, ctid: u32) -> Result<()> {
     }
 }
 
-/// Refresh-if-needed and install `email`'s access token into clone `host_id`/`ctid`,
-/// recording the push so the reconcile pass doesn't repeat it. If the refresh rotated
-/// the token, fan it out to the account's other clones in the background.
-pub async fn push_account_to_clone(app: &App, host_id: &str, ctid: u32, email: &str) -> Result<()> {
+/// Refresh-if-needed and install `email`'s access token into clone `host_id` (== its
+/// container name), recording the push so the reconcile pass doesn't repeat it. If the
+/// refresh rotated the token, fan it out to the account's other clones in the background.
+pub async fn push_account_to_clone(app: &App, host_id: &str, email: &str) -> Result<()> {
     let (token, rotated) = fresh_access_token(app, email).await?;
-    apply_clone_token(&app.config().proxmox.ssh, ctid, &token).await?;
+    apply_clone_token(app, host_id, &token).await?;
     app.claude.pushed.lock().unwrap().insert(host_id.to_string(), token);
     if rotated {
         let app = app.clone();
@@ -976,22 +933,22 @@ pub async fn push_account_to_clone(app: &App, host_id: &str, ctid: u32, email: &
 /// unreachable) stays stale and is retried next pass. The pushed map is in-memory, so
 /// the first pass after a server restart re-pushes every assigned clone.
 pub async fn push_stale_tokens(app: &App) {
-    let ssh = app.config().proxmox.ssh;
     let mut first = true;
     for host in app.store.get().hosts {
-        let (Some(ctid), Some(email)) = (host.ctid, host.claude_account_email.as_deref()) else {
+        let Some(email) = host.claude_account_email.as_deref() else { continue };
+        if !host.managed {
             continue;
-        };
+        }
         let Some(acct) = app.claude.get_by_email(email) else { continue };
         let stale = app.claude.pushed.lock().unwrap().get(&host.id) != Some(&acct.access_token);
         if !stale {
             continue;
         }
         if !first {
-            tokio::time::sleep(STAGGER).await; // gentle on the node
+            tokio::time::sleep(STAGGER).await; // gentle on the daemon
         }
         first = false;
-        match apply_clone_token(&ssh, ctid, &acct.access_token).await {
+        match apply_clone_token(app, &host.id, &acct.access_token).await {
             Ok(()) => {
                 app.claude.pushed.lock().unwrap().insert(host.id.clone(), acct.access_token);
                 tracing::info!("pushed fresh token ({email}) to {}", host.id);
@@ -1020,7 +977,9 @@ async fn auto_swap_exhausted(app: &App) {
         if host.claude_group.is_some() {
             continue;
         }
-        let Some(ctid) = host.ctid else { continue };
+        if !host.managed {
+            continue;
+        }
         let Some(cur) = &host.claude_account_email else { continue };
         if !exhausted(cur) {
             continue;
@@ -1029,7 +988,7 @@ async fn auto_swap_exhausted(app: &App) {
         if &next == cur || exhausted(&next) {
             continue; // no better option
         }
-        match push_account_to_clone(app, &host.id, ctid, &next).await {
+        match push_account_to_clone(app, &host.id, &next).await {
             Ok(()) => {
                 tracing::info!("auto-swapped {} from {cur} to {next}", host.id);
                 let id = host.id.clone();
@@ -1144,7 +1103,7 @@ mod tests {
         email.to_string()
     }
     fn clone_host(id: &str, cur: Option<&str>) -> Host {
-        Host { id: id.into(), ctid: Some(1), claude_account_email: cur.map(str::to_string), ..Default::default() }
+        Host { id: id.into(), managed: true, claude_account_email: cur.map(str::to_string), ..Default::default() }
     }
 
     #[test]

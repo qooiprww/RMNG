@@ -37,8 +37,9 @@ Tool result `content` items are either `{ "type":"text", "text":"…" }` or
 
 ## Per-clone MCP (control-server `:9002`)
 
-IP-routed: the calling clone is matched against `hosts[].host`; no `clone` argument. Exposes
-exactly one tool.
+Header-routed: the caller self-identifies with its clone id (== hostname) in the
+`x-rmng-clone` header — the agent-wrapper sets it on its MCP server config; no `clone`
+argument. Exposes exactly one tool.
 
 ### `set_state` — `{ report?: "working"|"idle", note?: string }`
 Record the agent's desktop verdict + note for the calling clone (sets `agentReport` /
@@ -60,12 +61,17 @@ clone → `"unknown clone"`; an unreachable daemon → `"clone-daemon MCP unreac
 |---|---|---|
 | `list_hosts` | — | JSON of `hosts[]` + state |
 | `select` | `clone` | set the viewer's selected host |
-| `clone` | `source`, `hostname` | start a CoW clone → `"clone started: op …"` |
+| `clone` | `image`, `hostname` | clone from a source image (`rmng/template:<name>`) → `"clone started: op …"` |
 | `delete` | `clone` | delete a host → `"delete started: op …"` |
-| `redeploy` | `clone`, `daemonOnly?` | hot-swap daemon (+agent) binaries |
 | `claude_recommended` | — | `{email}` recommended account |
 | `claude_swap` | `clone`, `account?` (email/`auto`) | hot-swap the clone's Claude account |
 | `set_state` | `clone`, `report?`, `note?` | as per-clone, but clone from the arg |
+| `send_message` | `clone`, `text` | send a chat message to the clone's host agent (async — the turn runs detached; `409`-style error if one is already running) → `"message sent to …"` |
+| `read_chat` | `clone` | the host-agent chat history + live working state: `{ busy, activity?, messages[] }` |
+
+> There is no `redeploy` tool (and no `/api/clone/redeploy` endpoint) any more — clone
+> binaries hot-swap themselves automatically. See
+> [DEPLOY.md#upgrades](DEPLOY.md#upgrades).
 
 ### Proxied desktop/window tools
 
@@ -89,9 +95,9 @@ its per-monitor latest-dmabuf (screenshots via `media::screenshot_png`), and gno
 | `list_monitors` | — | `[{id,width,height}]` |
 | `screenshot` | `monitor?`=0 | PNG of the monitor's latest captured frame (image). Errors if no frame buffered yet |
 | `mouse_move` | `x`, `y`, `monitor?`=0 | clamp to monitor bounds, eased glide (10 steps ≈100 ms); **emits a cursor-warp** to the viewer each step; settle + screenshot |
-| `left_click` / `right_click` / `middle_click` | `x?`, `y?`, `monitor?`=0 | optional jump-move, then press (`0x110`/`0x111`/`0x112`) → 50 ms → release; settle + screenshot |
-| `left_double_click` | `x?`, `y?`, `monitor?`=0 | two left presses 80 ms apart; settle + screenshot |
-| `scroll` | `amount` (clamped ±15), `x?`, `y?`, `monitor?`=0 | optional jump-move, then `amount` discrete vertical notches 25 ms apart; settle + screenshot |
+| `left_click` / `right_click` / `middle_click` | `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then press (`0x110`/`0x111`/`0x112`) → 50 ms → release; settle + screenshot |
+| `left_double_click` | `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then two left presses 80 ms apart; settle + screenshot |
+| `scroll` | `amount` (clamped ±15), `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then `amount` discrete vertical notches 25 ms apart; settle + screenshot |
 | `key` | `keys` (e.g. `"ctrl+c"`, `"alt+Tab"`, `"Return"`) | parse combo → press in order, release in reverse (X11 keysyms); settle + screenshot |
 | `type` | `text` | per-char keysym press/release, 12 ms apart (full Unicode); returns `"typed N chars"` |
 

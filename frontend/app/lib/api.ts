@@ -1,5 +1,7 @@
 import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
 import type { ConfigPutResponse } from "~/lib/wire/ConfigPutResponse";
+import type { ImageInfo } from "~/lib/wire/ImageInfo";
+import type { SetupEnv } from "~/lib/wire/SetupEnv";
 
 // Client-side API wrappers. Each POSTs JSON; the server mutates state and
 // broadcasts, so the caller doesn't need the response beyond error handling —
@@ -41,30 +43,34 @@ export type ClonePayload = (
 export const activate = (id: string | null) =>
   postJson("/api/activate", { id });
 export const reorder = (order: string[]) => postJson("/api/reorder", { order });
-export const cloneHost = (source: string, payload: ClonePayload) =>
-  postJson("/api/clone", { source, ...payload });
+/** Start a clone from a source image (`image` = a canonical reference from
+ *  `listImages`, e.g. `rmng/template:my-base`). Progress streams over /events. */
+export const cloneHost = (image: string, payload: ClonePayload) =>
+  postJson("/api/clone", { image, ...payload });
 export const deleteHost = (id: string) => postJson("/api/delete", { id });
-/** Provision a brand-new template CT from the fixed Ubuntu 26.04 base image (the
- *  only base the patched GNOME is built for), with resources from the New-template
- *  modal. The new CT is registered as a clonable template. Progress streams over
- *  /events like a clone. (Bootstrap errors are plain text, so read the body as
- *  text on failure.) */
-export async function bootstrapTemplate(
-  hostname: string,
-  resources: { cores: number; memoryMb: number; diskGb: number },
-): Promise<{ id: string }> {
-  const res = await fetch("/api/template/bootstrap", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ hostname, ...resources }),
-  });
-  if (!res.ok) throw new Error((await res.text().catch(() => "")) || res.statusText);
-  return res.json().catch(() => ({})) as Promise<{ id: string }>;
-}
-/** Hot-swap a clone's clone-daemon (+ agent-wrapper unless daemonOnly) binaries from the
- *  control-server's embedded copies, without reprovisioning. Restarts the unit(s). */
-export const redeployClone = (id: string, daemonOnly = false) =>
-  postJson("/api/clone/redeploy", { id, daemonOnly });
+
+// --- images (clone-source templates) ---------------------------------------
+
+/** The clone-source images (`rmng.image=1`); each carries the host ids of live
+ *  clones running on it (`inUseBy`). Powers the sidebar Images section + the
+ *  clone dialog's image picker. */
+export const listImages = () => getJson("/api/images") as Promise<ImageInfo[]>;
+/** Pull the clone template from a registry (`reference`, e.g. `pegasis0/rmng-template:latest`)
+ *  and retag it locally as `rmng/template:<name>`. Omitted/blank `reference` falls back
+ *  server-side to `docker.templateReference`. Returns the driving Operation (kind `pull`);
+ *  progress streams over /events. */
+export const pullTemplate = (name: string, reference?: string) =>
+  postJson("/api/images/pull", { name, reference });
+/** Commit a running clone to a new clone-source image `rmng/template:<name>`.
+ *  Returns the driving Operation (kind `commit`); progress streams over /events. */
+export const commitImage = (host: string, name: string) =>
+  postJson("/api/images/commit", { host, name });
+/** Remove a clone-source image by reference. 409 (with a "…in use by…" message)
+ *  when a live clone or a running op still references it. */
+export const deleteImage = (reference: string) =>
+  postJson("/api/images/delete", { reference });
+/** The environment preflight rows for the setup wizard's first step. */
+export const getSetupEnv = () => getJson("/api/setup/env") as Promise<SetupEnv>;
 
 /** Force an immediate Claude usage poll (refresh tokens + fetch 5h/7d). */
 export const refreshClaudeUsage = () => postJson("/api/claude/refresh", {});
@@ -109,10 +115,14 @@ async function putJson(url: string, body: unknown): Promise<unknown> {
 export const getConfig = () => getJson("/api/config") as Promise<AppConfigRedacted>;
 /** Merge a partial config update (empty-string secrets are left unchanged), persist,
  *  apply live. Returns the new redacted config plus whether a restart is required to
- *  apply restart-scoped settings (ports, cloneSocket, staticDir, chroma). */
+ *  apply restart-scoped settings (ports, cloneSocket, staticDir, chroma). When the
+ *  patch flips `setupComplete` (wizard finish), the server also ensures the `rmng`
+ *  network; a non-fatal failure rides along as `networkWarning`. */
 export const putConfig = (patch: unknown) =>
-  putJson("/api/config", patch) as Promise<ConfigPutResponse>;
-/** Validate a setting (e.g. `proxmox` SSH reachability). */
+  putJson("/api/config", patch) as Promise<
+    ConfigPutResponse & { networkWarning?: string }
+  >;
+/** Validate a setting (e.g. `"docker"` — re-runs the Docker self-setup probe). */
 export const testConfig = (what: string) =>
   postJson("/api/config/test", { what }) as Promise<{ ok: boolean; message: string }>;
 /** Apply the saved monitor layout to all running clones (rewrites RMNG_MONITORS +

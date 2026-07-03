@@ -1,8 +1,7 @@
 # HTTP API reference — web port (default `:9000`)
 
-The control-server's **port 2** serves the React management UI (embedded SPA), the
-JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}` with
-`ConnectInfo::<SocketAddr>` (the source IP is used by `/api/detector-feedback`).
+The control-server's **port 2** serves the React management UI (a static SPA served from
+disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}`.
 
 - **No auth.** All endpoints are open; the server is meant to sit behind a tailnet /
   firewall. Path params that hit the filesystem (`notes`, `uploads`) are validated as
@@ -19,22 +18,25 @@ JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}` with
 
 | Method | Path | Purpose | Success |
 |---|---|---|---|
-| GET | `/events` | Global state SSE (snapshot + diffs) | 200 SSE `ControlState` |
+| GET | `/events` | Global state SSE (snapshot + diffs) + named `stats` event | 200 SSE `ControlState` |
 | POST | `/api/activate` | Select the host shown in the viewer | 200 `ControlState` |
 | POST | `/api/reorder` | Reorder the host list | 200 `ControlState` |
-| POST | `/api/clone` | Start a CoW clone (Linear ticket / new ticket / plain) | 200 `{ok, op}` |
-| POST | `/api/template/bootstrap` | Build a fresh template/clone from the base image | 200 `Operation` |
-| POST | `/api/clone/redeploy` | Hot-swap a clone's daemon (+agent) binaries | 200 `{ok}` |
+| POST | `/api/clone` | Start a clone from an image (Linear ticket / new ticket / plain) | 200 `{ok, op}` |
 | POST | `/api/monitors/apply` | Push the saved monitor layout to all running clones | 200 `{ok,applied,errors}` |
 | POST | `/api/delete` | Destroy a clone / unregister a plain host | 200 `Operation` |
+| GET | `/api/setup/env` | Setup wizard environment preflight rows | 200 `SetupEnv` |
+| GET | `/api/images` | List clone-source images (`rmng.image=1`) | 200 `ImageInfo[]` |
+| POST | `/api/images/pull` | Pull the clone template from a registry and tag it `rmng/template:<name>` | 200 `Operation` |
+| POST | `/api/images/commit` | Commit a running clone to a new image | 200 `Operation` |
+| POST | `/api/images/delete` | Remove a clone-source image | 200 `{ok}` |
 | GET | `/api/notes/:id` | Fetch a host's rich-text notes | 200 `[block]` |
 | POST | `/api/notes/:id` | Save a host's notes | 204 |
 | POST | `/api/upload` | Upload an image (multipart) | 200 `{url}` |
 | GET | `/uploads/:file` | Serve an uploaded image | 200 binary |
 | POST | `/api/detector-feedback` | Clone reports a wrong needs-human verdict (multipart) | 200 `{ok,id,host}` |
 | GET | `/api/config` | Current config, secrets redacted | 200 `AppConfigRedacted` |
-| PUT | `/api/config` | Merge a partial config update (persists 0600) | 200 `{ config: AppConfigRedacted, restartRequired }` |
-| POST | `/api/config/test` | Test a setting (currently Proxmox SSH) | 200 `{ok,message}` |
+| PUT | `/api/config` | Merge a partial config update (persists 0600) | 200 `{ config, restartRequired, networkWarning? }` |
+| POST | `/api/config/test` | Test a setting (currently `"docker"`) | 200 `{ok,message}` |
 | POST | `/api/claude/import/check` | Check a clone is signed in via claude.ai | 200 `{ok,email,orgName,subscriptionType}` |
 | POST | `/api/claude/import` | Import a Claude account from a signed-in clone | 200 `{ok,email,cleared}` |
 | POST | `/api/claude/refresh` | Force one usage poll now | 200 `{ok,rateLimited}` |
@@ -47,8 +49,9 @@ JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}` with
 | POST | `/api/chat/:id/abort` | Abort the in-flight agent turn | 204 |
 | GET | `/*` | SPA fallback (embedded frontend) | 200 asset / `index.html` |
 
-Error statuses: `400` validation, `404` unknown id/file, `409` chat busy, `500` server
-(I/O, SSH), `502` agent-wrapper unreachable. Error bodies are a plain string or `{error}`.
+Error statuses: `400` validation, `404` unknown id/file, `409` chat busy / image still in
+use, `500` server (I/O), `502` the Docker daemon or agent-wrapper is unreachable. Error bodies
+are a plain string or `{error}`.
 
 ---
 
@@ -65,16 +68,31 @@ keeps the connection alive. This is what the dashboard subscribes to.
 |---|---|---|
 | `selected` | `string?` | host id shown in the viewer |
 | `monitors` | `MonitorSpec[]` | global desired layout |
-| `hosts` | `Host[]` | all registered clones/templates/plain hosts |
-| `operations` | `Operation[]` | in-flight + recent clone/delete jobs |
-| `templates` | `string[]` | host ids that are templates |
+| `hosts` | `Host[]` | all registered clones + plain hosts |
+| `operations` | `Operation[]` | in-flight + recent clone/delete/pull/commit jobs |
 | `claude_accounts` | `ClaudeUsage[]` | per-account 5h/7d usage + spend |
 
-`Host` carries connection info (`id`, `host`, `port`, `username`, …), the Proxmox `ctid`,
-the assigned `claude_account_email`, Linear metadata (`linear_workspace`, `linear_ticket`,
-`linear_branch`, …), `agent_report` (working/idle), `state_note`, and `monitor_state`
-(working/idle/offline). `Operation` carries `id`, `kind` (clone/delete), `target`,
-`status`, `step`, `pct`, a rolling `log`, `ctid`, and timestamps.
+`Host` carries connection info (`id`, `host`, `port`, `username`, …), the `managed` flag
+(true = a Docker container named after the host id backs it; false = a plain unmanaged
+row), the `source` image reference, the assigned
+`claude_account_email`, Linear metadata (`linear_workspace`, `linear_ticket`, `linear_branch`,
+…), `agent_report` (working/idle), `state_note`, and `monitor_state` (working/idle/offline).
+`Operation` carries `id`, `kind` (clone/delete/pull/commit — a persisted legacy `"bootstrap"`
+op still loads, aliased onto `pull`), `target`, `source`, `status`, `step`, `pct`, a rolling
+`log`, and timestamps.
+
+### `stats` event
+The same `/events` connection multiplexes a second, named SSE event: `stats`, a live
+`{ <hostId>: ContainerStats }` map for running **managed** clones only (a stopped or
+unmanaged host contributes no entry). `ContainerStats` ([control.rs](../crates/wire/src/control.rs)):
+`cpuPct` (percentage of ONE core — 100 == a single fully-used core, so a container busy
+across several cores reads > 100; docker-CLI convention), `memUsed`/`memLimit` (bytes,
+docker-CLI semantics). Sampled by the monitor poller alongside its 4 s `/status` probe
+([monitor.rs](../crates/control-server/src/monitor.rs)); a new subscriber gets the latest
+map immediately, then one push per tick — but only when the map actually changed (deduped
+by value, not serialization, so an idle fleet doesn't wake subscribers). Deliberately kept
+out of `ControlState`/`state.json`: these numbers move every tick, and every `ControlState`
+mutation persists the file, so folding stats in would rewrite it every 4 s.
 
 ---
 
@@ -92,14 +110,14 @@ Reorder `hosts` by the given list of ids. Returns the updated `ControlState`.
 ## Clone lifecycle
 
 ### `POST /api/clone`
-Start a Copy-on-Write clone from a source host. Runs async — returns an `Operation` id
+Start a clone container from a clone-source image. Runs async — returns an `Operation` id
 immediately; progress flows over `/events`. After the clone is up the server kicks off the
 agent's first message ([chat::kickoff_agent](../crates/control-server/src/chat.rs)).
 
 Body (one of three task modes + optional account/instructions):
 ```jsonc
 {
-  "source": "rmng-template",          // required: source host id
+  "image": "rmng/template:base",      // required: clone-source image reference (from GET /api/images)
   // -- pick ONE task mode --
   "ticket": "DEV-123",              // existing Linear ticket, OR
   "create": { "team": "dev", "title": "...", "description": "..." },      // new ticket, OR
@@ -115,31 +133,80 @@ Body (one of three task modes + optional account/instructions):
   "claudeInstructions": "..."       // extra instructions for Claude Code
 }
 ```
-The selected preset's vars are written into the clone's session env, plus
-`LINEAR_API_KEY=<preset key>` (auths the clone's `linear` MCP).
-Hostname is derived (`pega-{ticket}` or a slug of the plain title, with a numeric suffix on
-collision). Returns `{ "ok": true, "op": Operation }` or `400 {error}`.
+`image` accepts a `rmng/template:<name>` reference, a full `sha256:…` id, or a bare 64-hex id;
+whatever form is passed is canonicalized to the reference and recorded on the host as
+`source`. The image must carry the `rmng.image=1` label (a raw non-image id is rejected). The
+selected preset's vars are written into the clone's session env, plus `LINEAR_API_KEY=<preset
+key>` (auths the clone's `linear` MCP). Hostname is derived (`pega-{ticket}` or a slug of the
+plain title, with a numeric suffix on collision). Returns `{ "ok": true, "op": Operation }` or
+`400 {error}`.
 
-### `POST /api/template/bootstrap` — body `{ "hostname": string, "cores"?: u32, "memoryMb"?: u32, "diskGb"?: u32 }`
-Build a brand-new container from the fixed Ubuntu 26.04 base image (full provisioning, not
-CoW): headless GNOME + clone-daemon + agent-wrapper + the patched gnome-shell deb. The base
-image is not configurable — the patched gnome-shell is compiled against Ubuntu 26.04's GNOME
-only. Resources default to 16 cores / 32768 MB / 128 GB when omitted. Returns the
-`Operation`. Use this once to create the golden template; thereafter clone from it.
-
-### `POST /api/clone/redeploy` — body `{ "id": string, "daemonOnly"?: bool }`
-Hot-swap a running clone's `clone-daemon` (+ `agent-wrapper` unless `daemonOnly`) from the
-control-server's embedded copies, without reprovisioning (~10 s). The daemon reconnects to
-the media socket; with `daemonOnly` the Claude session stays alive. Returns `{ok}`.
+> There is no `/api/clone/redeploy` endpoint (and no fleet MCP `redeploy` tool) any more.
+> Clone binaries (`clone-daemon`/`agent-wrapper`) hot-swap themselves automatically — a hash
+> check on the daemon's `Hello` plus a periodic sweep — see
+> [DEPLOY.md#upgrades](DEPLOY.md#upgrades).
 
 ### `POST /api/monitors/apply`
-Push `config.monitors` to every running clone (those with a `ctid`): rewrites each clone's
-`RMNG_MONITORS` + dummy mode specs and restarts its GNOME + daemon. Returns
+Push `config.monitors` to every running clone (those with a `container`): rewrites each
+clone's `RMNG_MONITORS` + dummy mode specs and restarts its GNOME + daemon. Returns
 `{ "ok": bool, "applied": string[], "errors": string[] }` (partial success allowed).
 
 ### `POST /api/delete` — body `{ "id": string }`
-Destroy a managed clone (stops + removes the CT and its thin snapshot) or unregister a
-plain host. Returns the `Operation`; progress over `/events`.
+Destroy a managed clone (stops it with `SIGRTMIN+3`, removes the container and its
+`rmng-dind-<id>` inner-Docker volume) or unregister a plain host. Returns the `Operation`;
+progress over `/events`.
+
+---
+
+## Images (clone-source templates) & setup
+
+Clone sources are images labeled `rmng.image=1`, repo `rmng/template:<name>` — there is no
+golden-CT / CoW model. `POST` bodies (references contain `/` and `:`, so nothing uses path
+params).
+
+### `GET /api/images` → `ImageInfo[]`
+List clone-source images, newest first. Each `ImageInfo` carries `id` (`sha256:…`),
+`reference` (`rmng/template:<name>`), `size_bytes`, `created_at`, `base` (true for the
+published clone template, `rmng.base=1`), `created_from` (lineage, `rmng.created-from`), and
+`in_use_by` (host ids of live clones whose `source` is this image). `502` if the daemon is
+unreachable.
+
+### `POST /api/images/pull` — body `{ "name": string, "reference"?: string }`
+Pull the clone template from a registry and retag it locally as `rmng/template:<name>`. `name`
+is a bare DNS label; the server prepends the repo. `reference` is a registry `repo:tag` to pull
+from — absent/blank defaults to `config.docker.templateReference` (default
+`pegasis0/rmng-template:latest`); see
+[DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template) for how that image is
+built and published. Rejects a name that already exists, a blank reference, and a
+`repo@sha256:…` digest reference (pull a `repo:tag` instead). Verifies the pulled image
+carries the `rmng.image=1` label **before** retagging (else it isn't an RMNG template) and
+warns — without refusing — if its `StopSignal` isn't `SIGRTMIN+3`. Returns the driving
+`Operation` (kind `pull`, which the setup wizard's "Download template" step watches for,
+showing aggregate byte progress). Replaces the retired in-product `/api/images/bootstrap`
+build — no base OS is built in-product any more, only pulled pre-built.
+
+### `POST /api/images/commit` — body `{ "host": string, "name": string }`
+Commit a running managed clone (`host`) to a new clone-source image `rmng/template:<name>`
+(kind `commit`). `docker commit` **excludes volume mounts**, so the clone's inner-Docker state
+(`/var/lib/docker`) never enters the image — clones always start with an empty inner Docker.
+On-disk credentials in the clone's home **are** baked in (logged as a warning). Rejects a name
+that already exists.
+
+### `POST /api/images/delete` — body `{ "reference": string }` → `{ok}`
+Remove a clone-source image. `409` if any host still runs on it (`in_use_by` non-empty) or a
+running operation (clone/commit/pull) references it as its source or target; the daemon's own
+"in use by a container" `409` is surfaced too. Deleting a pulled template's local
+`rmng/template:<name>` tag only untags it while the registry tag is still attached to the same
+layers — the image re-lists under that remaining reference; delete again to actually free them
+(see [DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template)).
+
+### `GET /api/setup/env` → `SetupEnv`
+The setup wizard's environment preflight: `{ rows: EnvCheckRow[] }`, each row `{ id, label,
+ok, detail, required }`. Rows, in order: **Docker daemon** reachable (`dockerDaemon`,
+required), **control-server container** detected (`selfContainer`, info — absence = dev mode),
+**clone media socket mount** at `/srv/rmng-sock` (`sockMount`, required), **GPU render node**
+`/dev/dri/renderD128` (`renderNode`, required). Cached from the Docker self-setup probe
+(refreshed at startup and by `POST /api/config/test {docker}`).
 
 ---
 
@@ -161,10 +228,11 @@ Serve an uploaded image by its generated `<16-hex>.<ext>` name, with the right C
 
 ### `POST /api/detector-feedback` (multipart)
 A clone's `clone-daemon report-detection` posts here when the needs-human detector's verdict
-was wrong. The **caller's source IP** is matched against `hosts[].host` to resolve the clone
-(so no auth/clone arg is needed). Fields: `kind` (`false-positive`|`false-negative`,
-required), `detectorVerdict`, `detectorReason`, `actualState`, repeated `ignoreReason`,
-`note`, and an optional `screenshot` file. Persists a JSON record + screenshot under
+was wrong. The caller **self-identifies** with a `clone` field (its hostname == host id —
+clone IPs are dynamic Docker IPAM, so there is no source-IP mapping). Fields: `clone`
+(required), `kind` (`false-positive`|`false-negative`, required), `detectorVerdict`,
+`detectorReason`, `actualState`, repeated `ignoreReason`, `note`, and an optional
+`screenshot` file. Persists a JSON record + screenshot under
 `data/detector-feedback/`. Returns `{ "ok": true, "id": "...", "host": "..." }`.
 
 ---
@@ -172,25 +240,29 @@ required), `detectorVerdict`, `detectorReason`, `actualState`, repeated `ignoreR
 ## Configuration
 
 ### `GET /api/config` → `AppConfigRedacted`
-The full config with secrets replaced by `*_set: bool` booleans (Proxmox SSH, preset
-Linear keys). Non-secret fields (ports, monitors, `proxmox` storage/bridge/hostname prefix,
-`staticDir`/`cloneSocket`/`chroma`, `setupComplete`, claude poll config) are returned
-verbatim. See [PROTOCOL.md](PROTOCOL.md#config-schema) for the schema.
+The full config with the only secret (preset Linear keys) replaced by `linearKeySet: bool`.
+Everything else is returned verbatim — ports, monitors, the `docker` block
+(`socket`/`subnet`/`hostnamePrefix`/`cloneCpus`/`cloneMemoryMb`; no secret — the local daemon
+socket needs none), `staticDir`/`cloneSocket`/`chroma`, `setupComplete`, `detectorInferenceUrl`,
+and claude poll config. See [PROTOCOL.md](PROTOCOL.md#config-schema) for the schema.
 
-### `PUT /api/config` (partial merge) → `{ config: AppConfigRedacted, restartRequired }`
+### `PUT /api/config` (partial merge) → `{ config, restartRequired, networkWarning? }`
 Deep-merge a partial config over the stored one, persist to disk at `0600`, apply live.
 Returns the redacted config plus `restartRequired: boolean` — set when a restart-required
-field changed (the four listen ports, `cloneSocket`, `staticDir`, `chroma`) so the UI can
-prompt for a restart. `cloneSocket` still triggers this pre-latch (the server bound the old
-path at startup) even though it is a one-time field (see below).
-Secret-merge rules: an **empty string keeps** the stored secret; a non-empty string replaces
-it; `presets` rows merge by name (blank `linearKey` keeps the stored one). One-time fields
-(`dataDir`, `proxmox.storage`, `proxmox.bridge`, `cloneSocket`) are locked once
-`setupComplete` latches.
+field changed (the four listen ports, `cloneSocket`, `docker.socket`, `staticDir`, `chroma`)
+so the UI can prompt for a restart. `cloneSocket` still triggers this pre-latch (the server
+bound the old path at startup) even though it is a one-time field (see below). A wizard-finish
+flip (`setupComplete` false → true) materializes the lazy `rmng` network here; a failure is
+non-fatal and echoed as `networkWarning`. Merge rules: an **empty string keeps** the stored
+value; a non-empty string replaces it; `presets` rows merge by name (blank `linearKey` keeps
+the stored one). `docker.subnet` is validated as an IPv4 `/16`–`/24` CIDR. One-time fields
+(`dataDir`, `cloneSocket`, `docker.subnet`) are locked once `setupComplete` latches (which
+itself is a one-way latch).
 
-### `POST /api/config/test` — body `{ "what": "proxmox" }` → `{ ok, message }`
-Synchronously test a setting. Currently only `"proxmox"` (runs `ssh -o BatchMode=yes
--o ConnectTimeout=10 <target> true`).
+### `POST /api/config/test` — body `{ "what": "docker" }` → `{ ok, message }`
+Synchronously test a setting. Currently only `"docker"`: re-runs the Docker self-setup probe
+and collapses the environment report (daemon reachable, sock mount, render node) into a single
+`(ok, message)` verdict. The row-by-row breakdown is `GET /api/setup/env`.
 
 ---
 
@@ -202,7 +274,7 @@ Synchronously test a setting. Currently only `"proxmox"` (runs `ssh -o BatchMode
 | `POST /api/claude/import` | `{host}` | `{ok, email, cleared}` | Harvest the clone's OAuth pair (read off its disk) into the server's secret store, then delete the clone's credentials file |
 | `POST /api/claude/refresh` | — | `{ok, rateLimited}` | Force one usage poll; `rateLimited` if any account hit 429 |
 | `GET /api/claude/recommended` | — | `{email}` | Pinned account, else lowest-usage; `null` if none |
-| `POST /api/claude/swap` | `{host, account}` | `{ok, account, group, selection}` | Resolve `account` (email / `auto` / `group:<name>` / `none`) and write the clone's `~/.claude/.credentials.json` via the Proxmox node. A `group:` selection binds the clone to that group for rotation; `none` removes the credentials file (`account` null); the verbatim choice is echoed as `selection` and stored on the host (`502` if unreachable) |
+| `POST /api/claude/swap` | `{host, account}` | `{ok, account, group, selection}` | Resolve `account` (email / `auto` / `group:<name>` / `none`) and write the clone's `~/.claude/.credentials.json` via `docker exec`. A `group:` selection binds the clone to that group for rotation; `none` removes the credentials file (`account` null); the verbatim choice is echoed as `selection` and stored on the host (`502` if unreachable) |
 | `POST /api/claude/rotate` | — | `{ok}` | Run one group-rotation pass immediately (the rotator otherwise runs every 10 min). Sticky: a clone keeps its account while it stays eligible (member, imported, 5h usage ≤ 90%); only clones whose account fell out of eligibility move, to the least-loaded / least-used member |
 
 The single-token model (the server owns each account's OAuth pair and pushes the current
@@ -230,7 +302,9 @@ default `:4096`), persisting history at `data/chats/{id}.json`.
 ## SPA fallback
 
 ### `GET /*`
-Serves the embedded React build (`frontend/build/client` via `rust-embed`); unknown paths
-fall back to `index.html` for client-side routing. Set the `staticDir` config field
-(Settings → Advanced; empty = embedded, restart-required) to a disk path to serve from
-there instead (frontend hot-reload during dev).
+Serves the installed React build from disk; unknown paths fall back to `index.html` for
+client-side routing. The bundle is resolved at startup: `/usr/local/share/rmng/static` in the
+image, else the repo dev build (`frontend/build/client`). A non-empty `staticDir` config field
+(Settings → Advanced; restart-required) overrides that with any disk path (frontend
+hot-reload during dev). If no frontend resolves anywhere, the route returns a 404 hint and the
+API stays up.
