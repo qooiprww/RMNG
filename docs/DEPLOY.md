@@ -358,12 +358,16 @@ inherits it (there's no per-install control-server payload any more; see
 
 ## Day-2 operations (from the dashboard / API / fleet MCP)
 
-- **Clone**: `POST /api/clone` — Linear ticket / new ticket / plain, from a chosen image.
+- **Clone**: `POST /api/clone` — Linear ticket / new ticket / plain, from a chosen image. If
+  `config.monitors` is set, the new clone is brought to that layout automatically before the
+  op completes (best-effort — see the op log on failure); the template's baked-in default
+  layout only matters when no monitors are configured.
 - **Pull a template**: `POST /api/images/pull {name, reference?}` — from the Images panel, any
   time (not just first-run setup).
 - **Commit a clone → image**: `POST /api/images/commit {host, name}`.
-- **Apply a monitor layout** to running clones: `POST /api/monitors/apply` (rewrites each
-  clone's `RMNG_MONITORS` + restarts its GNOME/daemon).
+- **Apply a monitor layout** to already-running clones: `POST /api/monitors/apply` (rewrites
+  each clone's `RMNG_MONITORS` + restarts its GNOME/daemon) — for pushing a layout change made
+  after those clones were created.
 - **Hot-swap a Claude account**: `POST /api/claude/swap {host, account}` — writes the clone's
   `~/.claude/.credentials.json` live via `docker exec`.
 - **Delete**: `POST /api/delete {id}` (stops + removes the container and its

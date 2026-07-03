@@ -328,6 +328,30 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // finds no managed host and skips. Re-request now that the row is in place so swap-at-
     // create coverage doesn't have to wait for the next sweep.
     app.swap.request_check(&spec.new_hostname);
+
+    // Bring the fresh clone to the CONFIGURED monitor layout. The pulled template bakes a
+    // fixed default (`ARG` on the gnome-shell user unit's `Environment=`), which only matches
+    // a deployment's config by coincidence — the old in-product bootstrap baked the config's
+    // layout into every clone at build time, so this replaces that. Only reprovision when the
+    // operator actually set a layout (`cfg.monitors` non-empty); an empty config means the
+    // template default is intentionally fine, so skip the extra exec + GNOME-session restart.
+    // Best-effort: log the outcome but never fail an already-completed clone op over it — the
+    // operator can always re-apply from Settings.
+    if !app.config().monitors.is_empty() {
+        match provision::apply_monitors(&app, &spec.new_hostname, |_step, _msg| {}).await {
+            Ok(()) => patch_op(&app, &op_id, |op| {
+                op.log.push("monitors: applied configured layout".into())
+            }),
+            Err(e) => {
+                tracing::warn!("apply_monitors({}) failed: {e}", spec.new_hostname);
+                patch_op(&app, &op_id, |op| {
+                    op.log.push(format!(
+                        "WARN monitors apply failed: {e} — apply manually from Settings"
+                    ))
+                });
+            }
+        }
+    }
     schedule_prune(app.clone(), op_id.clone(), PRUNE_DONE_MS);
 
     // Assign a Claude account/group (or explicitly none): record the operator's
