@@ -26,6 +26,9 @@ pub struct App {
     /// surfaces its own daemon-connection failure, so the server still boots the wizard
     /// even when Docker is down.
     pub docker: Arc<DockerCtl>,
+    /// Automatic hash-based binary hot-swap engine state (worker channel + expected
+    /// hashes + per-host swap guards). Empty until [`crate::binswap::spawn`] warms it.
+    pub swap: Arc<crate::binswap::SwapState>,
 }
 
 impl App {
@@ -46,6 +49,7 @@ impl App {
             chat: Arc::new(ChatState::default()),
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
             docker,
+            swap: Arc::new(crate::binswap::SwapState::default()),
         }
     }
 

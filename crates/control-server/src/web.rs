@@ -499,7 +499,8 @@ async fn clone_redeploy(
     if !host.managed {
         return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", req.id)));
     }
-    crate::provision::redeploy_clone(&app, &host.id, req.daemon_only, |step, msg| {
+    let units = crate::provision::manual_redeploy_units(req.daemon_only);
+    crate::provision::redeploy_clone(&app, &host.id, &units, |step, msg| {
         tracing::info!("redeploy {} {step}: {msg}", req.id);
     })
     .await

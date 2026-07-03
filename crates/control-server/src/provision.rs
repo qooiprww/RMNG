@@ -685,23 +685,58 @@ pub async fn delete_clone(
 
 // --- redeploy -------------------------------------------------------------------------
 
+/// One clone `systemd --user` unit in the hot-swap plan: the [`crate::assets::payload`]
+/// name to resolve bytes for, the user unit to bounce, and the on-disk binary name under
+/// `/opt/rmng/bin` (`provision-clone.sh` installs these names). This folds in the
+/// payload-name → bin-name match that used to live inline in the redeploy loop, so both
+/// the manual redeploy surfaces and the automatic swap engine (`binswap`) share one table.
+pub struct RedeployUnit {
+    /// Asset name passed to [`crate::assets::payload`] (`clone-daemon`, `agent-wrapper`).
+    pub payload: &'static str,
+    /// The `systemd --user` unit to stop/start around the swap.
+    pub unit: &'static str,
+    /// The installed binary name under `/opt/rmng/bin` (what the unit execs).
+    pub bin: &'static str,
+}
+
 /// The clone user's `systemd --user` units, in the order redeploy touches them.
-const REDEPLOY_UNITS: &[(&str, &str)] = &[
-    ("clone-daemon", "rmng-clone-daemon.service"),
-    ("agent-wrapper", "agent-wrapper.service"),
+pub const REDEPLOY_UNITS: &[RedeployUnit] = &[
+    RedeployUnit { payload: "clone-daemon", unit: "rmng-clone-daemon.service", bin: "rmng-clone-daemon" },
+    RedeployUnit { payload: "agent-wrapper", unit: "agent-wrapper.service", bin: "agent-wrapper" },
 ];
 
-/// Hot-swap a running clone's `clone-daemon` (+ `agent-wrapper` unless `daemon_only`)
-/// binaries WITHOUT reprovisioning. Per unit: `systemctl --user stop` (exec'd as the clone
-/// user with its `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` — linger guarantees the user
-/// manager is up) → `upload_tar` the payload binary to **`/opt/rmng/bin/<name>`** (the units
-/// exec from there; the old `redeploy.sh` pushed to `$HOME`, a latent path bug this fixes) →
-/// `reset-failed` + `start`. No username arg — the clone user (`CLONE_USER`) is compiled in
-/// (fixes mcp.rs's stray `"pega"`). Skips a unit whose payload is missing (WARN).
+/// Resolve the payloads the manual redeploy surfaces (web.rs `clone_redeploy`, mcp.rs
+/// redeploy tool) push: walk [`REDEPLOY_UNITS`] (agent-wrapper dropped when `daemon_only`),
+/// reading each payload from the image assets and **skipping — with a WARN — any that's
+/// absent** (a dev checkout without that binary staged). Byte resolution moved out of
+/// [`redeploy_clone`] into the caller in the swap-engine refactor; this keeps the manual
+/// callers' pre-refactor behavior (the automatic engine resolves + hash-guards its own set).
+pub fn manual_redeploy_units(daemon_only: bool) -> Vec<(&'static RedeployUnit, Vec<u8>)> {
+    REDEPLOY_UNITS
+        .iter()
+        .filter(|u| !(daemon_only && u.payload == "agent-wrapper"))
+        .filter_map(|u| match crate::assets::payload(u.payload) {
+            Some(bytes) => Some((u, bytes)),
+            None => {
+                tracing::warn!("redeploy: {} payload missing; skipping", u.payload);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Hot-swap a running clone's binaries WITHOUT reprovisioning. The caller resolves the
+/// `(unit, payload-bytes)` pairs (from [`manual_redeploy_units`] or the swap engine's
+/// hash-guarded resolution); this drives the systemd dance. Per unit: `systemctl --user
+/// stop` (exec'd as the clone user with its `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
+/// — linger guarantees the user manager is up) → `upload_tar` the binary to
+/// **`/opt/rmng/bin/<bin>`** (the units exec from there; the old `redeploy.sh` pushed to
+/// `$HOME`, a latent path bug this fixes) → `reset-failed` + `start`. No username arg — the
+/// clone user (`CLONE_USER`) is compiled in (fixes mcp.rs's stray `"pega"`).
 pub async fn redeploy_clone(
     app: &App,
     container: &str,
-    daemon_only: bool,
+    units: &[(&'static RedeployUnit, Vec<u8>)],
     mut on_progress: impl FnMut(&str, &str),
 ) -> Result<()> {
     let docker = &app.docker;
@@ -713,32 +748,17 @@ pub async fn redeploy_clone(
         bail!("could not resolve uid of '{CLONE_USER}' in {container}: {}", uid_out.trim());
     }
 
-    for (payload_name, unit) in REDEPLOY_UNITS {
-        if daemon_only && *payload_name == "agent-wrapper" {
-            continue;
-        }
-        let Some(bytes) = crate::assets::payload(payload_name) else {
-            tracing::warn!("redeploy: {payload_name} payload missing; skipping");
-            on_progress("skip", &format!("{payload_name} payload missing; skipped"));
-            continue;
-        };
+    for (unit, bytes) in units {
+        on_progress("stop", &format!("stopping {}", unit.unit));
+        run_user_systemctl(app, container, &uid, &["stop", unit.unit]).await.ok();
 
-        // The on-disk binary name in /opt/rmng/bin (provision-clone.sh installs these names).
-        let bin_name = match *payload_name {
-            "clone-daemon" => "rmng-clone-daemon",
-            other => other,
-        };
-
-        on_progress("stop", &format!("stopping {unit}"));
-        run_user_systemctl(app, container, &uid, &["stop", unit]).await.ok();
-
-        on_progress("push", &format!("pushing {bin_name} → /opt/rmng/bin"));
+        on_progress("push", &format!("pushing {} → /opt/rmng/bin", unit.bin));
         docker
             .upload_tar(
                 container,
                 vec![TarEntry {
-                    path: format!("opt/rmng/bin/{bin_name}"),
-                    data: bytes,
+                    path: format!("opt/rmng/bin/{}", unit.bin),
+                    data: bytes.clone(),
                     mode: 0o755,
                     uid: 0,
                     gid: 0,
@@ -746,9 +766,9 @@ pub async fn redeploy_clone(
             )
             .await?;
 
-        on_progress("start", &format!("starting {unit}"));
-        run_user_systemctl(app, container, &uid, &["reset-failed", unit]).await.ok();
-        run_user_systemctl(app, container, &uid, &["start", unit]).await?;
+        on_progress("start", &format!("starting {}", unit.unit));
+        run_user_systemctl(app, container, &uid, &["reset-failed", unit.unit]).await.ok();
+        run_user_systemctl(app, container, &uid, &["start", unit.unit]).await?;
     }
 
     on_progress("done", "redeploy complete");

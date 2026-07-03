@@ -298,7 +298,8 @@ async fn call_tool(st: &McpState, caller: Option<&str>, name: &str, args: Value)
             if !host.managed {
                 return Err("not a managed clone".into());
             }
-            crate::provision::redeploy_clone(app, &host.id, daemon_only, |step, msg| {
+            let units = crate::provision::manual_redeploy_units(daemon_only);
+            crate::provision::redeploy_clone(app, &host.id, &units, |step, msg| {
                 tracing::info!("redeploy {clone} {step}: {msg}");
             })
             .await

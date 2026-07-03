@@ -6,6 +6,7 @@
 
 mod app;
 mod assets;
+mod binswap;
 mod chat;
 mod claude;
 mod config;
@@ -129,6 +130,11 @@ async fn main() -> Result<()> {
     tokio::spawn(claude::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
     tokio::spawn(homes::run(app.clone()));
+
+    // Automatic hash-based binary hot-swap engine: warm the expected payload hashes, then
+    // run the worker + sweep loops. Spawned BEFORE the media plane so its enqueue channel
+    // is live before the first clone `Hello` (a later task fires `request_check` from there).
+    binswap::spawn(app.clone());
 
     // Port 1 (video) — ingest clone dmabufs, VA-API encode, serve the viewer.
     mediaplane::spawn(app.clone());
