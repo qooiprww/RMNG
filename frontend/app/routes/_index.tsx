@@ -1,7 +1,11 @@
 import { Menu } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 
-import { ChangeAccountModal } from "~/components/ChangeAccountModal";
+import {
+  ChangeAccountModal,
+  currentCodexValue,
+  currentValue,
+} from "~/components/ChangeAccountModal";
 import { CloneModal } from "~/components/CloneModal";
 import { CommitImageModal } from "~/components/CommitImageModal";
 import { ImportAccountModal } from "~/components/ImportAccountModal";
@@ -23,9 +27,11 @@ import {
   putConfig,
   putForwards,
   refreshClaudeUsage,
+  refreshCodexUsage,
   reorder,
   restartServer,
   swapClaudeAccount,
+  swapCodexAccount,
   testConfig,
   updateServer,
 } from "~/lib/api";
@@ -382,6 +388,9 @@ function Dashboard({
           accounts={(state.claudeAccounts ?? []).filter(
             (a) => a.assignable && a.provider !== "codex",
           )}
+          codexAccounts={(state.claudeAccounts ?? []).filter(
+            (a) => a.assignable && a.provider === "codex",
+          )}
           onClose={() => setCloneOpen(false)}
           onClone={(image, payload) => {
             run(cloneHost(image, payload));
@@ -394,6 +403,9 @@ function Dashboard({
         <SettingsPanel
           accountEmails={(state.claudeAccounts ?? [])
             .filter((a) => a.provider !== "codex")
+            .map((a) => a.email)}
+          codexAccountEmails={(state.claudeAccounts ?? [])
+            .filter((a) => a.provider === "codex")
             .map((a) => a.email)}
           onClose={() => setSettingsOpen(false)}
           getConfig={getConfig}
@@ -438,6 +450,7 @@ function Dashboard({
           onImported={() => {
             setImportOpen(false);
             run(refreshClaudeUsage());
+            run(refreshCodexUsage());
           }}
         />
       ) : null}
@@ -448,17 +461,36 @@ function Dashboard({
           accounts={(state.claudeAccounts ?? []).filter(
             (a) => a.assignable && a.provider !== "codex",
           )}
+          codexAccounts={(state.claudeAccounts ?? []).filter(
+            (a) => a.assignable && a.provider === "codex",
+          )}
           busy={changing}
           onClose={() => setChangeHost(null)}
-          onSubmit={(value) => {
+          onSubmit={(claude, codex) => {
             setChanging(true);
-            swapClaudeAccount(changeHost.id, value)
-              .then(() => setError(null))
-              .catch((e: Error) => setError(e.message))
-              .finally(() => {
-                setChanging(false);
+            // Baselines must use the SAME group-aware derivation the modal shows
+            // (currentValue/currentCodexValue), or a legacy group-bound host whose
+            // selection is stored only as a group would spuriously fire — or mask — a swap.
+            const jobs: Promise<unknown>[] = [];
+            if (claude !== currentValue(changeHost))
+              jobs.push(swapClaudeAccount(changeHost.id, claude));
+            if (codex !== currentCodexValue(changeHost))
+              jobs.push(swapCodexAccount(changeHost.id, codex));
+            Promise.allSettled(jobs).then((results) => {
+              setChanging(false);
+              const failed = results.find((r) => r.status === "rejected");
+              if (failed) {
+                // Surface the failure and keep the modal open so the operator can retry
+                // (a silent close would look like the token swap succeeded).
+                setError(
+                  (failed as PromiseRejectedResult).reason?.message ??
+                    "account swap failed",
+                );
+              } else {
+                setError(null);
                 setChangeHost(null);
-              });
+              }
+            });
           }}
         />
       ) : null}

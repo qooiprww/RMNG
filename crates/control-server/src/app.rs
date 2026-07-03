@@ -18,6 +18,8 @@ pub struct App {
     pub http: reqwest::Client,
     /// Claude secret store + usage cache.
     pub claude: Arc<ClaudeStore>,
+    /// Codex secret store + usage cache (sibling of `claude`).
+    pub codex: Arc<crate::codex::CodexStore>,
     /// Per-host chat fan-out + in-flight state.
     pub chat: Arc<ChatState>,
     /// Media plane shared state (clone conns + latest frames).
@@ -42,6 +44,7 @@ pub struct App {
 impl App {
     pub fn new(store: Arc<StateStore>, cfg: AppConfig) -> Self {
         let claude = Arc::new(ClaudeStore::load(&cfg.data_dir));
+        let codex = Arc::new(crate::codex::CodexStore::load(&cfg.data_dir));
         // `DockerCtl::connect` is infallible and I/O-free: even a missing socket FILE
         // (bare `docker run` without the sock bind) boots the server — the failure is
         // surfaced per call and by `self_setup`'s env report, so the wizard shows it.
@@ -54,6 +57,7 @@ impl App {
                 .build()
                 .expect("reqwest client"),
             claude,
+            codex,
             chat: Arc::new(ChatState::default()),
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
             docker,
@@ -66,6 +70,24 @@ impl App {
     /// A cheap snapshot of the current config.
     pub fn config(&self) -> AppConfig {
         self.cfg.read().unwrap().clone()
+    }
+
+    /// A minimal App backed by a throwaway temp data dir, for unit tests in sibling
+    /// modules (state + stores are file-isolated; Docker is constructed I/O-free).
+    #[cfg(test)]
+    pub fn test_app() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rmng-cloneops-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store =
+            std::sync::Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
+        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        Self::new(store, cfg)
     }
 
     /// What to dial a host's in-clone services at (agent-wrapper `/status`+chat, the

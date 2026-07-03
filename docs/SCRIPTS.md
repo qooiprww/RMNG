@@ -30,6 +30,7 @@ control-server binary and streamed to a container over `docker exec bash -s` —
 |---|---|---|---|
 | `crates/control-server/scripts/apply-monitors.sh` | in a clone container (`docker exec`) | `provision::apply_monitors` | Re-apply a monitor layout to a running clone without reprovisioning |
 | `crates/control-server/scripts/claude-import.sh` | in a clone container (`docker exec`) | `provision::run_clone_op` (`claude.rs`) | Read `claude auth status` / the credentials file, clear it, or install a token |
+| `crates/control-server/scripts/codex-import.sh` | in a clone container (`docker exec`) | `clone_ops::run_clone_op` (`codex.rs`) | Read `~/.codex/auth.json` status / the auth file, clear it, or install a token |
 | `template/setup/{lib,10-desktop,15-gnome-patch,20-toolbox,30-user}.sh` | in the template build (`RUN`) | `template/Dockerfile` | Provision the clone template rootfs: desktop, patched shell, dev toolbox, the clone user + its units (binaries themselves are `COPY`'d in by the Dockerfile after) |
 | `gnome-patch/build-shell-deb.sh` | the `gnome-build` stage of `template/Dockerfile` | `docker build` | Build the patched gnome-shell `.deb` |
 
@@ -60,6 +61,23 @@ it, print `CLEARED`. `apply <b64>` — write `~/.claude/.credentials.json` (0600
 base64 JSON in `$3` (the current short-lived access token, refresh emptied). Backs
 `claude.rs`'s `{check_clone_auth, import_clone_account, apply_clone_token}`; hot-swaps a
 running clone's account with no restart (Claude Code re-reads creds per request).
+
+### `codex-import.sh <user> status|read|clear|apply [b64]`
+Mirrors `claude-import.sh` for the Codex CLI. Runs inside the target **clone** container
+as the clone user. `status` — decode `~/.codex/auth.json` and print identity (email, plan,
+account_id) from the `id_token` JWT; exits non-zero if no token or if only an API key is
+present. `read` — the clone's `~/.codex/auth.json`. `clear` — delete it, print `CLEARED`.
+`apply <b64>` — write `~/.codex/auth.json` (0600) from the base64 JSON in `$3` (the
+injected token with `OPENAI_API_KEY: null`, `refresh_token: ""`, `last_refresh: <now>`).
+Backs `codex.rs`'s `{check_clone_auth, import_clone_account, apply_clone_token}`; hot-swaps
+a running clone's Codex account with no restart (the Codex CLI re-reads auth per request).
+
+> **Provisioning note:** the `codex` CLI is installed into the clone template by
+> `template/setup/30-user.sh` (warn-only — the install step does not fail the build if the
+> CLI is unavailable). Existing clone images built before this change **do not** have the
+> Codex CLI and need a template rebuild (`docker build`) followed by `POST /api/images/pull`
+> to pull the updated template. Hot-swapping the binswap (`clone-daemon` / `agent-wrapper`)
+> does **not** install CLIs — it only replaces the two RMNG binaries.
 
 ---
 

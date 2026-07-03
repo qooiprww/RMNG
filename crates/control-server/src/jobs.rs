@@ -53,6 +53,9 @@ pub struct CloneSpec {
     pub linear: Option<LinearMeta>,
     /// Requested Claude account: an email, `"auto"`, or `None` (= auto).
     pub claude_account: Option<String>,
+    /// Requested Codex account: an email, `"auto"`, `"group:<name>"`, `"none"`, or `None`
+    /// (= auto). Independent of `claude_account`.
+    pub codex_account: Option<String>,
     pub first_message: Option<String>,
     pub agent_instructions: Option<String>,
     pub claude_instructions: Option<String>,
@@ -417,6 +420,48 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
         }
     }
 
+    // Assign a Codex account/group (or explicitly none), independently of Claude — a clone
+    // can hold both. Same shape as the Claude block above, reading codex_* state.
+    if let Some(assignment) = crate::codex::resolve_assignment(&app, spec.codex_account.as_deref()) {
+        let selection = crate::codex::normalize_selection(spec.codex_account.as_deref());
+        let (group, account) = match assignment {
+            crate::codex::Assignment::Group { name, initial } => (Some(name), Some(initial)),
+            crate::codex::Assignment::Account(a) => (None, Some(a)),
+            crate::codex::Assignment::None => (None, None),
+        };
+        let id = spec.new_hostname.clone();
+        let (email, group_set) = (account.clone(), group.clone());
+        app.store.mutate(|s| {
+            if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
+                h.codex_selection = Some(selection.clone());
+                h.codex_account_email = email.clone();
+                h.codex_group = group_set.clone();
+            }
+        });
+        match account {
+            None => patch_op(&app, &op_id, |op| {
+                op.log.push("codex account: none (no token installed)".into())
+            }),
+            Some(email) => {
+                let label = match &group {
+                    Some(g) => format!("{email} (group {g})"),
+                    None => email.clone(),
+                };
+                match crate::codex::push_account_to_clone(&app, &spec.new_hostname, &email).await {
+                    Ok(()) => patch_op(&app, &op_id, |op| {
+                        op.log.push(format!("codex account: assigned {label}"))
+                    }),
+                    Err(e) => {
+                        tracing::warn!("codex push_account_to_clone({}) failed: {e}", spec.new_hostname);
+                        patch_op(&app, &op_id, |op| {
+                            op.log.push(format!("codex account: failed to assign {label}: {e}"))
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Kick off the agent: hand it the ticket URL (ticket clones) or the plain
     // first message, plus any instruction overrides. Detached; it waits for the
     // wrapper to come up.
@@ -749,6 +794,20 @@ mod tests {
             started_at: now_ms(),
             finished_at: None,
         }
+    }
+
+    #[test]
+    fn clonespec_default_has_no_codex_account() {
+        let spec = CloneSpec { new_hostname: "x".into(), ..Default::default() };
+        assert!(spec.codex_account.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_clone_codex_none_leaves_no_email() {
+        // With no imported codex accounts, resolve_assignment(None) → None, so a clone's
+        // codex_account_email stays None (the block is a no-op) — independent of claude.
+        let app = test_app();
+        assert!(crate::codex::resolve_assignment(&app, None).is_none());
     }
 
     #[tokio::test]

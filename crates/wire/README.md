@@ -32,10 +32,12 @@ transport types (socket, viewer) are serde-only.
 ```text
 ControlState { selected: Option<String>, monitors: Vec<MonitorSpec>,
                hosts: Vec<Host>, operations: Vec<Operation>,
-               templates: Vec<String>, claude_accounts: Vec<ClaudeUsage> }
+               templates: Vec<String>, claude_accounts: Vec<ClaudeUsage>,
+               codex_accounts: Vec<CodexUsage> }
 Host { id, host, port, username, password, domain?, gdm_username?, gdm_password?,
        container?, source?, claude_account_email?, linear_*?, display_name?,
-       agent_report?, state_note?, monitor_state? }
+       agent_report?, state_note?, monitor_state?,
+       codex_account_email?, codex_group?, codex_selection? }
 Operation { id, kind: Clone|Delete|Bootstrap|Commit, target, source?, status, step, pct,
             message, log: Vec<String>, container?, started_at, finished_at? }
 ClaudeUsage { id, email, provider, active, assignable?, error?, stale?,
@@ -47,6 +49,8 @@ AppConfig { docker{socket, subnet, hostname_prefix, clone_cpus, clone_memory_mb,
             presets: [{name, labels: [label], linear_key, vars: [{key, value}]}],
             claude{poll, pinnedEmail, swap..., auto_swap_on_exhaustion: bool},
             clone_groups: [{name, accounts: [email]}],
+            codex{pollSecs, pinnedEmail, autoSwapOnExhaustion, usagePolling},
+            codex_groups: [{name, accounts: [email]}],
             clone_socket, data_dir, static_dir, chroma, setup_complete, detector_inference_url,
             monitors: [MonitorSpec], listen{video, web, clone_mcp, global_mcp}, agent{port} }
 # Clone sources are images (rmng/template:<name>), not a config template block — pulled from a
@@ -57,6 +61,11 @@ AppConfig { docker{socket, subnet, hostname_prefix, clone_cpus, clone_memory_mb,
 # Claude account tokens are NOT config: each account's OAuth pair lives in the server's
 # 0600 `claude-accounts.json`; the server refreshes it and pushes the current short-lived
 # access token into assigned clones' ~/.claude/.credentials.json (see control-server).
+# Codex account tokens are NOT config: each account's OAuth triple lives in the server's
+# 0600 `codex-accounts.json`; the server refreshes it and pushes a short-lived
+# auth.json into assigned clones' ~/.codex/auth.json (refresh_token emptied; see control-server).
+CodexConfig { pollSecs, pinnedEmail?, autoSwapOnExhaustion: bool, usagePolling: bool }
+             # usagePolling=false suppresses GET /wham/usage; refresh + push still run
 AppConfigRedacted   # GET /api/config shape: the one secret → set/unset, never plaintext
 ImageInfo   # GET /api/images row: {id, reference, size_bytes, created_at, base, created_from?, in_use_by}
 SetupEnv / EnvCheckRow   # GET /api/setup/env: the wizard's environment preflight rows

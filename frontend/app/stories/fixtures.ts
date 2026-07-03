@@ -217,6 +217,8 @@ export const appConfig: AppConfigRedacted = {
     pinnedEmail: "alex@example.com",
     autoSwapOnExhaustion: false,
   },
+  codex: { pollSecs: BigInt(600), pinnedEmail: null, autoSwapOnExhaustion: false, usagePolling: true },
+  codexGroups: [],
   cloneGroups: [{ name: "pooled", accounts: ["alex@example.com", "sam@example.com"] }],
   presets: [
     {

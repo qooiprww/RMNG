@@ -44,6 +44,12 @@ disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}
 | GET | `/api/claude/recommended` | Recommended account for a new clone | 200 `{email}` |
 | POST | `/api/claude/swap` | Change a clone's Claude account/group (email/`auto`/`group:<name>`/`none`) | 200 `{ok,account,group,selection}` |
 | POST | `/api/claude/rotate` | Run one group-rotation pass now | 200 `{ok}` |
+| POST | `/api/codex/import/check` | Check a clone is signed in via ChatGPT | 200 `{ok,email,plan,accountId}` |
+| POST | `/api/codex/import` | Import a Codex account from a signed-in clone | 200 `{ok,email,cleared}` |
+| POST | `/api/codex/refresh` | Force one Codex usage poll now | 200 `{ok,rateLimited}` |
+| GET | `/api/codex/recommended` | Recommended Codex account for a new clone | 200 `{email}` |
+| POST | `/api/codex/swap` | Change a clone's Codex account/group | 200 `{ok,account,group,selection}` |
+| POST | `/api/codex/rotate` | Run one Codex group-rotation pass now | 200 `{ok}` |
 | GET | `/api/chat/:id` | Chat snapshot for a host | 200 `ChatSnapshot` |
 | POST | `/api/chat/:id` | Send a message to the host's agent | 202 |
 | GET | `/api/chat/:id/events` | Per-host chat SSE | 200 SSE `ChatSnapshot` |
@@ -140,6 +146,7 @@ Body (one of three task modes + optional account/instructions):
                                     //   REQUIRED while any presets exist. Create mode:
                                     //   REQUIRED (the preset's key creates the ticket).
   "claudeAccount": "user@anthropic.com" | "auto" | "group:<name>" | "none",
+  "codexAccount":  "user@openai.com"  | "auto" | "group:<name>" | "none",
   "agentInstructions": "...",       // extra context for the agent-wrapper
   "claudeInstructions": "..."       // extra instructions for Claude Code
 }
@@ -294,6 +301,29 @@ and collapses the environment report (daemon reachable, sock mount, render node)
 The single-token model (the server owns each account's OAuth pair and pushes the current
 short-lived access token to assigned clones on every refresh) is described in
 [PROTOCOL.md](PROTOCOL.md#claude-accounts).
+
+---
+
+## Codex accounts
+
+Codex (OpenAI/ChatGPT) accounts mirror the Claude endpoints. The server owns each
+account's OAuth pair; clones receive only a short-lived injected `~/.codex/auth.json`.
+
+| Endpoint | Body | Returns | Does |
+|---|---|---|---|
+| `POST /api/codex/import/check` | `{host}` | `{ok, email, plan, accountId}` | Confirms the clone is signed in to Codex via ChatGPT (reads `~/.codex/auth.json`, decodes the id_token JWT). Errors if signed in with an API key |
+| `POST /api/codex/import` | `{host}` | `{ok, email, cleared}` | Harvests the OAuth triple, stores it (0600 `codex-accounts.json`), clears the clone's auth.json |
+| `POST /api/codex/refresh` | — | `{ok, rateLimited}` | Force one usage poll; `rateLimited` if any account hit 429 |
+| `GET /api/codex/recommended` | — | `{email}` | Pinned account, else lowest-usage; `null` if none |
+| `POST /api/codex/swap` | `{host, account}` | `{ok, account, group, selection}` | Resolve `account` (email / `auto` / `group:<name>` / `none`) and write the clone's `~/.codex/auth.json` via `docker exec`. A `group:` selection binds the clone to that group for rotation; `none` removes the auth file; the verbatim choice is echoed as `selection` and stored on the host (`502` if unreachable) |
+| `POST /api/codex/rotate` | — | `{ok}` | Run one Codex group-rotation pass immediately |
+
+Clone creation (`POST /api/clone`) accepts an optional `codexAccount` alongside
+`claudeAccount`; a clone can be assigned both independently.
+
+The single-token model (the server owns each account's OAuth pair and pushes the current
+short-lived access token to assigned clones on every refresh) is described in
+[PROTOCOL.md](PROTOCOL.md#codex-accounts).
 
 ---
 

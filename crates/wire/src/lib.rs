@@ -25,7 +25,7 @@ pub mod socket;
 pub mod viewer;
 
 pub use config::{
-    AppConfig, AppConfigRedacted, ChromaMode, ClaudeConfig, CloneGroup,
+    AppConfig, AppConfigRedacted, ChromaMode, ClaudeConfig, CloneGroup, CodexConfig,
     ConfigPutResponse, DockerConfig, EnvCheckRow, EnvVar, ImageInfo, ListenConfig, Preset,
     PresetRedacted, SetupEnv,
 };

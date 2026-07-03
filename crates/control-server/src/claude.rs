@@ -24,13 +24,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use wire::{ClaudeSpend, ClaudeUsage, ClaudeUsageWindow, CloneGroup, Host};
 
 use crate::app::App;
+use crate::clone_ops::{extract_json, now_ms, rand_u64, shuffle, snippet};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -54,10 +55,6 @@ const ROTATE_MAX_FIVE_HOUR_PCT: f64 = 90.0;
 /// account switch always cold-starts the clone's Anthropic prompt cache, so staying
 /// put is cheaper than perfect spread.
 const ROTATE_SECS: u64 = 600;
-
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -210,14 +207,6 @@ pub struct ImportResult {
     pub email: String,
     /// Whether the clone's credentials file was successfully removed.
     pub cleared: bool,
-}
-
-/// The `{…}` substring of `s` (login-shell noise can wrap the JSON), else trimmed `s`.
-fn extract_json(s: &str) -> &str {
-    match (s.find('{'), s.rfind('}')) {
-        (Some(a), Some(b)) if b >= a => &s[a..=b],
-        _ => s.trim(),
-    }
 }
 
 /// Confirm clone `host` is signed in to Claude Code via **claude.ai** (not an API
@@ -382,10 +371,6 @@ pub async fn fresh_access_token(app: &App, email: &str) -> Result<(String, bool)
     Ok((acct.access_token, true))
 }
 
-fn snippet(s: &str) -> String {
-    if s.is_empty() { String::new() } else { format!(": {}", &s[..s.len().min(120)]) }
-}
-
 // The usage API returns explicit `null` for numeric fields that don't apply (e.g.
 // an account with extra-usage disabled). `#[serde(default)]` only covers a *missing*
 // key, not a present `null`, so every nullable number is `Option<_>` here.
@@ -499,7 +484,7 @@ pub async fn poll_once(app: &App) -> Result<bool> {
 async fn poll_inner(app: &App) -> Result<bool> {
     let accts = app.claude.snapshot();
     if accts.is_empty() {
-        app.store.mutate(|s| s.claude_accounts.clear());
+        crate::clone_ops::replace_provider_views(app, wire::Provider::Claude, Vec::new(), None);
         return Ok(false);
     }
 
@@ -546,19 +531,13 @@ async fn poll_inner(app: &App) -> Result<bool> {
     for v in &mut views {
         v.assignable = Some(true);
     }
-
-    // Pinned email first, then alphabetical.
     let cfg = app.config();
-    let pinned = cfg.claude.pinned_email.clone();
-    views.sort_by(|a, b| {
-        let ap = Some(&a.email) == pinned.as_ref();
-        let bp = Some(&b.email) == pinned.as_ref();
-        if ap != bp {
-            return if ap { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
-        }
-        a.email.cmp(&b.email)
-    });
-    app.store.mutate(|s| s.claude_accounts = views);
+    crate::clone_ops::replace_provider_views(
+        app,
+        wire::Provider::Claude,
+        views,
+        cfg.claude.pinned_email.as_deref(),
+    );
 
     // Fan out any tokens this poll rotated (and retry earlier failed pushes).
     push_stale_tokens(app).await;
@@ -684,26 +663,6 @@ pub fn resolve_assignment(app: &App, requested: Option<&str>) -> Option<Assignme
     resolve_clone_account(app, requested).map(Assignment::Account)
 }
 
-/// Non-cryptographic randomness from `/dev/urandom` (mirrors `files::rand_hex`),
-/// enough to shuffle/tiebreak rotation; falls back to the clock.
-fn rand_u64() -> u64 {
-    use std::io::Read;
-    let mut buf = [0u8; 8];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok() {
-        u64::from_le_bytes(buf)
-    } else {
-        now_ms() as u64
-    }
-}
-
-/// In-place Fisher–Yates shuffle.
-fn shuffle<T>(v: &mut [T]) {
-    for i in (1..v.len()).rev() {
-        let j = (rand_u64() % (i as u64 + 1)) as usize;
-        v.swap(i, j);
-    }
-}
-
 /// How many clones each account email is currently assigned to.
 fn clone_counts(app: &App) -> HashMap<String, u32> {
     let mut m = HashMap::new();
@@ -721,6 +680,7 @@ fn five_hour_pct(app: &App, email: &str) -> f64 {
         .get()
         .claude_accounts
         .iter()
+        .filter(|u| u.provider != Some(wire::Provider::Codex))
         .find(|u| u.email == email)
         .and_then(|u| u.five_hour.as_ref())
         .map(|w| w.pct)
@@ -963,8 +923,12 @@ pub async fn push_stale_tokens(app: &App) {
 /// When a clone's assigned account is exhausted, hot-swap it to the best alternative.
 async fn auto_swap_exhausted(app: &App) {
     let st = app.store.get();
-    let usage: HashMap<String, &ClaudeUsage> =
-        st.claude_accounts.iter().map(|u| (u.email.clone(), u)).collect();
+    let usage: HashMap<String, &ClaudeUsage> = st
+        .claude_accounts
+        .iter()
+        .filter(|u| u.provider != Some(wire::Provider::Codex))
+        .map(|u| (u.email.clone(), u))
+        .collect();
     let exhausted = |email: &str| -> bool {
         usage.get(email).is_some_and(|u| {
             let five = u.five_hour.as_ref().map(|w| w.pct).unwrap_or(0.0);

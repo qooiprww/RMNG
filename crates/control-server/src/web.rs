@@ -70,6 +70,12 @@ pub fn router(app: App) -> Router {
         .route("/api/claude/recommended", get(claude_recommended))
         .route("/api/claude/swap", post(claude_swap))
         .route("/api/claude/rotate", post(claude_rotate))
+        .route("/api/codex/import/check", post(codex_import_check))
+        .route("/api/codex/import", post(codex_import))
+        .route("/api/codex/refresh", post(codex_refresh))
+        .route("/api/codex/recommended", get(codex_recommended))
+        .route("/api/codex/swap", post(codex_swap))
+        .route("/api/codex/rotate", post(codex_rotate))
         .route("/api/chat/:id", get(chat_get).post(chat_send))
         .route("/api/chat/:id/events", get(chat_events))
         .route("/api/chat/:id/abort", post(chat_abort))
@@ -300,6 +306,7 @@ async fn clone(
 
     let image = str_field("image").filter(|s| !s.is_empty()).ok_or_else(|| bad("body must include { image }".into()))?;
     let claude_account = str_field("claudeAccount");
+    let codex_account = str_field("codexAccount");
     let agent_instructions = str_field("agentInstructions");
     let claude_instructions = str_field("claudeInstructions");
     let cfg = app.config();
@@ -343,6 +350,7 @@ async fn clone(
             new_hostname: hostname,
             linear: Some(LinearMeta { display_name: Some(display), ..Default::default() }),
             claude_account,
+            codex_account,
             first_message: Some(message).filter(|m| !m.is_empty()),
             agent_instructions,
             claude_instructions,
@@ -374,6 +382,7 @@ async fn clone(
         new_hostname: hostname,
         linear: Some(meta),
         claude_account,
+        codex_account,
         first_message: None,
         agent_instructions,
         claude_instructions,
@@ -1005,6 +1014,115 @@ async fn claude_rotate(State(app): State<App>) -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
+// --- Codex accounts --------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CodexImportReq {
+    host: String,
+}
+
+/// `POST /api/codex/import/check` — confirm a clone is signed in to Codex via ChatGPT and
+/// report its identity so the UI can show it before importing.
+async fn codex_import_check(State(app): State<App>, Json(req): Json<CodexImportReq>) -> JsonResult {
+    let host = host_by_id(&app, &req.host)
+        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let auth = crate::codex::check_clone_auth(&app, &host)
+        .await
+        .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(json!({
+        "ok": true,
+        "email": auth.email,
+        "plan": auth.plan,
+        "accountId": auth.account_id,
+    })))
+}
+
+/// `POST /api/codex/import` — import a Codex account from a signed-in clone.
+async fn codex_import(State(app): State<App>, Json(req): Json<CodexImportReq>) -> JsonResult {
+    let host = host_by_id(&app, &req.host)
+        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let res = crate::codex::import_clone_account(&app, &host)
+        .await
+        .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
+    let _ = crate::codex::poll_once(&app).await;
+    Ok(Json(json!({ "ok": true, "email": res.email, "cleared": res.cleared })))
+}
+
+/// `POST /api/codex/refresh` — force one usage poll now.
+async fn codex_refresh(State(app): State<App>) -> Json<serde_json::Value> {
+    let any429 = crate::codex::poll_once(&app).await.unwrap_or(false);
+    Json(json!({ "ok": true, "rateLimited": any429 }))
+}
+
+/// `GET /api/codex/recommended` — the account the clone dialog should pre-select.
+async fn codex_recommended(State(app): State<App>) -> Json<serde_json::Value> {
+    Json(json!({ "email": crate::codex::recommend(&app) }))
+}
+
+#[derive(Deserialize)]
+struct CodexSwapReq {
+    host: String,
+    /// Account email, `auto`, `none`, or `group:<name>`.
+    account: String,
+}
+
+/// `POST /api/codex/swap` — change a clone's Codex account/group.
+async fn codex_swap(
+    State(app): State<App>,
+    Json(req): Json<CodexSwapReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let host = app
+        .store
+        .get()
+        .hosts
+        .into_iter()
+        .find(|h| h.id == req.host)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    if !host.managed {
+        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", host.id)));
+    }
+    let assignment = crate::codex::resolve_assignment(&app, Some(&req.account))
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "no imported Codex accounts".into()))?;
+    let selection = crate::codex::normalize_selection(Some(&req.account));
+    let (group, email) = match assignment {
+        crate::codex::Assignment::None => {
+            crate::codex::clear_clone_token(&app, &host.id)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            app.codex.forget_pushed(&host.id);
+            (None, None)
+        }
+        crate::codex::Assignment::Group { name, initial } => {
+            crate::codex::push_account_to_clone(&app, &host.id, &initial)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            (Some(name), Some(initial))
+        }
+        crate::codex::Assignment::Account(a) => {
+            crate::codex::push_account_to_clone(&app, &host.id, &a)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            (None, Some(a))
+        }
+    };
+    let (id, email_set, group_set, sel_set) =
+        (host.id.clone(), email.clone(), group.clone(), selection.clone());
+    app.store.mutate(|s| {
+        if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
+            h.codex_account_email = email_set;
+            h.codex_group = group_set;
+            h.codex_selection = Some(sel_set);
+        }
+    });
+    Ok(Json(json!({ "ok": true, "account": email, "group": group, "selection": selection })))
+}
+
+/// `POST /api/codex/rotate` — run one Codex group-rotation pass immediately.
+async fn codex_rotate(State(app): State<App>) -> Json<serde_json::Value> {
+    crate::codex::rotate_once(&app).await;
+    Json(json!({ "ok": true }))
+}
+
 // --- per-host chat ---------------------------------------------------------
 
 fn host_by_id(app: &App, id: &str) -> Option<wire::Host> {
@@ -1254,5 +1372,18 @@ mod playbook_tests {
             compose_playbook(&cfg_with("BASE"), Some(&preset_with("EXTRA"))),
             "BASE\n\nEXTRA"
         );
+    }
+}
+
+#[cfg(test)]
+mod codex_route_tests {
+    use super::*;
+
+    #[test]
+    fn codex_swap_req_parses() {
+        let r: CodexSwapReq =
+            serde_json::from_str(r#"{ "host": "pega-1", "account": "group:team" }"#).unwrap();
+        assert_eq!(r.host, "pega-1");
+        assert_eq!(r.account, "group:team");
     }
 }

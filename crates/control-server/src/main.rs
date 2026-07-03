@@ -9,6 +9,8 @@ mod assets;
 mod binswap;
 mod chat;
 mod claude;
+mod clone_ops;
+mod codex;
 mod config;
 mod docker;
 mod files;
@@ -153,6 +155,8 @@ async fn main() -> Result<()> {
     // (port 445), so the homes are browsable over `smb://<host>/clones` too.
     tokio::spawn(claude::run_poller(app.clone()));
     tokio::spawn(claude::run_rotator(app.clone()));
+    tokio::spawn(codex::run_poller(app.clone()));
+    tokio::spawn(codex::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
     tokio::spawn(homes::run(app.clone()));
     tokio::spawn(smb::run(app.clone()));
