@@ -268,6 +268,10 @@ so those tools reflect the clone's own 16-cpu / 32-GiB limits.
   re-create clones**. The binds are applied at clone-create time, so only clones created after
   the probe saw lxcfs get them; existing clones keep their old view until re-created. The
   binds are container config only — never baked into a committed image.
+- **Load average is the one exception.** Even with lxcfs installed and its `loadavg` mask in
+  place, the reported load average stays host-wide — lxcfs only virtualizes it per-cgroup with
+  its non-default `-l` startup flag, which RMNG's mount doesn't pass — while `free`, `nproc`,
+  and the rest of `uptime`'s output are masked and do reflect the clone's own limits.
 
 ## The image build
 

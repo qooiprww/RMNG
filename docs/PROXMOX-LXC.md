@@ -74,11 +74,24 @@ apt-get install -y lxcfs
 ls /var/lib/lxcfs/proc/            # cpuinfo loadavg meminfo stat swaps uptime
 ```
 
+**Inside the Docker-host CT specifically**, Ubuntu's `lxcfs.service` ships
+`ConditionVirtualization=!container` — so the unit is silently skipped ("unmet condition")
+when installed inside an LXC CT rather than on bare metal, and the `ls` above comes up
+empty. Drop that condition with an override (found live: `apt-get install` alone is not
+enough in this environment):
+
+```sh
+mkdir -p /etc/systemd/system/lxcfs.service.d
+printf '[Unit]\nConditionVirtualization=\n' > /etc/systemd/system/lxcfs.service.d/in-ct.conf
+systemctl daemon-reload && systemctl enable --now lxcfs
+```
+
 This needs the CT feature `fuse=1` (set in §1). It's entirely optional: without lxcfs,
 clones just see host-wide `/proc` values and everything else works. RMNG auto-detects it —
 the setup wizard's environment checklist shows an advisory **LXCFS** row (present / not
 installed). Install it, then restart the control-server (or hit Settings → Test) and
-re-create clones to pick it up.
+re-create clones to pick it up (see the caveat on load average in
+[DEPLOY.md](DEPLOY.md#clone-proc-limits-lxcfs)).
 
 ## 3. Verify the daemon before deploying RMNG
 

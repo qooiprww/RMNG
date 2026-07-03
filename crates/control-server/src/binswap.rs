@@ -260,7 +260,11 @@ async fn sweep_once(app: &App) {
 /// 6. **Swap** — [`crate::provision::redeploy_clone`] the survivors; bump `failures` + set
 ///    `next_swap_allowed = now + backoff(failures)`. On `Ok` clear `pending` (the re-Hello
 ///    check verifies + resets); on `Err` set `pending = the attempted units` (covers
-///    upload-ok/start-failed).
+///    upload-ok/start-failed) and `tokio::spawn` a timer that sleeps until the backoff
+///    deadline then calls [`SwapState::request_check`] itself — a failed swap has no
+///    guaranteed re-Hello to lean on (the daemon that would send it is the one that just
+///    failed to start), so this timer is the real retry; the sweep stays the
+///    belt-and-braces backstop.
 async fn check_host(app: &App, id: &str) {
     // 1a. A clone we manage? (state store = ownership authority; rejects build workers.)
     if !app.store.get().hosts.iter().any(|h| h.id == id && h.managed) {
@@ -415,9 +419,27 @@ async fn check_host(app: &App, id: &str) {
             guard.pending = to_swap.iter().map(|(u, _)| u.bin).collect();
             tracing::warn!(
                 target: "binswap",
-                "{id}: swap FAILED ({e:#}); retrying after {boff}s. If it persists, inspect the \
+                "{id}: swap FAILED ({e:#}); retrying in ~{boff}s. If it persists, inspect the \
                  clone's `systemctl --user` units (rmng-clone-daemon / agent-wrapper)"
             );
+            // Self-re-enqueue for the backoff deadline. A failed swap otherwise has no
+            // path back into the channel except the next sweep pass (up to
+            // SWEEP_INTERVAL later) or the clone's own re-Hello — but the live failure
+            // this guards against (create-time swap racing the clone's `systemctl
+            // --user` bus not being up yet) means the daemon that would send that Hello
+            // is exactly the one that just failed to (re)start, so there IS no Hello to
+            // rely on. Spawning here makes the WARN above ("retrying in ~Ns") true
+            // instead of aspirational. `request_check` is a cheap, idempotent send, and
+            // `check_host`'s own eligibility gates (managed + running) plus the
+            // pending/backoff bookkeeping make a duplicate or now-stale enqueue
+            // harmless — this timer racing a sweep or Hello that fires first just
+            // means one of the two checks is a no-op.
+            let app = app.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(boff)).await;
+                app.swap.request_check(&id);
+            });
         }
     }
 }
