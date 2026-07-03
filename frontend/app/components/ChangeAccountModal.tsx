@@ -10,13 +10,13 @@ import type { CloneGroup } from "~/lib/wire/CloneGroup";
 
 /** Current selection for a host: the verbatim selection when recorded ("auto", "none",
  *  `group:<name>`, or an email), else derived from its group/account for legacy hosts. */
-function currentValue(host: Host): string {
+export function currentValue(host: Host): string {
   if (host.claudeSelection) return host.claudeSelection;
   if (host.claudeGroup) return `group:${host.claudeGroup}`;
   return host.claudeAccountEmail ?? "auto";
 }
 
-function currentCodexValue(host: Host): string {
+export function currentCodexValue(host: Host): string {
   if (host.codexSelection) return host.codexSelection;
   if (host.codexGroup) return `group:${host.codexGroup}`;
   return host.codexAccountEmail ?? "auto";

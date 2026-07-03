@@ -1,6 +1,10 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 
-import { ChangeAccountModal } from "~/components/ChangeAccountModal";
+import {
+  ChangeAccountModal,
+  currentCodexValue,
+  currentValue,
+} from "~/components/ChangeAccountModal";
 import { CloneModal } from "~/components/CloneModal";
 import { CommitImageModal } from "~/components/CommitImageModal";
 import { ImportAccountModal } from "~/components/ImportAccountModal";
@@ -441,14 +445,28 @@ function Dashboard({
           onClose={() => setChangeHost(null)}
           onSubmit={(claude, codex) => {
             setChanging(true);
+            // Baselines must use the SAME group-aware derivation the modal shows
+            // (currentValue/currentCodexValue), or a legacy group-bound host whose
+            // selection is stored only as a group would spuriously fire — or mask — a swap.
             const jobs: Promise<unknown>[] = [];
-            if (claude !== (changeHost.claudeSelection ?? changeHost.claudeAccountEmail ?? "auto"))
+            if (claude !== currentValue(changeHost))
               jobs.push(swapClaudeAccount(changeHost.id, claude));
-            if (codex !== (changeHost.codexSelection ?? changeHost.codexAccountEmail ?? "auto"))
+            if (codex !== currentCodexValue(changeHost))
               jobs.push(swapCodexAccount(changeHost.id, codex));
-            Promise.allSettled(jobs).finally(() => {
+            Promise.allSettled(jobs).then((results) => {
               setChanging(false);
-              setChangeHost(null);
+              const failed = results.find((r) => r.status === "rejected");
+              if (failed) {
+                // Surface the failure and keep the modal open so the operator can retry
+                // (a silent close would look like the token swap succeeded).
+                setError(
+                  (failed as PromiseRejectedResult).reason?.message ??
+                    "account swap failed",
+                );
+              } else {
+                setError(null);
+                setChangeHost(null);
+              }
             });
           }}
         />
