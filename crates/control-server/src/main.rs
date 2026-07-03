@@ -12,6 +12,7 @@ mod claude;
 mod config;
 mod docker;
 mod files;
+mod forward;
 mod homes;
 mod jobs;
 mod linear;

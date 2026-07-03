@@ -33,6 +33,10 @@ pub struct App {
     /// tick; `/events` fans it out as a named `stats` SSE event. SSE-only — never persisted
     /// to `state.json` (see [`crate::monitor::StatsBus`]).
     pub stats: Arc<crate::monitor::StatsBus>,
+    /// Volatile port-forward runtime status. Published by the media plane (viewer
+    /// reports + data-conn counts); `/events` fans it out as a named `forwards` SSE
+    /// event. SSE-only — never persisted (see [`crate::forward::ForwardBus`]).
+    pub forwards: Arc<crate::forward::ForwardBus>,
 }
 
 impl App {
@@ -55,6 +59,7 @@ impl App {
             docker,
             swap: Arc::new(crate::binswap::SwapState::default()),
             stats: Arc::new(crate::monitor::StatsBus::new()),
+            forwards: Arc::new(crate::forward::ForwardBus::new()),
         }
     }
 

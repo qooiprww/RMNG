@@ -111,14 +111,17 @@ pub async fn serve(app: App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `GET /events` — two multiplexed streams on one connection:
+/// `GET /events` — three multiplexed streams on one connection:
 ///   - the persisted `ControlState` as the default (unnamed) event → the client's
 ///     `onmessage`: full snapshot on connect, then one frame per change;
 ///   - the volatile per-host CPU/RAM map as a named `stats` event → the client's
-///     `addEventListener("stats")`: latest snapshot on connect, then one per poll tick.
+///     `addEventListener("stats")`: latest snapshot on connect, then one per poll tick;
+///   - the volatile port-forward runtime map as a named `forwards` event → the client's
+///     `addEventListener("forwards")`: snapshot on connect, then one per status change.
 ///
-/// Stats ride a separate SSE-only bus ([`crate::monitor::StatsBus`]) so they never enter
-/// `ControlState` / `state.json` (which persists on every mutation). 20s keep-alive ping.
+/// Stats and forwards ride separate SSE-only buses ([`crate::monitor::StatsBus`],
+/// [`crate::forward::ForwardBus`]) so they never enter `ControlState` / `state.json`
+/// (which persists on every mutation). 20s keep-alive ping.
 async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (snapshot, rx) = app.store.subscribe();
     let state_initial = futures::stream::once(async move { Ok(Event::default().data(snapshot)) });
@@ -141,8 +144,23 @@ async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
     });
     let stats_stream = stats_initial.chain(stats_updates);
 
-    Sse::new(futures::stream::select(state_stream, stats_stream))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)).text("ping"))
+    let (fwd_snapshot, fwd_rx) = app.forwards.subscribe();
+    let fwd_initial = futures::stream::once(
+        async move { Ok(Event::default().event("forwards").data(fwd_snapshot)) },
+    );
+    let fwd_updates = BroadcastStream::new(fwd_rx).filter_map(|r| async move {
+        match r {
+            Ok(json) => Some(Ok(Event::default().event("forwards").data(json))),
+            Err(_) => None,
+        }
+    });
+    let fwd_stream = fwd_initial.chain(fwd_updates);
+
+    Sse::new(futures::stream::select(
+        state_stream,
+        futures::stream::select(stats_stream, fwd_stream),
+    ))
+    .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)).text("ping"))
 }
 
 #[derive(Deserialize)]
