@@ -47,7 +47,7 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
-use wire::{ContainerStats, DockerConfig, EnvCheckRow, ImageInfo, SetupEnv};
+use wire::{ContainerStats, DockerConfig, EnvCheckRow, ImageInfo, SetupEnv, UpdateStatus};
 
 // --- Constants ------------------------------------------------------------------------
 
@@ -269,6 +269,17 @@ pub struct ManagedContainer {
     /// The image reference the container was created from, as `docker ps` shows it.
     pub image: String,
     pub running: bool,
+}
+
+/// The running control-server image's identity, read from its own container → image.
+/// `repo_digest` is the `repo@sha256:…` for the configured repo (the update-check
+/// baseline); `revision`/`created` are the OCI labels stamped by scripts/publish-server.sh.
+#[derive(Debug, Clone, Default)]
+pub struct ServerImageInfo {
+    pub image_id: String,
+    pub repo_digest: Option<String>,
+    pub revision: Option<String>,
+    pub created: Option<String>,
 }
 
 /// One file to drop into a container via `upload_tar`. `mode` is the raw unix mode
@@ -805,6 +816,95 @@ impl DockerCtl {
             .await
             .with_context(|| format!("inspecting image {reference}"))?;
         Ok(info.config.and_then(|c| c.labels).unwrap_or_default())
+    }
+
+    /// The running control-server image's identity: inspect our own container to get its
+    /// image id, then inspect that image for the RepoDigest matching `repo` + the OCI
+    /// version labels. `repo` is the reference-without-tag of `docker.serverImage`.
+    pub async fn self_image_info(&self, self_id: &str, repo: &str) -> Result<ServerImageInfo> {
+        let docker = self.daemon()?;
+        let ctr = docker
+            .inspect_container(self_id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+            .context("inspecting self container for image info")?;
+        let image_id = ctr.image.clone().ok_or_else(|| anyhow!("self container has no image id"))?;
+        let img = docker.inspect_image(&image_id).await.context("inspecting self image")?;
+        let labels = img.config.as_ref().and_then(|c| c.labels.clone()).unwrap_or_default();
+        // RepoDigest for our repo, e.g. "pegasis0/rmng@sha256:…". Match on the repo prefix.
+        let repo_digest = img
+            .repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find(|rd| rd.starts_with(&format!("{repo}@")));
+        Ok(ServerImageInfo {
+            image_id,
+            repo_digest,
+            revision: labels.get("org.opencontainers.image.revision").cloned().filter(|s| !s.is_empty()),
+            created: labels.get("org.opencontainers.image.created").cloned().filter(|s| !s.is_empty()),
+        })
+    }
+
+    /// The remote manifest digest of `reference` from the registry, WITHOUT pulling
+    /// (Docker's `/distribution/{name}/json`). Returns the descriptor digest string
+    /// (`sha256:…`). Surfaces registry errors verbatim (auth / rate-limit / not-found).
+    pub async fn registry_digest(&self, reference: &str) -> Result<String> {
+        let info = self
+            .daemon()?
+            .inspect_registry_image(reference, None)
+            .await
+            .with_context(|| format!("querying the registry for {reference}"))?;
+        // bollard's DistributionInspect carries an OCI descriptor with the manifest digest;
+        // the digest is optional in the model, so treat its absence as an error.
+        info.descriptor
+            .digest
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| anyhow!("registry returned no manifest digest for {reference}"))
+    }
+
+    /// Compute the full update status for the UI: current identity + remote digest +
+    /// available flag. Never bails — registry / daemon failures land in `status.error`
+    /// with `available = false`, so the UI can always render something.
+    pub async fn check_update(&self, reference: &str, self_id: Option<&str>) -> UpdateStatus {
+        let (repo, _tag) = split_reference(reference);
+        let mut status = UpdateStatus {
+            current_revision: None,
+            current_created: None,
+            current_digest: None,
+            remote_digest: None,
+            available: false,
+            reference: reference.to_string(),
+            error: None,
+        };
+        // Current identity (dev mode / no self container → leave current_* None).
+        if let Some(id) = self_id {
+            match self.self_image_info(id, &repo).await {
+                Ok(info) => {
+                    status.current_revision = info.revision;
+                    status.current_created = info.created;
+                    status.current_digest = info.repo_digest.map(|rd| {
+                        // Keep just the sha256:… part for a clean compare/display.
+                        rd.split_once('@').map(|(_, d)| d.to_string()).unwrap_or(rd)
+                    });
+                }
+                Err(e) => status.error = Some(format!("reading current image: {e}")),
+            }
+        }
+        // Remote digest.
+        match self.registry_digest(reference).await {
+            Ok(remote) => {
+                status.available = is_update_available(status.current_digest.as_deref(), &remote);
+                status.remote_digest = Some(remote);
+            }
+            Err(e) => {
+                // Don't overwrite a current-image error with the remote one; append.
+                let msg = format!("checking registry: {e}");
+                status.error = Some(match status.error.take() {
+                    Some(prev) => format!("{prev}; {msg}"),
+                    None => msg,
+                });
+            }
+        }
+        status
     }
 
     /// An image's `Config.StopSignal` (e.g. `SIGRTMIN+3`), or `None` when unset. The
@@ -1584,6 +1684,15 @@ fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
+/// Whether a remote digest represents an update over the running one. Unknown local digest
+/// (dev build / no RepoDigest) → true (can't prove up-to-date, so offer the update).
+fn is_update_available(current_digest: Option<&str>, remote_digest: &str) -> bool {
+    match current_digest {
+        Some(cur) => cur != remote_digest,
+        None => true,
+    }
+}
+
 /// The lxcfs `/proc` binds for a clone's `HostConfig`, given the cached probe verdict
 /// (`lxcfs_ok`). Pure (no I/O) so it's unit-testable and safe: it emits binds ONLY when
 /// the probe confirmed lxcfs is present, which is the single guard against the
@@ -2012,6 +2121,16 @@ mod tests {
     fn short_id_strips_sha_prefix() {
         assert_eq!(short_id("sha256:abcdef0123456789"), "abcdef012345");
         assert_eq!(short_id("abcdef0123456789"), "abcdef012345");
+    }
+
+    #[test]
+    fn is_update_available_compares_digests() {
+        // No local digest known → treat as available (can't prove up-to-date).
+        assert!(super::is_update_available(None, "sha256:bbb"));
+        // Same digest → up to date.
+        assert!(!super::is_update_available(Some("sha256:aaa"), "sha256:aaa"));
+        // Different digest → update available.
+        assert!(super::is_update_available(Some("sha256:aaa"), "sha256:bbb"));
     }
 
     #[test]
