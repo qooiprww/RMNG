@@ -211,8 +211,18 @@ export function SettingsPanel({
     setClaudeGroups(c.cloneGroups.map((g) => ({ name: g.name, accounts: [...g.accounts] })));
   }
 
+  // Seed the form from the server ONCE, when the panel opens. This must NOT depend on
+  // `onClose` (a fresh inline arrow on every parent render): the dashboard re-renders
+  // every few seconds on each `stats` SSE frame, and re-running this would re-seed the
+  // form from the server and wipe the user's in-progress edits.
   useEffect(() => {
     getConfig().then(load).catch((e: Error) => setError(e.message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Escape closes — its own effect so it can track the latest `onClose` without
+  // re-triggering the config fetch above.
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
