@@ -241,7 +241,7 @@ export function SidebarHost({
               {host.linearTicket}
             </span>
           ) : null}
-          <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800">
+          <span className="min-w-0 flex-1 break-words text-sm font-medium text-slate-800">
             {host.displayName ?? host.id}
           </span>
           {!busy && host.unread && !selected ? (
