@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Phase 20 — dev toolbox: the CT-104 dev-template app set, ALL via apt (no flatpak/snap):
 # dev/CLI tools, Docker, cloud CLIs, build libs, fonts, themes, browsers, Cursor, VS Code,
-# Celluloid/ffmpeg, Extension Manager, ONLYOFFICE, plus HMCL / Mission Center / Monaspace
-# from their upstream releases, and the system-wide GNOME dconf defaults.
+# Celluloid/ffmpeg, Extension Manager, ONLYOFFICE, plus HMCL / Mission Center / Monaspace /
+# adw-gtk3 from their upstream releases, and the system-wide GNOME dconf defaults.
 #
 # BEST-EFFORT by design: these are genuinely optional apps, so a transient network/apt
 # failure WARNs (via `apti` / the `mc_install`+`mona_install` functions) rather than sinking
@@ -146,14 +146,37 @@ mona_install(){
 log "dev toolbox: Monaspace fonts (full: static + frozen + variable)"
 mona_install && log "Monaspace installed ($(find /usr/share/fonts/monaspace -type f 2>/dev/null | wc -l) files)" || warn "Monaspace install skipped"
 
+# adw-gtk3 (https://github.com/lassekongo83/adw-gtk3) — a GTK3 theme matching libadwaita's
+# look, so legacy GTK3 apps stop clashing with the GTK4/libadwaita apps that already look
+# native. Pinned release tarball (NOT `main`); the sha256 below was independently downloaded
+# + hashed (matches the digest GitHub's own release-assets API reports for this file).
+# UNLIKE the best-effort apps above (HMCL / Mission Center / Monaspace), this is
+# LOAD-BEARING: it becomes the system default theme below, so a theme mismatch would be
+# visible product surface. No `apti`/`|| warn` here — a failed download, checksum mismatch,
+# or extract trips `set -e` and FAILS THE BUILD.
+ADW_GTK3_VERSION=v6.5
+ADW_GTK3_URL="https://github.com/lassekongo83/adw-gtk3/releases/download/${ADW_GTK3_VERSION}/adw-gtk3${ADW_GTK3_VERSION}.tar.xz"
+ADW_GTK3_SHA256=a81780fadfc432be0fc3d89c4ebb41aa28e4f032d42c36f9789c57dd10cfa41c
+log "adw-gtk3 ${ADW_GTK3_VERSION} (pinned + sha256-verified, load-bearing)"
+curl -fsSL "$ADW_GTK3_URL" -o /tmp/adw-gtk3.tar.xz
+echo "${ADW_GTK3_SHA256}  /tmp/adw-gtk3.tar.xz" | sha256sum -c -
+install -d -m0755 /usr/share/themes
+# Filter to the two expected top-level dirs: also doubles as a structure assertion — if the
+# release ever stops shipping either, `tar` exits non-zero and (via set -e) fails the build.
+tar -xJf /tmp/adw-gtk3.tar.xz -C /usr/share/themes/ adw-gtk3 adw-gtk3-dark
+rm -f /tmp/adw-gtk3.tar.xz
+log "adw-gtk3 installed: $(ls -d /usr/share/themes/adw-gtk3 /usr/share/themes/adw-gtk3-dark | wc -l)/2 dirs present"
+
 # GNOME desktop defaults, system-wide via dconf (session-independent → every clone gets them
-# on first boot): Papirus icons, Monaspace Neon Frozen 11 as the default monospace font, and
-# all three window buttons (minimize/maximize/close). Users can still override per-session.
-log "GNOME desktop defaults: Papirus icons + Monaspace Neon Frozen mono + 3 window buttons"
+# on first boot): adw-gtk3 as the GTK theme, Papirus icons, Monaspace Neon Frozen 11 as the
+# default monospace font, and all three window buttons (minimize/maximize/close). Users can
+# still override per-session.
+log "GNOME desktop defaults: adw-gtk3 + Papirus icons + Monaspace Neon Frozen mono + 3 window buttons"
 install -d /etc/dconf/profile /etc/dconf/db/local.d
 printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user
 cat > /etc/dconf/db/local.d/00-rmng-desktop <<'DCONF'
 [org/gnome/desktop/interface]
+gtk-theme='adw-gtk3'
 icon-theme='Papirus'
 monospace-font-name='Monaspace Neon Frozen 11'
 
