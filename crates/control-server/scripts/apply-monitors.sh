@@ -20,6 +20,16 @@ uctl(){ runuser -u "$USER" -- env \
   XDG_RUNTIME_DIR="/run/user/$U" \
   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$U/bus" \
   systemctl --user "$@"; }
+# Belt-and-suspenders on every exit path, success OR failure: another actor (the binswap
+# sweep, a manual /api/monitors/apply racing this one) can land a concurrent bounce of the
+# SAME rmng-clone-daemon.service mid-script and abort us between the `stop` and `start`
+# below — that's exactly what the deliberately-unguarded restart/start calls further down
+# are for (see the comment there); this trap is the safety net for whatever they don't
+# catch. It does NOT change the script's exit code (no `exit` inside it, and every command
+# in it is `|| true`-guarded) — a real failure still propagates so the caller
+# (`provision::apply_monitors`) still surfaces it — it only makes sure the daemon itself is
+# left reset-failed + started so a would-be swap has a live target instead of a stranded one.
+trap 'uctl reset-failed rmng-clone-daemon.service >&2 2>/dev/null || true; uctl start rmng-clone-daemon.service >&2 2>/dev/null || true' EXIT
 
 say "config monitors=$MONS"
 sed -i "s#MUTTER_DEBUG_DUMMY_MODE_SPECS=.*#MUTTER_DEBUG_DUMMY_MODE_SPECS=$MODE_SPECS#" "$GU"
@@ -32,7 +42,12 @@ uctl daemon-reload >&2
 # explicit restart into the StartLimit and leaving the service failed.
 say "restarting headless GNOME"
 uctl stop rmng-clone-daemon.service >&2 2>/dev/null || true
-uctl restart gnome-headless.service >&2
+# One retry: a concurrent redeploy_clone (or another apply-monitors run) touching this same
+# unit can land a transient systemd job-conflict on the first attempt. Retry once after a
+# short beat for that transient case; a second failure is a real problem and must still
+# abort the script (`set -e`) rather than be swallowed — the EXIT trap above still leaves
+# the daemon reset-failed + started regardless of how this script ends.
+uctl restart gnome-headless.service >&2 2>/dev/null || { sleep 2; uctl restart gnome-headless.service >&2; }
 sleep 6
 say "starting clone-daemon"
 uctl reset-failed rmng-clone-daemon.service >&2 2>/dev/null || true
