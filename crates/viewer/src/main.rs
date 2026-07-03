@@ -12,7 +12,7 @@
 //!
 //! Port-1 framing: `[u8 tag]` then tag 0 = `[u32be monitor_id][u32be len][AnnexB AU]`
 //! (video), tag 1 = `[u32be len][JSON ClipboardMsg]`, tag 2 = `[u32be len][JSON CursorMeta]`.
-//! viewer→server: `[u8 tag][u32be len][json]` (0 input, 1 clipboard). Auto-reconnects.
+//! viewer→server: `[u8 tag][u32be len][json]` (0 input, 1 clipboard, 2 forward-status). Auto-reconnects.
 //!
 //! The server address (`host:port`) is read from `~/.config/rmng-viewer/config.json`
 //! and editable at runtime via the main window's title-bar Settings button (see
@@ -53,6 +53,7 @@ use wire::ChromaMode;
 use wire::socket::{
     ClipboardData, ClipboardMsg, ClipboardOffer, ClipboardRequest, CursorMeta, CursorShape, MonitorPlacement,
 };
+use wire::forward::{ForwardStatusMsg, ForwardsMsg};
 use wire::viewer::ModeMsg;
 
 fn main() -> Result<()> {
@@ -172,6 +173,16 @@ fn run_gui() -> Result<()> {
     let addr: ServerAddr = Arc::new(Mutex::new(config::load().server_addr));
     let aus: VideoAus = Arc::new(Mutex::new(VecDeque::new()));
     let writer: Writer = Arc::new(Mutex::new(None));
+    // Port-forward manager: reports status back as port-1 tag-2 frames via `writer`.
+    let fwd_mgr: Arc<forward::ForwardManager> = {
+        let writer = writer.clone();
+        let report: forward::StatusReport = Arc::new(move |msg: ForwardStatusMsg| {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                send_tagged(&writer, 2, json);
+            }
+        });
+        Arc::new(forward::ForwardManager::new(report))
+    };
     let inbox: ClipInbox = Arc::new(Mutex::new(VecDeque::new()));
     let cursors: Cursors = Arc::new(Mutex::new(HashMap::new()));
     let reported: ReportedLayout = Arc::new(Mutex::new(Vec::new()));
@@ -180,8 +191,8 @@ fn run_gui() -> Result<()> {
 
     // Net thread: reconnect loop; read [u8 tag][…] → video queue / clipboard / cursor / layout.
     {
-        let (aus, srcs, writer, inbox, cursors, reported, warp, addr) =
-            (aus.clone(), srcs.clone(), writer.clone(), inbox.clone(), cursors.clone(), reported.clone(), warp.clone(), addr.clone());
+        let (aus, srcs, writer, inbox, cursors, reported, warp, addr, fwd_mgr) =
+            (aus.clone(), srcs.clone(), writer.clone(), inbox.clone(), cursors.clone(), reported.clone(), warp.clone(), addr.clone(), fwd_mgr.clone());
         std::thread::spawn(move || {
             loop {
                 // Re-read the (possibly just-changed) address each reconnect, so the
@@ -207,8 +218,8 @@ fn run_gui() -> Result<()> {
                         let mut rd = std::io::BufReader::new(rd);
                         let mut tag = [0u8; 1];
                         while rd.read_exact(&mut tag).is_ok() {
-                            // tags 1 (clipboard), 2 (cursor), 3 (layout), 4 (mode) are all [u32 len][json].
-                            if matches!(tag[0], 1 | 2 | 3 | 4) {
+                            // tags 1 (clipboard), 2 (cursor), 3 (layout), 4 (mode), 5 (forwards) are all [u32 len][json].
+                            if matches!(tag[0], 1 | 2 | 3 | 4 | 5) {
                                 let mut lb = [0u8; 4];
                                 if rd.read_exact(&mut lb).is_err() {
                                     break;
@@ -232,6 +243,18 @@ fn run_gui() -> Result<()> {
                                 } else if tag[0] == 3 {
                                     if let Ok(l) = serde_json::from_slice::<Vec<MonitorPlacement>>(&body) {
                                         *reported.lock().unwrap() = l;
+                                    }
+                                } else if tag[0] == 5 {
+                                    // Desired forward set: reconcile local listeners. The
+                                    // data port lives on the same host as the video port.
+                                    if let Ok(m) = serde_json::from_slice::<ForwardsMsg>(&body) {
+                                        let server = addr.lock().unwrap().clone();
+                                        let host = server
+                                            .rsplit_once(':')
+                                            .map(|(h, _)| h.to_string())
+                                            .unwrap_or(server);
+                                        let forward_addr = format!("{host}:{}", m.forward_port);
+                                        fwd_mgr.reconcile(m.rules, forward_addr);
                                     }
                                 } else if let Ok(c) = serde_json::from_slice::<CursorMeta>(&body) {
                                     let now = Instant::now();
