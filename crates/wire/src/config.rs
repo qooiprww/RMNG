@@ -25,10 +25,19 @@ pub struct ListenConfig {
     /// `RMNG_DAEMON_MCP_PORT`). Same value for every clone.
     #[serde(default = "default_daemon_mcp")]
     pub daemon_mcp: u16,
+    /// The control-server's port-forward data plane. The viewer opens one TCP
+    /// connection here per accepted local socket; the server splices to the clone.
+    /// Restart-required (bound at startup).
+    #[serde(default = "default_forward")]
+    pub forward: u16,
 }
 
 fn default_daemon_mcp() -> u16 {
     9004
+}
+
+fn default_forward() -> u16 {
+    9005
 }
 
 /// Chroma subsampling mode for the port-1 viewer video stream.
@@ -51,7 +60,7 @@ pub enum ChromaMode {
 
 impl Default for ListenConfig {
     fn default() -> Self {
-        Self { web: 9000, video: 9001, clone_mcp: 9002, global_mcp: 9003, daemon_mcp: default_daemon_mcp() }
+        Self { web: 9000, video: 9001, clone_mcp: 9002, global_mcp: 9003, daemon_mcp: default_daemon_mcp(), forward: default_forward() }
     }
 }
 
@@ -538,5 +547,20 @@ mod tests {
         assert_eq!(r.docker.hostname_prefix, "dev-");
         // template_reference is non-secret — it passes through the redacted view intact.
         assert_eq!(r.docker.template_reference, "pegasis0/rmng-template:v9");
+    }
+}
+
+#[cfg(test)]
+mod listen_tests {
+    use super::*;
+
+    #[test]
+    fn listen_config_forward_defaults_9005() {
+        assert_eq!(ListenConfig::default().forward, 9005);
+        // absent in JSON → default
+        let lc: ListenConfig =
+            serde_json::from_str(r#"{"web":9000,"video":9001,"cloneMcp":9002,"globalMcp":9003}"#)
+                .unwrap();
+        assert_eq!(lc.forward, 9005);
     }
 }

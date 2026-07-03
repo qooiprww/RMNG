@@ -31,5 +31,5 @@ pub use config::{
 pub use control::{
     AgentReport, Chat, ChatMessage, ChatRole, ClaudeSpend, ClaudeUsage, ClaudeUsageWindow,
     ContainerStats, ControlState, Host, MonitorSpec, MonitorState, Operation, OperationKind,
-    OperationStatus, Provider,
+    OperationStatus, PortForward, Provider,
 };

@@ -56,6 +56,23 @@ pub enum MonitorState {
     Offline,
 }
 
+/// One local-forward rule: a TCP port inside this clone (`remote_port`) exposed at
+/// `127.0.0.1:<local_port>` on the machine running the native viewer. Persisted in
+/// `state.json`; the viewer runs the listener. `id` is derived server-side as
+/// `f{local_port}` (local ports are globally unique across all hosts' rules).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct PortForward {
+    pub id: String,
+    pub remote_port: u16,
+    pub local_port: u16,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../frontend/app/lib/wire/")]
@@ -140,6 +157,11 @@ pub struct Host {
     /// monitor poller on that transition, cleared when the clone is activated.
     #[serde(default)]
     pub unread: bool,
+    /// Local port-forward rules for this host (see [`PortForward`]). Persisted; the
+    /// viewer runs the listeners and reports status out-of-band (volatile `forwards`
+    /// SSE event, never stored here).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<PortForward>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -443,5 +465,34 @@ mod tests {
         assert!(s.contains("\"fiveHour\""));
         let back: ControlState = serde_json::from_str(&s).unwrap();
         assert_eq!(st, back);
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    #[test]
+    fn port_forward_round_trips_camel_case() {
+        let f = PortForward {
+            id: "f8080".into(),
+            remote_port: 3000,
+            local_port: 8080,
+            enabled: true,
+            label: Some("dev".into()),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"remotePort\":3000"), "got {json}");
+        assert!(json.contains("\"localPort\":8080"), "got {json}");
+        assert_eq!(serde_json::from_str::<PortForward>(&json).unwrap(), f);
+    }
+
+    #[test]
+    fn host_forwards_defaults_empty_and_is_omitted() {
+        let json = r#"{"id":"h","host":"h"}"#;
+        let h: Host = serde_json::from_str(json).unwrap();
+        assert!(h.forwards.is_empty());
+        // empty forwards must not serialize (skip_serializing_if)
+        assert!(!serde_json::to_string(&h).unwrap().contains("forwards"));
     }
 }

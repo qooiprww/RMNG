@@ -9,4 +9,10 @@ export type ListenConfig = { web: number, video: number, cloneMcp: number, globa
  * tools to `http://{clone-ip}:{daemon_mcp}`; each clone-daemon listens here (set via
  * `RMNG_DAEMON_MCP_PORT`). Same value for every clone.
  */
-daemonMcp: number, };
+daemonMcp: number, 
+/**
+ * The control-server's port-forward data plane. The viewer opens one TCP
+ * connection here per accepted local socket; the server splices to the clone.
+ * Restart-required (bound at startup).
+ */
+forward: number, };
