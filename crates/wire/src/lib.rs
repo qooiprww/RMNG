@@ -18,6 +18,7 @@
 pub mod avc444;
 pub mod config;
 pub mod control;
+pub mod forward;
 pub mod mcp;
 pub mod net;
 pub mod socket;
