@@ -57,6 +57,7 @@ pub fn router(app: App) -> Router {
         .route("/api/config", get(config_get).put(config_put))
         .route("/api/config/test", post(config_test))
         .route("/api/setup/env", get(setup_env))
+        .route("/api/server/version", get(server_version))
         .route("/api/images", get(images_list))
         .route("/api/images/pull", post(images_pull))
         .route("/api/images/commit", post(images_commit))
@@ -818,6 +819,15 @@ fn collapse_env_report(report: &crate::docker::EnvReport) -> (bool, String) {
 /// render node). The report is refreshed at startup + by `config_test("docker")`.
 async fn setup_env(State(app): State<App>) -> Json<wire::SetupEnv> {
     Json(app.docker.env().await.to_setup_env())
+}
+
+/// `GET /api/server/version` — the control-server's own version + whether Hub has a newer
+/// image (registry digest compare, no pull). Never 500s: registry/daemon failures land in
+/// `UpdateStatus.error` so the UI always renders.
+async fn server_version(State(app): State<App>) -> Json<wire::UpdateStatus> {
+    let reference = app.config().docker.server_image;
+    let self_id = app.docker.env().await.self_container;
+    Json(app.docker.check_update(&reference, self_id.as_deref()).await)
 }
 
 // --- Claude accounts -------------------------------------------------------

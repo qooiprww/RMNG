@@ -2,6 +2,7 @@ import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
 import type { ConfigPutResponse } from "~/lib/wire/ConfigPutResponse";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
 import type { SetupEnv } from "~/lib/wire/SetupEnv";
+import type { UpdateStatus } from "~/lib/wire/UpdateStatus";
 
 // Client-side API wrappers. Each POSTs JSON; the server mutates state and
 // broadcasts, so the caller doesn't need the response beyond error handling —
@@ -78,6 +79,8 @@ export const deleteImage = (reference: string) =>
   postJson("/api/images/delete", { reference });
 /** The environment preflight rows for the setup wizard's first step. */
 export const getSetupEnv = () => getJson("/api/setup/env") as Promise<SetupEnv>;
+/** The control-server's own version + whether Hub has a newer image (no pull). */
+export const getUpdateStatus = () => getJson("/api/server/version") as Promise<UpdateStatus>;
 
 /** Force an immediate Claude usage poll (refresh tokens + fetch 5h/7d). */
 export const refreshClaudeUsage = () => postJson("/api/claude/refresh", {});
