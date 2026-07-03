@@ -38,7 +38,7 @@ export type ClonePayload = (
       | { create: { team: string; title: string; description: string } }
     ) & { agentInstructions?: string; claudeInstructions?: string })
   | { plain: { title: string; message: string } }
-) & { claudeAccount?: string; preset?: string };
+) & { claudeAccount?: string; codexAccount?: string; preset?: string };
 
 export const activate = (id: string | null) =>
   postJson("/api/activate", { id });
@@ -92,6 +92,29 @@ export const recommendedClaudeAccount = () =>
  *  "group:<name>". `account` in the reply is null when set to "none". */
 export const swapClaudeAccount = (host: string, account: string) =>
   postJson("/api/claude/swap", { host, account }) as Promise<{
+    ok: boolean;
+    account: string | null;
+    group: string | null;
+    selection: string;
+  }>;
+
+export const refreshCodexUsage = () => postJson("/api/codex/refresh", {});
+
+export const checkCodexImport = (host: string) =>
+  postJson("/api/codex/import/check", { host }) as Promise<{
+    email: string;
+    plan: string | null;
+    accountId: string;
+  }>;
+
+export const importCodexAccount = (host: string) =>
+  postJson("/api/codex/import", { host }) as Promise<{ email: string; cleared: boolean }>;
+
+export const recommendedCodexAccount = () =>
+  getJson("/api/codex/recommended") as Promise<{ email: string | null }>;
+
+export const swapCodexAccount = (host: string, account: string) =>
+  postJson("/api/codex/swap", { host, account }) as Promise<{
     ok: boolean;
     account: string | null;
     group: string | null;

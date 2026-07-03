@@ -19,6 +19,7 @@ import {
   pullTemplate,
   putConfig,
   refreshClaudeUsage,
+  refreshCodexUsage,
   reorder,
   swapClaudeAccount,
   testConfig,
@@ -362,6 +363,9 @@ function Dashboard({
           accounts={(state.claudeAccounts ?? []).filter(
             (a) => a.assignable && a.provider !== "codex",
           )}
+          codexAccounts={(state.claudeAccounts ?? []).filter(
+            (a) => a.assignable && a.provider === "codex",
+          )}
           onClose={() => setCloneOpen(false)}
           onClone={(image, payload) => {
             run(cloneHost(image, payload));
@@ -374,6 +378,9 @@ function Dashboard({
         <SettingsPanel
           accountEmails={(state.claudeAccounts ?? [])
             .filter((a) => a.provider !== "codex")
+            .map((a) => a.email)}
+          codexAccountEmails={(state.claudeAccounts ?? [])
+            .filter((a) => a.provider === "codex")
             .map((a) => a.email)}
           onClose={() => setSettingsOpen(false)}
           getConfig={getConfig}
@@ -415,6 +422,7 @@ function Dashboard({
           onImported={() => {
             setImportOpen(false);
             run(refreshClaudeUsage());
+            run(refreshCodexUsage());
           }}
         />
       ) : null}
@@ -424,6 +432,9 @@ function Dashboard({
           host={changeHost}
           accounts={(state.claudeAccounts ?? []).filter(
             (a) => a.assignable && a.provider !== "codex",
+          )}
+          codexAccounts={(state.claudeAccounts ?? []).filter(
+            (a) => a.assignable && a.provider === "codex",
           )}
           busy={changing}
           onClose={() => setChangeHost(null)}

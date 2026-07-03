@@ -51,6 +51,12 @@ export interface Host {
    * alone can't. Absent on hosts created before this field / when Claude isn't used.
    */
   claudeSelection?: string;
+  /** Email of the imported Codex account whose token is written into this clone. */
+  codexAccountEmail?: string;
+  /** Name of the Codex group this clone is balanced within (absent = single account). */
+  codexGroup?: string;
+  /** Verbatim operator Codex pick: "auto" | "none" | "group:<name>" | email. */
+  codexSelection?: string;
   /** Linear workspace name this host's ticket belongs to (selects the card color). */
   linearWorkspace?: string;
   /** Linear ticket identifier, e.g. "WE-142". */
