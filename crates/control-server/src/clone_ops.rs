@@ -52,6 +52,45 @@ pub(crate) fn shuffle<T>(v: &mut [T]) {
     }
 }
 
+/// Stable ordering rank for a provider so a merged `claude_accounts` list groups Claude
+/// rows before Codex rows deterministically regardless of which poller wrote last.
+fn provider_rank(p: Option<wire::Provider>) -> u8 {
+    match p {
+        Some(wire::Provider::Claude) => 0,
+        Some(wire::Provider::Codex) => 1,
+        None => 2,
+    }
+}
+
+/// Publish `views` (all of `provider`) into `ControlState.claude_accounts`, replacing
+/// exactly this provider's existing rows and leaving every other provider's rows intact.
+/// `views` are sorted pinned-email-first then alphabetical; the combined list is then
+/// stable-sorted by provider rank so grouping is deterministic. This is what lets the
+/// Claude and Codex pollers coexist without clobbering each other (each poller previously
+/// did `s.claude_accounts = views`, which would erase the other provider).
+pub(crate) fn replace_provider_views(
+    app: &App,
+    provider: wire::Provider,
+    mut views: Vec<wire::ClaudeUsage>,
+    pinned: Option<&str>,
+) {
+    views.sort_by(|a, b| {
+        let ap = Some(a.email.as_str()) == pinned;
+        let bp = Some(b.email.as_str()) == pinned;
+        if ap != bp {
+            return if ap { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        }
+        a.email.cmp(&b.email)
+    });
+    app.store.mutate(|s| {
+        let mut merged: Vec<wire::ClaudeUsage> =
+            s.claude_accounts.iter().filter(|u| u.provider != Some(provider)).cloned().collect();
+        merged.extend(views.iter().cloned());
+        merged.sort_by_key(|u| provider_rank(u.provider));
+        s.claude_accounts = merged;
+    });
+}
+
 /// Run one import-script op (`status`|`read`|`clear`|`apply`) inside clone `container`
 /// via `docker exec bash -s`, returning its raw stdout+stderr. `script` is the guest
 /// script body (`include_str!`); `extra` are extra positional args (e.g. the base64
@@ -137,6 +176,55 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_provider_views_preserves_other_provider() {
+        use wire::{ClaudeUsage, Provider};
+        fn view(email: &str, provider: Provider) -> ClaudeUsage {
+            ClaudeUsage {
+                id: format!("{email}|{provider:?}"),
+                email: email.into(),
+                provider: Some(provider),
+                active: false,
+                assignable: Some(true),
+                error: None,
+                stale: None,
+                last_updated: 0,
+                five_hour: None,
+                seven_day: None,
+                spend: None,
+            }
+        }
+        let app = crate::app::App::test_app();
+        // Seed: two claude, one codex.
+        app.store.mutate(|s| {
+            s.claude_accounts =
+                vec![view("a@c", Provider::Claude), view("b@c", Provider::Claude), view("z@o", Provider::Codex)];
+        });
+        // A codex poll publishes a new codex set (pinned y@o first).
+        replace_provider_views(
+            &app,
+            Provider::Codex,
+            vec![view("z@o", Provider::Codex), view("y@o", Provider::Codex)],
+            Some("y@o"),
+        );
+        let st = app.store.get();
+        // Both claude rows still present.
+        assert_eq!(st.claude_accounts.iter().filter(|u| u.provider == Some(Provider::Claude)).count(), 2);
+        // Codex rows are the new set, pinned first.
+        let codex: Vec<_> = st
+            .claude_accounts
+            .iter()
+            .filter(|u| u.provider == Some(Provider::Codex))
+            .map(|u| u.email.as_str())
+            .collect();
+        assert_eq!(codex, vec!["y@o", "z@o"]);
+        // An empty codex publish drops all codex rows but keeps claude.
+        replace_provider_views(&app, Provider::Codex, vec![], None);
+        let st2 = app.store.get();
+        assert_eq!(st2.claude_accounts.len(), 2);
+        assert!(st2.claude_accounts.iter().all(|u| u.provider == Some(Provider::Claude)));
+    }
 
     #[test]
     fn extract_json_strips_shell_noise() {

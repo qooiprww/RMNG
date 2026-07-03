@@ -63,6 +63,24 @@ impl App {
         self.cfg.read().unwrap().clone()
     }
 
+    /// A minimal App backed by a throwaway temp data dir, for unit tests in sibling
+    /// modules (state + stores are file-isolated; Docker is constructed I/O-free).
+    #[cfg(test)]
+    pub fn test_app() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rmng-cloneops-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store =
+            std::sync::Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
+        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        Self::new(store, cfg)
+    }
+
     /// What to dial a host's in-clone services at (agent-wrapper `/status`+chat, the
     /// clone-daemon MCP). Managed clones are addressed by container name (== host id):
     /// Docker's embedded DNS serves it on the rmng bridge. In dev mode the server runs

@@ -484,7 +484,7 @@ pub async fn poll_once(app: &App) -> Result<bool> {
 async fn poll_inner(app: &App) -> Result<bool> {
     let accts = app.claude.snapshot();
     if accts.is_empty() {
-        app.store.mutate(|s| s.claude_accounts.clear());
+        crate::clone_ops::replace_provider_views(app, wire::Provider::Claude, Vec::new(), None);
         return Ok(false);
     }
 
@@ -531,19 +531,13 @@ async fn poll_inner(app: &App) -> Result<bool> {
     for v in &mut views {
         v.assignable = Some(true);
     }
-
-    // Pinned email first, then alphabetical.
     let cfg = app.config();
-    let pinned = cfg.claude.pinned_email.clone();
-    views.sort_by(|a, b| {
-        let ap = Some(&a.email) == pinned.as_ref();
-        let bp = Some(&b.email) == pinned.as_ref();
-        if ap != bp {
-            return if ap { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
-        }
-        a.email.cmp(&b.email)
-    });
-    app.store.mutate(|s| s.claude_accounts = views);
+    crate::clone_ops::replace_provider_views(
+        app,
+        wire::Provider::Claude,
+        views,
+        cfg.claude.pinned_email.as_deref(),
+    );
 
     // Fan out any tokens this poll rotated (and retry earlier failed pushes).
     push_stale_tokens(app).await;
@@ -686,6 +680,7 @@ fn five_hour_pct(app: &App, email: &str) -> f64 {
         .get()
         .claude_accounts
         .iter()
+        .filter(|u| u.provider != Some(wire::Provider::Codex))
         .find(|u| u.email == email)
         .and_then(|u| u.five_hour.as_ref())
         .map(|w| w.pct)
@@ -928,8 +923,12 @@ pub async fn push_stale_tokens(app: &App) {
 /// When a clone's assigned account is exhausted, hot-swap it to the best alternative.
 async fn auto_swap_exhausted(app: &App) {
     let st = app.store.get();
-    let usage: HashMap<String, &ClaudeUsage> =
-        st.claude_accounts.iter().map(|u| (u.email.clone(), u)).collect();
+    let usage: HashMap<String, &ClaudeUsage> = st
+        .claude_accounts
+        .iter()
+        .filter(|u| u.provider != Some(wire::Provider::Codex))
+        .map(|u| (u.email.clone(), u))
+        .collect();
     let exhausted = |email: &str| -> bool {
         usage.get(email).is_some_and(|u| {
             let five = u.five_hour.as_ref().map(|w| w.pct).unwrap_or(0.0);
