@@ -12,7 +12,7 @@ use axum::{
     http::{StatusCode, header},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
@@ -69,7 +69,8 @@ pub fn router(app: App) -> Router {
         .route("/api/claude/rotate", post(claude_rotate))
         .route("/api/chat/:id", get(chat_get).post(chat_send))
         .route("/api/chat/:id/events", get(chat_events))
-        .route("/api/chat/:id/abort", post(chat_abort));
+        .route("/api/chat/:id/abort", post(chat_abort))
+        .route("/api/hosts/:id/forwards", put(forwards_put));
 
     // Frontend from the filesystem: a non-empty `static_dir` overrides (dev hot-reload
     // without a rebuild); otherwise the assets search path resolves it (the image's
@@ -200,6 +201,82 @@ async fn reorder(State(app): State<App>, Json(req): Json<ReorderReq>) -> Json<Co
         s.hosts = out;
     });
     Json(next)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForwardsPutReq {
+    forwards: Vec<ForwardInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForwardInput {
+    #[serde(default)]
+    id: Option<String>,
+    remote_port: u16,
+    local_port: u16,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Validate a host's proposed forward set against the whole state and normalize it into
+/// `PortForward`s (ids derived `f{local_port}`). Errors: port 0, duplicate local port
+/// within the request, or a local port already claimed by a *different* host (the viewer
+/// binds them all on one machine → the local-port space is global).
+fn validate_forwards(
+    state: &wire::ControlState,
+    host_id: &str,
+    inputs: Vec<ForwardInput>,
+) -> Result<Vec<wire::PortForward>, (StatusCode, String)> {
+    let bad = |m: String| (StatusCode::BAD_REQUEST, m);
+    // Local ports claimed by OTHER hosts.
+    let mut taken: std::collections::HashSet<u16> = state
+        .hosts
+        .iter()
+        .filter(|h| h.id != host_id)
+        .flat_map(|h| h.forwards.iter().map(|f| f.local_port))
+        .collect();
+    let mut out = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        if inp.remote_port == 0 || inp.local_port == 0 {
+            return Err(bad("ports must be 1–65535".into()));
+        }
+        if !taken.insert(inp.local_port) {
+            return Err(bad(format!("local port {} is already in use", inp.local_port)));
+        }
+        out.push(wire::PortForward {
+            id: inp.id.unwrap_or_else(|| format!("f{}", inp.local_port)),
+            remote_port: inp.remote_port,
+            local_port: inp.local_port,
+            enabled: inp.enabled,
+            label: inp.label,
+        });
+    }
+    Ok(out)
+}
+
+/// `PUT /api/hosts/:id/forwards` — replace a host's forward rules. Validated
+/// synchronously (returns 400 on conflict); persisted to `state.json`; the media plane
+/// re-pushes the new set to the viewer off the store broadcast.
+async fn forwards_put(
+    State(app): State<App>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<ForwardsPutReq>,
+) -> Result<Json<ControlState>, (StatusCode, String)> {
+    let state = app.store.get();
+    if !state.hosts.iter().any(|h| h.id == id) {
+        return Err((StatusCode::NOT_FOUND, format!("no host '{id}'")));
+    }
+    let validated = validate_forwards(&state, &id, req.forwards)?;
+    let next = app.store.mutate(|s| {
+        if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
+            h.forwards = validated;
+        }
+    });
+    Ok(Json(next))
 }
 
 /// `POST /api/clone` — start a clone from a source image. Body is one of:
@@ -1037,5 +1114,57 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("already being pulled"), "msg: {}", err.1);
+    }
+}
+
+#[cfg(test)]
+mod forwards_validation_tests {
+    use super::*;
+    use wire::{ControlState, Host};
+
+    fn state_with(hosts: Vec<Host>) -> ControlState {
+        ControlState { hosts, ..Default::default() }
+    }
+
+    fn host(id: &str) -> Host {
+        Host { id: id.into(), host: id.into(), ..Default::default() }
+    }
+
+    fn input(remote: u16, local: u16) -> ForwardInput {
+        ForwardInput { id: None, remote_port: remote, local_port: local, enabled: true, label: None }
+    }
+
+    #[test]
+    fn assigns_ids_from_local_port() {
+        let st = state_with(vec![host("a")]);
+        let out = validate_forwards(&st, "a", vec![input(3000, 8080)]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "f8080");
+        assert_eq!(out[0].remote_port, 3000);
+    }
+
+    #[test]
+    fn rejects_zero_port() {
+        let st = state_with(vec![host("a")]);
+        let err = validate_forwards(&st, "a", vec![input(0, 8080)]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_duplicate_local_within_request() {
+        let st = state_with(vec![host("a")]);
+        let err = validate_forwards(&st, "a", vec![input(1, 8080), input(2, 8080)]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_local_port_used_by_another_host() {
+        let mut other = host("b");
+        other.forwards = vec![wire::PortForward {
+            id: "f8080".into(), remote_port: 9, local_port: 8080, enabled: true, label: None,
+        }];
+        let st = state_with(vec![host("a"), other]);
+        let err = validate_forwards(&st, "a", vec![input(3000, 8080)]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
