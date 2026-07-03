@@ -20,8 +20,8 @@ use crate::provision::{
 };
 
 const LOG_LIMIT: usize = 200;
-const PRUNE_DONE_MS: u64 = 8_000;
-const PRUNE_ERROR_MS: u64 = 60_000;
+pub(crate) const PRUNE_DONE_MS: u64 = 8_000;
+pub(crate) const PRUNE_ERROR_MS: u64 = 60_000;
 
 #[derive(Debug)]
 pub struct JobError(pub String);
@@ -113,7 +113,7 @@ fn fail_op(app: &App, op_id: &str, msg: String) {
     schedule_prune(app.clone(), op_id.to_string(), PRUNE_ERROR_MS);
 }
 
-fn schedule_prune(app: App, op_id: String, delay_ms: u64) {
+pub(crate) fn schedule_prune(app: App, op_id: String, delay_ms: u64) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         app.store.mutate(|s| s.operations.retain(|o| o.id != op_id));
@@ -551,8 +551,13 @@ async fn run_update(app: App, op_id: String, reference: String) {
         Err(e) => return fail_op(&app, &op_id, format!("capturing run-spec: {e:#}")),
     };
 
-    // 4. Resolve the target digest (for boot reconcile). Best-effort.
-    let target_digest = app.docker.registry_digest(&reference).await.ok();
+    // 4. Resolve the target digest (for boot reconcile) from the JUST-PULLED image's own LOCAL
+    //    RepoDigest, NOT the registry index descriptor. reconcile compares this against the
+    //    running container's local RepoDigest (`self_image_info`), so it must be the same
+    //    source/shape: a multi-arch/index image's descriptor digest differs from the platform
+    //    image digest the recreated container reports, which would flag every successful update
+    //    as a false Error. Best-effort → `None` (reconcile then completes optimistically).
+    let target_digest = app.docker.image_repo_digest(&reference).await;
 
     // 5. Write the handoff + launch the detached helper from the NEW image.
     patch_op(&app, &op_id, |op| {

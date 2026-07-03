@@ -324,7 +324,6 @@ pub struct ManagedContainer {
 /// baseline); `revision`/`created` are the OCI labels stamped by scripts/publish-server.sh.
 #[derive(Debug, Clone, Default)]
 pub struct ServerImageInfo {
-    pub image_id: String,
     pub repo_digest: Option<String>,
     pub revision: Option<String>,
     pub created: Option<String>,
@@ -885,11 +884,27 @@ impl DockerCtl {
             .into_iter()
             .find(|rd| rd.starts_with(&format!("{repo}@")));
         Ok(ServerImageInfo {
-            image_id,
             repo_digest,
             revision: labels.get("org.opencontainers.image.revision").cloned().filter(|s| !s.is_empty()),
             created: labels.get("org.opencontainers.image.created").cloned().filter(|s| !s.is_empty()),
         })
+    }
+
+    /// The LOCAL RepoDigest of a (just-pulled) image, trimmed to the bare `sha256:…`.
+    /// Inspects `reference` and picks the `repo@sha256:…` entry for `reference`'s repo — the
+    /// SAME source + shape [`self_image_info`] reads for the running container — so boot
+    /// reconcile compares like-for-like. Unlike the registry descriptor digest (see
+    /// [`Self::registry_digest`]), this is the platform image's own digest, which is what the
+    /// recreated container reports for a multi-arch/index image. Best-effort: any failure
+    /// (daemon down, image gone, no matching repo digest) yields `None`.
+    pub async fn image_repo_digest(&self, reference: &str) -> Option<String> {
+        let (repo, _tag) = split_reference(reference);
+        let img = self.daemon().ok()?.inspect_image(reference).await.ok()?;
+        img.repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find(|rd| rd.starts_with(&format!("{repo}@")))
+            .map(|rd| rd.split_once('@').map(|(_, d)| d.to_string()).unwrap_or(rd))
     }
 
     /// The remote manifest digest of `reference` from the registry, WITHOUT pulling
@@ -1228,10 +1243,18 @@ impl DockerCtl {
             .await
             .with_context(|| format!("recreating container {}", spec.container_name))?
             .id;
-        docker
+        if let Err(e) = docker
             .start_container(&id, None::<bollard::query_parameters::StartContainerOptions>)
             .await
-            .with_context(|| format!("starting recreated container {}", spec.container_name))?;
+        {
+            // Create succeeded but start failed: the created-but-stopped container still holds
+            // the name. Remove it (best-effort, 404-tolerant) so a fallback recreate / retry
+            // won't 409 on the name and leave the host with a stopped container and nothing
+            // running — the exact state the create-error fallback exists to prevent.
+            let _ = self.remove_container(&id).await;
+            return Err(e)
+                .with_context(|| format!("starting recreated container {}", spec.container_name));
+        }
         Ok(id)
     }
 
@@ -1266,6 +1289,14 @@ impl DockerCtl {
             }
         }
 
+        if mounts.is_empty() {
+            tracing::warn!(
+                target: "update",
+                "no /data mount discovered on self ({self_id}); launching the self-upgrade helper \
+                 without it — the helper won't see the handoff/config and the update op may stay \
+                 stuck Running"
+            );
+        }
         let host_config = HostConfig {
             // docker.sock as a bind (source == target == the configured socket path).
             binds: Some(vec![format!("{socket}:{socket}")]),
@@ -2032,7 +2063,16 @@ mod tests {
         assert_eq!(spec.new_image_ref, "pegasis0/rmng:latest");
         assert_eq!(spec.host_config.privileged, Some(true));
         assert_eq!(spec.host_config.pid_mode.as_deref(), Some("host"));
-        assert!(spec.networks.contains_key("rmng"));
+        // Config (hostname) must survive the projection — the recreated container needs it.
+        assert_eq!(spec.config.hostname.as_deref(), Some("rmng"));
+        // The network attachment AND its rmng-control alias must survive — the design's key
+        // guarantee so the recreated server keeps its stable in-network address.
+        let net = spec.networks.get("rmng").expect("rmng network preserved");
+        assert!(
+            net.aliases.iter().flatten().any(|a| a == "rmng-control"),
+            "rmng-control alias must survive projection, got {:?}",
+            net.aliases
+        );
     }
 
     // --- client construction ----------------------------------------------------------

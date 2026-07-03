@@ -166,6 +166,10 @@ pub async fn reconcile_pending(app: &App) {
             op.finished_at = Some(chrono_now_ms());
         }
     });
+    // Prune the finalized op like every other terminal op (jobs.rs), so the completed
+    // "Updating control-server" card doesn't linger in state.json / the UI forever.
+    let delay = if done { crate::jobs::PRUNE_DONE_MS } else { crate::jobs::PRUNE_ERROR_MS };
+    crate::jobs::schedule_prune(app.clone(), op_id.clone(), delay);
     tracing::info!(target: "update", "reconciled update op {op_id}: {msg}");
     clear_handoff();
     // Best-effort: remove the leftover helper container.
