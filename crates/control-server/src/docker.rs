@@ -1667,7 +1667,7 @@ fn prefix_to_mask(prefix: u8) -> u32 {
 /// Split an image reference into `(name-without-tag, tag)`, defaulting the tag to
 /// `latest`. Handles a registry host with a port (`host:5000/img:tag`) by only treating
 /// the final `:` after the last `/` as the tag separator.
-fn split_reference(reference: &str) -> (String, String) {
+pub fn split_reference(reference: &str) -> (String, String) {
     let last_slash = reference.rfind('/').map(|i| i + 1).unwrap_or(0);
     match reference[last_slash..].rfind(':') {
         Some(rel) => {

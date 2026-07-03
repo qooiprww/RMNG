@@ -21,6 +21,7 @@ mod mediaplane;
 mod monitor;
 mod provision;
 mod state;
+mod update;
 mod web;
 
 use std::sync::Arc;
@@ -38,6 +39,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Self-upgrade helper mode (detached container from the NEW image). A container launched by
+    // `jobs::run_update` runs `rmng-control-server self-upgrade <handoff>`: it stops+removes the
+    // old container and recreates it, then exits. Diverges — never becomes the normal server.
+    // Placed after tracing init (so the helper gets logging) and before config::load().
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("self-upgrade") {
+        let handoff = argv.get(2).cloned().unwrap_or_else(|| update::HANDOFF_PATH.to_string());
+        update::self_upgrade_main(&handoff).await; // diverges
+    }
+
     let cfg = config::load()?;
     let store = Arc::new(state::StateStore::load(config::state_path(&cfg))?);
     state::spawn_watcher(store.clone());
@@ -48,6 +59,10 @@ async fn main() -> Result<()> {
     // mid-op (an `Operation` lives only while its driving task runs). Mark such ops `Error`
     // + prune them, so a same-named clone/pull/commit isn't blocked forever by the in-flight
     // guards. State-only — safe with Docker down.
+    //
+    // Resolve a surviving self-update Operation FIRST, before fail_stale_ops would clobber it as
+    // "interrupted". Best-effort; a no-op when the handoff is absent (normal boot).
+    update::reconcile_pending(&app).await;
     jobs::fail_stale_ops(&app);
 
     // Probe the Docker environment (daemon reachable, self-container detection, sock mount,
