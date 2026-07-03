@@ -140,7 +140,9 @@ keys, → `linearKeySet: bool`); `PUT /api/config` returns
 | `docker` | `DockerConfig` | see below | daemon socket + `rmng`-network subnet + hostname prefix + per-clone limits |
 | `presets` | `Preset[]` | `[]` | clone presets: env vars + Linear key + auto-select labels (**key secret**) |
 | `claude` | `ClaudeConfig` | — | usage polling config |
-| `clone_groups` | `CloneGroup[]` | `[]` | named account pools for rotation (not secret) |
+| `clone_groups` | `CloneGroup[]` | `[]` | named account pools for Claude rotation (not secret) |
+| `codex` | `CodexConfig` | — | Codex usage polling config |
+| `codex_groups` | `CloneGroup[]` | `[]` | named account pools for Codex rotation (not secret) |
 | `detector_inference_url` | string | `http://10.0.0.42:8080` | vision-LLM the needs-human detector polls; injected into clones as `RMNG_INFERENCE_URL` |
 
 - **`ListenConfig`**: `web 9000`, `video 9001`, `clone_mcp 9002`, `global_mcp 9003`,
@@ -187,6 +189,29 @@ keys, → `linearKeySet: bool`); `PUT /api/config` returns
   (`Host.claude_group`) sticks to its account (preserving its prompt cache) until that
   account passes 90% 5h usage or leaves the group; the 10-min rotator then moves it to
   the least-loaded / least-used member. Selected at clone/swap time as `group:<name>`.
+
+<a id="codex-accounts"></a>**Codex accounts** — server-owned single-token model, identical in spirit to Claude accounts.
+
+- **Store:** `codex-accounts.json` (0600, in `data_dir`; override `RMNG_CODEX_ACCOUNTS_FILE`).
+  Each record: `id` (`codex:<account_id>`), `email`, `account_id`, `plan`, `access_token`,
+  `id_token`, `refresh_token`, `expires_at`.
+- **Injected in-clone file:** `~/.codex/auth.json` = `{ "OPENAI_API_KEY": null, "tokens":
+  { "id_token", "access_token", "refresh_token": "", "account_id" }, "last_refresh": <now> }`.
+  The refresh token is emptied and `last_refresh` set to now so the clone's CLI never
+  rotates the server-owned token. The server re-pushes on every refresh, with a 60-min lead.
+- **Refresh:** `POST https://auth.openai.com/oauth/token` (client_id
+  `app_EMoamEEZ73f0CkXaXp7hrann`). No `expires_in` — expiry is decoded from the access-token
+  JWT `exp`. Refresh tokens are single-use / rotating.
+- **Usage:** `GET https://chatgpt.com/backend-api/wham/usage` (Bearer + `ChatGPT-Account-Id`);
+  windows map to 5h/weekly by `limit_window_seconds`. Disable with `codex.usagePolling=false`
+  (refresh + push still run).
+- **`CodexConfig`**: `poll_secs`, `pinned_email?`, `auto_swap_on_exhaustion` (bool),
+  `usage_polling` (bool, default `true`).
+- **`codexGroups`** (`CloneGroup[]`): same structure as `clone_groups`, used for Codex
+  account rotation. Selected at clone/swap time as `group:<name>`.
+- **`Host`** carries `codexAccountEmail` / `codexGroup` / `codexSelection` alongside the
+  Claude equivalents. One clone can hold both a Claude and a Codex account simultaneously.
+
 - **`MonitorSpec`**: `width`, `height`, `x`, `y`, `primary`.
 
 Template params are mostly not config: the base OS is fixed in the template build
