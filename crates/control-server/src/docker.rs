@@ -33,8 +33,8 @@ use bollard::container::LogOutput;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerConfig, ContainerCreateBody, EndpointSettings, HostConfig, Ipam,
-    IpamConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountPointTypeEnum,
+    ContainerConfig, ContainerCreateBody, ContainerInspectResponse, EndpointSettings, HostConfig,
+    Ipam, IpamConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountPointTypeEnum,
     MountTypeEnum, NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
     RestartPolicyNameEnum, VolumeCreateOptions,
 };
@@ -45,6 +45,7 @@ use bollard::query_parameters::{
     TagImageOptionsBuilder,
 };
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use wire::{ContainerStats, DockerConfig, EnvCheckRow, ImageInfo, SetupEnv, UpdateStatus};
@@ -257,6 +258,53 @@ pub struct CreateSpec {
     /// The shared clone media socket *directory* on the host to bind at `/srv/rmng-sock`.
     /// The daemon path is `<this>/clones.sock`; empty skips the mount (dev/test).
     pub sock_source: String,
+}
+
+/// A captured control-server run-spec: everything `create_container` needs to recreate our
+/// own container, projected from a live self-inspect. Serialized into the update handoff
+/// file so the `self-upgrade` helper (a fresh process from the new image) can recreate us.
+/// The only field NOT copied from the running container is the image — overridden to
+/// `new_image_ref`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfSpec {
+    /// The container name (== how the deployment named us), leading `/` stripped.
+    pub container_name: String,
+    /// The image the recreated container runs (the newly pulled ref).
+    pub new_image_ref: String,
+    /// The image id we were running before the swap (for the create-error fallback).
+    pub old_image_id: String,
+    /// Captured `Config` (hostname/env/labels/exposed_ports/stop_signal/stop_timeout/…).
+    pub config: ContainerConfig,
+    /// Captured `HostConfig` (privileged/pid_mode/init/mounts/port_bindings/restart_policy/…).
+    pub host_config: HostConfig,
+    /// Captured network attachments + aliases (preserves the rmng-control alias).
+    pub networks: HashMap<String, EndpointSettings>,
+}
+
+impl SelfSpec {
+    /// Project a container inspect into a `SelfSpec`, overriding the image to `new_image_ref`.
+    /// Pure (no I/O) so it's unit-testable against a fixture inspect.
+    pub fn from_inspect(resp: &ContainerInspectResponse, new_image_ref: &str) -> Result<SelfSpec> {
+        let container_name =
+            resp.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
+        let old_image_id = resp.image.clone().ok_or_else(|| anyhow!("inspect has no image id"))?;
+        let config = resp.config.clone().ok_or_else(|| anyhow!("inspect has no config"))?;
+        let host_config =
+            resp.host_config.clone().ok_or_else(|| anyhow!("inspect has no host_config"))?;
+        let networks = resp
+            .network_settings
+            .as_ref()
+            .and_then(|n| n.networks.clone())
+            .unwrap_or_default();
+        Ok(SelfSpec {
+            container_name,
+            new_image_ref: new_image_ref.to_string(),
+            old_image_id,
+            config,
+            host_config,
+            networks,
+        })
+    }
 }
 
 /// One RMNG-managed container as the daemon lists it (label `rmng.managed=1`): clones
@@ -1142,6 +1190,51 @@ impl DockerCtl {
         Ok(res.id)
     }
 
+    /// Full inspect of our own container (Config + HostConfig + NetworkSettings), the input
+    /// to [`SelfSpec::from_inspect`].
+    pub async fn inspect_self(&self, self_id: &str) -> Result<ContainerInspectResponse> {
+        self.daemon()?
+            .inspect_container(self_id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+            .with_context(|| format!("inspecting self container {self_id}"))
+    }
+
+    /// Create + start a container from a captured [`SelfSpec`], reusing the container name.
+    /// The caller must have already removed any container holding that name (the swap does
+    /// stop→remove→create). The image is `spec.new_image_ref` (the fallback path passes a
+    /// spec whose `new_image_ref` was set to the old image id). Returns the new container id.
+    pub async fn create_and_start_from_spec(&self, spec: &SelfSpec) -> Result<String> {
+        let c = &spec.config;
+        let body = ContainerCreateBody {
+            hostname: c.hostname.clone(),
+            env: c.env.clone(),
+            labels: c.labels.clone(),
+            exposed_ports: c.exposed_ports.clone(),
+            entrypoint: c.entrypoint.clone(),
+            cmd: c.cmd.clone(),
+            stop_signal: c.stop_signal.clone(),
+            stop_timeout: c.stop_timeout,
+            image: Some(spec.new_image_ref.clone()),
+            host_config: Some(spec.host_config.clone()),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: Some(spec.networks.clone()),
+            }),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::new().name(&spec.container_name).build();
+        let docker = self.daemon()?;
+        let id = docker
+            .create_container(Some(opts), body)
+            .await
+            .with_context(|| format!("recreating container {}", spec.container_name))?
+            .id;
+        docker
+            .start_container(&id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+            .with_context(|| format!("starting recreated container {}", spec.container_name))?;
+        Ok(id)
+    }
+
     /// Ensure a named volume exists (idempotent — create is safe to repeat).
     async fn ensure_volume(&self, name: &str) -> Result<()> {
         let opts = VolumeCreateOptions {
@@ -1843,6 +1936,29 @@ impl LineSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- self-spec projection ---------------------------------------------------------
+
+    #[test]
+    fn self_spec_from_inspect_projects_fields() {
+        // Minimal ContainerInspectResponse JSON (bollard models are Deserialize).
+        let json = r#"{
+            "Id": "abc123",
+            "Name": "/rmng",
+            "Image": "sha256:oldimageid",
+            "Config": { "Hostname": "rmng", "Env": ["RUST_LOG=info"], "Image": "rmng:latest" },
+            "HostConfig": { "Privileged": true, "PidMode": "host" },
+            "NetworkSettings": { "Networks": { "rmng": { "Aliases": ["rmng-control"] } } }
+        }"#;
+        let resp: super::ContainerInspectResponse = serde_json::from_str(json).unwrap();
+        let spec = super::SelfSpec::from_inspect(&resp, "pegasis0/rmng:latest").unwrap();
+        assert_eq!(spec.container_name, "rmng"); // leading slash stripped
+        assert_eq!(spec.old_image_id, "sha256:oldimageid");
+        assert_eq!(spec.new_image_ref, "pegasis0/rmng:latest");
+        assert_eq!(spec.host_config.privileged, Some(true));
+        assert_eq!(spec.host_config.pid_mode.as_deref(), Some("host"));
+        assert!(spec.networks.contains_key("rmng"));
+    }
 
     // --- client construction ----------------------------------------------------------
 
