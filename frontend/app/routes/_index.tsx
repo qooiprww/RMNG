@@ -121,17 +121,26 @@ export default function Home({ loaderData }: Route.ComponentProps) {
   if (!cfg.setupComplete) {
     return <SetupWizard state={state} initialConfig={cfg} onDone={refetchConfig} />;
   }
-  return <Dashboard state={state} stats={stats} templateRef={cfg.docker.templateReference} />;
+  return (
+    <Dashboard
+      state={state}
+      stats={stats}
+      templateRef={cfg.docker.templateReference}
+      cloneCpus={cfg.docker.cloneCpus}
+    />
+  );
 }
 
 function Dashboard({
   state,
   stats,
   templateRef,
+  cloneCpus,
 }: {
   state: ControlState;
   stats: Record<string, ContainerStats>;
   templateRef: string;
+  cloneCpus: number;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [cloneOpen, setCloneOpen] = useState(false);
@@ -368,6 +377,7 @@ function Dashboard({
                         key={host.id}
                         host={host}
                         stats={stats[host.id]}
+                        cloneCpus={cloneCpus}
                         selected={state.selected === host.id}
                         op={opForHost(host.id)}
                         onSelect={() => {

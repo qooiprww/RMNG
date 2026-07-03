@@ -46,21 +46,33 @@ function selBadge(sel: ClaudeSel): string | null {
   return null; // specific
 }
 
-/** Compact live-usage string for the row, e.g. `2.4 cpu · 5.1 / 16.0 GiB`. CPU is shown
- *  in "cores" (the wire value is percent-of-one-core, so ÷100); RAM as used / limit GiB,
- *  one decimal each. Returns null when there's nothing usable to show — no stats sampled
- *  yet, a stopped/unmanaged host (no entry), or no memory limit — so the row shows nothing
- *  rather than a `0.0 / 0.0` placeholder. `mem*` are typed bigint by ts-rs but arrive as
- *  JSON numbers, hence the `Number()` coercion. */
-function usageLine(stats?: ContainerStats): string | null {
+/** Compact live-usage string for the row, e.g. `12% cpu · 5.1 / 16.0 GiB`. CPU is
+ *  normalized to a 0-100% share of the clone's CPU allowance (`docker.cloneCpus`
+ *  cores): `stats.cpuPct` is docker-CLI convention (100 == one full core), so
+ *  `percent = cpuPct / cloneCpus`. Rendered as an integer percent, except below 1%
+ *  where one decimal is kept (`0.4% cpu`) so a near-idle clone doesn't read as
+ *  dead-zero. When `cloneCpus` is missing/`<= 0` (unlimited clone), falls back to
+ *  the old "cores" rendering (`2.4 cpu`, ÷100 of the wire percent-of-one-core value).
+ *  RAM is used / limit GiB, one decimal each. Returns null when there's nothing
+ *  usable to show — no stats sampled yet, a stopped/unmanaged host (no entry), or no
+ *  memory limit — so the row shows nothing rather than a `0.0 / 0.0` placeholder.
+ *  `mem*` are typed bigint by ts-rs but arrive as JSON numbers, hence the `Number()`
+ *  coercion. */
+function usageLine(stats: ContainerStats | undefined, cloneCpus: number): string | null {
   if (!stats) return null;
   const memLimit = Number(stats.memLimit);
   if (memLimit <= 0) return null;
   const GiB = 1024 ** 3;
-  const cores = (stats.cpuPct / 100).toFixed(1);
   const used = (Number(stats.memUsed) / GiB).toFixed(1);
   const limit = (memLimit / GiB).toFixed(1);
-  return `${cores} cpu · ${used} / ${limit} GiB`;
+  const cpu =
+    cloneCpus > 0
+      ? (() => {
+          const pct = stats.cpuPct / cloneCpus;
+          return `${pct < 1 ? pct.toFixed(1) : Math.round(pct)}% cpu`;
+        })()
+      : `${(stats.cpuPct / 100).toFixed(1)} cpu`;
+  return `${cpu} · ${used} / ${limit} GiB`;
 }
 
 function selTitle(sel: ClaudeSel): string {
@@ -81,6 +93,10 @@ export interface SidebarHostProps {
   /** Live CPU/RAM usage for this host's container, pushed over the `stats` SSE event.
    *  Absent for a stopped/unmanaged host or before the first sample — renders nothing. */
   stats?: ContainerStats;
+  /** The fleet's `docker.cloneCpus` CPU allowance (cores per clone), used to normalize
+   *  the usage line's CPU figure to a percent of that allowance. `<= 0` means unlimited,
+   *  which falls `usageLine` back to its old "cores" rendering. */
+  cloneCpus: number;
   selected: boolean;
   /** A running operation targeting this host (delete, or a clone finishing its
    *  post-add `wait-swap` step), if any. */
@@ -146,6 +162,7 @@ function AccountIcon() {
 export function SidebarHost({
   host,
   stats,
+  cloneCpus,
   selected,
   op,
   onSelect,
@@ -159,7 +176,7 @@ export function SidebarHost({
   const managed = host.managed === true;
   const status = effectiveStatus(host);
   const claudeSel = claudeSelection(host);
-  const usage = usageLine(stats);
+  const usage = usageLine(stats, cloneCpus);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: host.id, disabled: busy });
 
@@ -268,7 +285,11 @@ export function SidebarHost({
         {!busy && usage ? (
           <p
             className="mt-0.5 text-[10px] tabular-nums text-slate-400"
-            title="live container CPU (cores) · memory used / limit"
+            title={
+              cloneCpus > 0
+                ? "live container CPU (% of clone's CPU allowance) · memory used / limit"
+                : "live container CPU (cores) · memory used / limit"
+            }
           >
             {usage}
           </p>
