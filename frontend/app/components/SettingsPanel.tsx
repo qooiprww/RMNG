@@ -5,6 +5,7 @@ import type { AppConfigRedacted } from "~/lib/wire/AppConfigRedacted";
 import type { ChromaMode } from "~/lib/wire/ChromaMode";
 import type { ConfigPutResponse } from "~/lib/wire/ConfigPutResponse";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
+import type { UpdateStatus } from "~/lib/wire/UpdateStatus";
 import { ImagesSection } from "~/components/ImagesSection";
 import { MonitorsEditor, type Mon } from "~/components/MonitorsEditor";
 
@@ -109,6 +110,12 @@ export interface SettingsPanelProps {
   testConfig: (what: string) => Promise<{ ok: boolean; message: string }>;
   /** Apply the saved monitor layout to all running clones. */
   applyMonitors: () => Promise<{ ok: boolean; applied: string[]; errors: string[] }>;
+  /** Read the control-server's own version + update-available status. */
+  getUpdateStatus: () => Promise<UpdateStatus>;
+  /** Pull the latest control-server image and swap the running container onto it. */
+  updateServer: () => Promise<unknown>;
+  /** Restart the control-server container in place (applies changed startup settings). */
+  restartServer: () => Promise<{ ok: boolean }>;
   // --- clone-source images (moved here from the sidebar) ---
   images: ImageInfo[];
   imagesLoading: boolean;
@@ -125,6 +132,9 @@ export function SettingsPanel({
   putConfig,
   testConfig,
   applyMonitors,
+  getUpdateStatus,
+  updateServer,
+  restartServer,
   images,
   imagesLoading,
   pullBusy,
@@ -142,6 +152,45 @@ export function SettingsPanel({
   // True after a save that touched a restart-required setting (ports / cloneSocket /
   // staticDir / chroma) — surfaces a persistent banner until a later save clears it.
   const [restartRequired, setRestartRequired] = useState(false);
+  // Control-server's own version + update-available status (fetched on open; re-checked
+  // on demand via the "Check for updates" button).
+  const [serverStatus, setServerStatus] = useState<UpdateStatus | null>(null);
+  const [serverMsg, setServerMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    getUpdateStatus().then(setServerStatus).catch((e) => setServerMsg(`✗ ${(e as Error).message}`));
+  }, [getUpdateStatus]);
+
+  async function checkUpdate() {
+    setServerMsg("checking…");
+    try {
+      const s = await getUpdateStatus();
+      setServerStatus(s);
+      setServerMsg(s.error ? `⚠ ${s.error}` : s.available ? "update available" : "up to date");
+    } catch (e) {
+      setServerMsg(`✗ ${(e as Error).message}`);
+    }
+  }
+
+  async function doUpdate() {
+    if (!confirm("Update the control-server now?\n\nIt will pull the latest image and restart itself. The UI will briefly disconnect and reconnect; running clones are unaffected.")) return;
+    setServerMsg("updating… the server will restart shortly");
+    try {
+      await updateServer();
+    } catch (e) {
+      setServerMsg(`✗ ${(e as Error).message}`);
+    }
+  }
+
+  async function doRestart() {
+    if (!confirm("Restart the control-server now to apply the changed settings?\n\nThe UI will briefly disconnect and reconnect; running clones are unaffected.")) return;
+    setServerMsg("restarting… reconnecting shortly");
+    try {
+      await restartServer();
+    } catch (e) {
+      setServerMsg(`✗ ${(e as Error).message}`);
+    }
+  }
 
   // Editable form state. Secrets (preset linearKey) start blank = "unchanged".
   const [monitors, setMonitors] = useState<Mon[]>([]);
@@ -391,8 +440,15 @@ export function SettingsPanel({
         ) : null}
 
         {restartRequired ? (
-          <div className="mb-3 rounded border border-amber-300 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-400">
-            Run <code>docker restart rmng</code> to apply the changed port/socket/video settings.
+          <div className="mb-3 flex items-center gap-3 rounded border border-amber-300 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-400">
+            <span>Changed port/socket/video settings need a restart to apply.</span>
+            <button
+              type="button"
+              onClick={doRestart}
+              className="rounded border border-amber-400 dark:border-amber-700 px-2 py-1 text-xs font-medium text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40"
+            >
+              Restart control-server
+            </button>
           </div>
         ) : null}
 
@@ -503,6 +559,49 @@ export function SettingsPanel({
                 >
                   + Add preset
                 </button>
+              </div>
+            </Section>
+
+            {/* Control-server — its own image version + an on-demand update check. */}
+            <Section title="Control-server" effect="restart" hint="Update to the latest published image, or restart to apply changed startup settings.">
+              <div className="space-y-2">
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {serverStatus?.currentRevision ? (
+                    <>Version <code>{serverStatus.currentRevision}</code>{serverStatus.currentCreated ? ` · ${serverStatus.currentCreated}` : ""}</>
+                  ) : (
+                    "dev build (unversioned image)"
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={checkUpdate}
+                    className="rounded border border-slate-300 dark:border-slate-600 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  >
+                    Check for updates
+                  </button>
+                  <button
+                    type="button"
+                    onClick={doUpdate}
+                    disabled={!serverStatus?.available}
+                    className="rounded bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                  >
+                    Update
+                  </button>
+                  <button
+                    type="button"
+                    onClick={doRestart}
+                    className="rounded border border-slate-300 dark:border-slate-600 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  >
+                    Restart
+                  </button>
+                  {serverStatus ? (
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${serverStatus.available ? "bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400" : "bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400"}`}>
+                      {serverStatus.available ? "update available" : "up to date"}
+                    </span>
+                  ) : null}
+                  {serverMsg ? <p className="text-xs text-slate-500 dark:text-slate-400">{serverMsg}</p> : null}
+                </div>
               </div>
             </Section>
 

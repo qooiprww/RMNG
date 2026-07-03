@@ -22,6 +22,7 @@ mod monitor;
 mod provision;
 mod smb;
 mod state;
+mod update;
 mod web;
 
 use std::sync::Arc;
@@ -39,17 +40,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Self-upgrade helper mode (detached container from the NEW image). A container launched by
+    // `jobs::run_update` runs `rmng-control-server self-upgrade <handoff>`: it stops+removes the
+    // old container and recreates it, then exits. Diverges — never becomes the normal server.
+    // Placed after tracing init (so the helper gets logging) and before config::load().
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("self-upgrade") {
+        let handoff = argv.get(2).cloned().unwrap_or_else(|| update::HANDOFF_PATH.to_string());
+        update::self_upgrade_main(&handoff).await; // diverges
+    }
+
     let cfg = config::load()?;
     let store = Arc::new(state::StateStore::load(config::state_path(&cfg))?);
     state::spawn_watcher(store.clone());
 
     let app = app::App::new(store, cfg);
-
-    // A persisted `Running` operation is a corpse from a server that crashed/was killed
-    // mid-op (an `Operation` lives only while its driving task runs). Mark such ops `Error`
-    // + prune them, so a same-named clone/pull/commit isn't blocked forever by the in-flight
-    // guards. State-only — safe with Docker down.
-    jobs::fail_stale_ops(&app);
 
     // Probe the Docker environment (daemon reachable, self-container detection, sock mount,
     // render node) and cache the report so `GET /api/setup/env` + the wizard can render it.
@@ -59,6 +64,10 @@ async fn main() -> Result<()> {
     // Bounded: the shared bollard client's request timeout is 1 h (a base-image commit
     // legitimately runs that long), so a wedged-but-connectable daemon would otherwise
     // block THIS await — and with it the whole server boot — for up to an hour.
+    // Runs BEFORE `reconcile_pending`: self_setup is what populates the cached env report with
+    // the detected self-container id, and reconcile needs that id to inspect the running image
+    // and verify the update digest. (Daemon down/unresponsive → this times out, the env cache
+    // stays default, and reconcile correctly falls back to the optimistic "digest unverified".)
     {
         let setup_complete = app.config().setup_complete;
         match tokio::time::timeout(
@@ -78,6 +87,18 @@ async fn main() -> Result<()> {
             ),
         }
     }
+
+    // A persisted `Running` operation is a corpse from a server that crashed/was killed
+    // mid-op (an `Operation` lives only while its driving task runs). Mark such ops `Error`
+    // + prune them, so a same-named clone/pull/commit isn't blocked forever by the in-flight
+    // guards. State-only — safe with Docker down.
+    //
+    // Resolve a surviving self-update Operation FIRST, before fail_stale_ops would clobber it as
+    // "interrupted". self_setup above already populated the env cache with our self-container id,
+    // so reconcile's running-image digest check can actually run. Best-effort; a no-op when the
+    // handoff is absent (normal boot).
+    update::reconcile_pending(&app).await;
+    jobs::fail_stale_ops(&app);
 
     // Boot reconciliation: `state.json` is authoritative for host rows, but the daemon is
     // authoritative for what actually exists — diff them once so drift is visible instead

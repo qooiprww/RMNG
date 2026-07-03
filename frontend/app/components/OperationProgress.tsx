@@ -13,6 +13,7 @@ const VERB: Record<Operation["kind"], string> = {
   delete: "Deleting",
   pull: "Pulling",
   commit: "Committing",
+  update: "Updating",
 };
 
 export function OperationProgress({ op }: { op: Operation }) {

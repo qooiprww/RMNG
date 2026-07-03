@@ -177,6 +177,8 @@ pub enum OperationKind {
     #[serde(alias = "bootstrap")]
     Pull,
     Commit,
+    /// Self-update the control-server: pull a new image + swap the running container.
+    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -231,6 +233,29 @@ pub struct ContainerStats {
     pub mem_used: u64,
     /// Memory limit in bytes; 0 when the daemon reports none.
     pub mem_limit: u64,
+}
+
+/// Version + update-available status for the control-server itself, served by
+/// `GET /api/server/version`. `current_*` come from the running image's OCI labels /
+/// RepoDigest; `remote_digest` from a registry manifest query (no pull). `available` is
+/// true when a remote digest was fetched and differs from the running one. `error` carries
+/// a non-fatal detail (e.g. registry unreachable) so the UI can show "couldn't check".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct UpdateStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_digest: Option<String>,
+    pub available: bool,
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// 0–100 utilization for a rolling usage window + when it resets.

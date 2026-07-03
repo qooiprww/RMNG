@@ -57,6 +57,9 @@ pub fn router(app: App) -> Router {
         .route("/api/config", get(config_get).put(config_put))
         .route("/api/config/test", post(config_test))
         .route("/api/setup/env", get(setup_env))
+        .route("/api/server/version", get(server_version))
+        .route("/api/server/update", post(server_update))
+        .route("/api/server/restart", post(server_restart))
         .route("/api/images", get(images_list))
         .route("/api/images/pull", post(images_pull))
         .route("/api/images/commit", post(images_commit))
@@ -818,6 +821,48 @@ fn collapse_env_report(report: &crate::docker::EnvReport) -> (bool, String) {
 /// render node). The report is refreshed at startup + by `config_test("docker")`.
 async fn setup_env(State(app): State<App>) -> Json<wire::SetupEnv> {
     Json(app.docker.env().await.to_setup_env())
+}
+
+/// `GET /api/server/version` — the control-server's own version + whether Hub has a newer
+/// image (registry digest compare, no pull). Never 500s: registry/daemon failures land in
+/// `UpdateStatus.error` so the UI always renders.
+async fn server_version(State(app): State<App>) -> Json<wire::UpdateStatus> {
+    let reference = app.config().docker.server_image;
+    let self_id = app.docker.env().await.self_container;
+    Json(app.docker.check_update(&reference, self_id.as_deref()).await)
+}
+
+/// `POST /api/server/update` — pull `config.docker.serverImage` and swap the running
+/// control-server container onto it. Returns the driving Operation (kind `update`); the
+/// server restarts mid-op, and the rebooted server's reconcile finalizes it.
+async fn server_update(State(app): State<App>) -> Result<Json<Operation>, (StatusCode, String)> {
+    let reference = app.config().docker.server_image;
+    jobs::start_update(&app, &reference)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+/// `POST /api/server/restart` — restart the control-server in place to apply restart-required
+/// settings (ports / sockets / static dir / chroma), re-read from config.json on boot. The
+/// response is sent before the daemon tears us down; the UI reconnects when we're back.
+async fn server_restart(State(app): State<App>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let self_id = app
+        .docker
+        .env()
+        .await
+        .self_container
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "not running as a container (dev mode) — restart manually".to_string()))?;
+    let docker = app.docker.clone();
+    // Spawn the restart so the HTTP response flushes to the client BEFORE the daemon stops us
+    // (otherwise the browser sees a dropped connection instead of {ok:true}).
+    tokio::spawn(async move {
+        // Small delay to let the response return.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Err(e) = docker.restart_self(&self_id).await {
+            tracing::error!(target: "update", "self-restart failed: {e:#}");
+        }
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // --- Claude accounts -------------------------------------------------------

@@ -121,6 +121,15 @@ RUN if getent passwd 1000 >/dev/null; then userdel -r "$(getent passwd 1000 | cu
  && groupadd -g 1000 rmng \
  && useradd -u 1000 -g 1000 -M -s /usr/sbin/nologin rmng
 
+# Version stamp for the in-product self-update UI. Passed by scripts/publish-server.sh
+# (--build-arg); a plain `docker build` with no args leaves them empty → the UI shows a
+# "dev build". These are the only place the running server learns its own version.
+ARG GIT_SHA=""
+ARG BUILD_DATE=""
+LABEL org.opencontainers.image.revision="$GIT_SHA" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.version="$GIT_SHA"
+
 COPY --from=rust-build /out/rmng-control-server /usr/local/bin/rmng-control-server
 
 # Payloads + frontend on the image filesystem, stored PLAIN (assets.rs / web.rs read

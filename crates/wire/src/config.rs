@@ -170,6 +170,12 @@ pub struct DockerConfig {
     /// secret (public image over the local daemon), so it passes through the redacted view.
     #[serde(default = "default_template_reference")]
     pub template_reference: String,
+    /// Registry reference the in-product self-update pulls the control-server image from
+    /// (and digest-compares against for update-available detection). Immediate-apply (read
+    /// fresh per check/update); no secret (public image over the local daemon), so it
+    /// passes through the redacted view.
+    #[serde(default = "default_server_image")]
+    pub server_image: String,
 }
 
 fn default_docker_socket() -> String {
@@ -190,6 +196,9 @@ fn default_clone_memory_mb() -> u32 {
 fn default_template_reference() -> String {
     "pegasis0/rmng-template:latest".into()
 }
+fn default_server_image() -> String {
+    "pegasis0/rmng:latest".into()
+}
 
 impl Default for DockerConfig {
     fn default() -> Self {
@@ -200,6 +209,7 @@ impl Default for DockerConfig {
             clone_cpus: default_clone_cpus(),
             clone_memory_mb: default_clone_memory_mb(),
             template_reference: default_template_reference(),
+            server_image: default_server_image(),
         }
     }
 }
@@ -468,6 +478,12 @@ mod tests {
         assert!(mons[0].primary);
         assert_eq!(mons[1].x, 0);
         assert!(!mons[1].primary);
+    }
+
+    #[test]
+    fn docker_config_default_server_image() {
+        let d = DockerConfig::default();
+        assert_eq!(d.server_image, "pegasis0/rmng:latest");
     }
 
     #[test]

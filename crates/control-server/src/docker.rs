@@ -33,8 +33,8 @@ use bollard::container::LogOutput;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerConfig, ContainerCreateBody, EndpointSettings, HostConfig, Ipam,
-    IpamConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountPointTypeEnum,
+    ContainerConfig, ContainerCreateBody, ContainerInspectResponse, EndpointSettings, HostConfig,
+    Ipam, IpamConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountPointTypeEnum,
     MountTypeEnum, NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
     RestartPolicyNameEnum, VolumeCreateOptions,
 };
@@ -45,9 +45,10 @@ use bollard::query_parameters::{
     TagImageOptionsBuilder,
 };
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
-use wire::{ContainerStats, DockerConfig, EnvCheckRow, ImageInfo, SetupEnv};
+use wire::{ContainerStats, DockerConfig, EnvCheckRow, ImageInfo, SetupEnv, UpdateStatus};
 
 // --- Constants ------------------------------------------------------------------------
 
@@ -259,6 +260,53 @@ pub struct CreateSpec {
     pub sock_source: String,
 }
 
+/// A captured control-server run-spec: everything `create_container` needs to recreate our
+/// own container, projected from a live self-inspect. Serialized into the update handoff
+/// file so the `self-upgrade` helper (a fresh process from the new image) can recreate us.
+/// The only field NOT copied from the running container is the image — overridden to
+/// `new_image_ref`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfSpec {
+    /// The container name (== how the deployment named us), leading `/` stripped.
+    pub container_name: String,
+    /// The image the recreated container runs (the newly pulled ref).
+    pub new_image_ref: String,
+    /// The image id we were running before the swap (for the create-error fallback).
+    pub old_image_id: String,
+    /// Captured `Config` (hostname/env/labels/exposed_ports/stop_signal/stop_timeout/…).
+    pub config: ContainerConfig,
+    /// Captured `HostConfig` (privileged/pid_mode/init/mounts/port_bindings/restart_policy/…).
+    pub host_config: HostConfig,
+    /// Captured network attachments + aliases (preserves the rmng-control alias).
+    pub networks: HashMap<String, EndpointSettings>,
+}
+
+impl SelfSpec {
+    /// Project a container inspect into a `SelfSpec`, overriding the image to `new_image_ref`.
+    /// Pure (no I/O) so it's unit-testable against a fixture inspect.
+    pub fn from_inspect(resp: &ContainerInspectResponse, new_image_ref: &str) -> Result<SelfSpec> {
+        let container_name =
+            resp.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
+        let old_image_id = resp.image.clone().ok_or_else(|| anyhow!("inspect has no image id"))?;
+        let config = resp.config.clone().ok_or_else(|| anyhow!("inspect has no config"))?;
+        let host_config =
+            resp.host_config.clone().ok_or_else(|| anyhow!("inspect has no host_config"))?;
+        let networks = resp
+            .network_settings
+            .as_ref()
+            .and_then(|n| n.networks.clone())
+            .unwrap_or_default();
+        Ok(SelfSpec {
+            container_name,
+            new_image_ref: new_image_ref.to_string(),
+            old_image_id,
+            config,
+            host_config,
+            networks,
+        })
+    }
+}
+
 /// One RMNG-managed container as the daemon lists it (label `rmng.managed=1`): clones
 /// (name == host id) and `rmng-build-*` workers. See
 /// [`DockerCtl::list_managed_containers`].
@@ -269,6 +317,16 @@ pub struct ManagedContainer {
     /// The image reference the container was created from, as `docker ps` shows it.
     pub image: String,
     pub running: bool,
+}
+
+/// The running control-server image's identity, read from its own container → image.
+/// `repo_digest` is the `repo@sha256:…` for the configured repo (the update-check
+/// baseline); `revision`/`created` are the OCI labels stamped by scripts/publish-server.sh.
+#[derive(Debug, Clone, Default)]
+pub struct ServerImageInfo {
+    pub repo_digest: Option<String>,
+    pub revision: Option<String>,
+    pub created: Option<String>,
 }
 
 /// One file to drop into a container via `upload_tar`. `mode` is the raw unix mode
@@ -807,6 +865,111 @@ impl DockerCtl {
         Ok(info.config.and_then(|c| c.labels).unwrap_or_default())
     }
 
+    /// The running control-server image's identity: inspect our own container to get its
+    /// image id, then inspect that image for the RepoDigest matching `repo` + the OCI
+    /// version labels. `repo` is the reference-without-tag of `docker.serverImage`.
+    pub async fn self_image_info(&self, self_id: &str, repo: &str) -> Result<ServerImageInfo> {
+        let docker = self.daemon()?;
+        let ctr = docker
+            .inspect_container(self_id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+            .context("inspecting self container for image info")?;
+        let image_id = ctr.image.clone().ok_or_else(|| anyhow!("self container has no image id"))?;
+        let img = docker.inspect_image(&image_id).await.context("inspecting self image")?;
+        let labels = img.config.as_ref().and_then(|c| c.labels.clone()).unwrap_or_default();
+        // RepoDigest for our repo, e.g. "pegasis0/rmng@sha256:…". Match on the repo prefix.
+        let repo_digest = img
+            .repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find(|rd| rd.starts_with(&format!("{repo}@")));
+        Ok(ServerImageInfo {
+            repo_digest,
+            revision: labels.get("org.opencontainers.image.revision").cloned().filter(|s| !s.is_empty()),
+            created: labels.get("org.opencontainers.image.created").cloned().filter(|s| !s.is_empty()),
+        })
+    }
+
+    /// The LOCAL RepoDigest of a (just-pulled) image, trimmed to the bare `sha256:…`.
+    /// Inspects `reference` and picks the `repo@sha256:…` entry for `reference`'s repo — the
+    /// SAME source + shape [`self_image_info`] reads for the running container — so boot
+    /// reconcile compares like-for-like. Unlike the registry descriptor digest (see
+    /// [`Self::registry_digest`]), this is the platform image's own digest, which is what the
+    /// recreated container reports for a multi-arch/index image. Best-effort: any failure
+    /// (daemon down, image gone, no matching repo digest) yields `None`.
+    pub async fn image_repo_digest(&self, reference: &str) -> Option<String> {
+        let (repo, _tag) = split_reference(reference);
+        let img = self.daemon().ok()?.inspect_image(reference).await.ok()?;
+        img.repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find(|rd| rd.starts_with(&format!("{repo}@")))
+            .map(|rd| rd.split_once('@').map(|(_, d)| d.to_string()).unwrap_or(rd))
+    }
+
+    /// The remote manifest digest of `reference` from the registry, WITHOUT pulling
+    /// (Docker's `/distribution/{name}/json`). Returns the descriptor digest string
+    /// (`sha256:…`). Surfaces registry errors verbatim (auth / rate-limit / not-found).
+    pub async fn registry_digest(&self, reference: &str) -> Result<String> {
+        let info = self
+            .daemon()?
+            .inspect_registry_image(reference, None)
+            .await
+            .with_context(|| format!("querying the registry for {reference}"))?;
+        // bollard's DistributionInspect carries an OCI descriptor with the manifest digest;
+        // the digest is optional in the model, so treat its absence as an error.
+        info.descriptor
+            .digest
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| anyhow!("registry returned no manifest digest for {reference}"))
+    }
+
+    /// Compute the full update status for the UI: current identity + remote digest +
+    /// available flag. Never bails — registry / daemon failures land in `status.error`
+    /// with `available = false`, so the UI can always render something.
+    pub async fn check_update(&self, reference: &str, self_id: Option<&str>) -> UpdateStatus {
+        let (repo, _tag) = split_reference(reference);
+        let mut status = UpdateStatus {
+            current_revision: None,
+            current_created: None,
+            current_digest: None,
+            remote_digest: None,
+            available: false,
+            reference: reference.to_string(),
+            error: None,
+        };
+        // Current identity (dev mode / no self container → leave current_* None).
+        if let Some(id) = self_id {
+            match self.self_image_info(id, &repo).await {
+                Ok(info) => {
+                    status.current_revision = info.revision;
+                    status.current_created = info.created;
+                    status.current_digest = info.repo_digest.map(|rd| {
+                        // Keep just the sha256:… part for a clean compare/display.
+                        rd.split_once('@').map(|(_, d)| d.to_string()).unwrap_or(rd)
+                    });
+                }
+                Err(e) => status.error = Some(format!("reading current image: {e}")),
+            }
+        }
+        // Remote digest.
+        match self.registry_digest(reference).await {
+            Ok(remote) => {
+                status.available = is_update_available(status.current_digest.as_deref(), &remote);
+                status.remote_digest = Some(remote);
+            }
+            Err(e) => {
+                // Don't overwrite a current-image error with the remote one; append.
+                let msg = format!("checking registry: {e}");
+                status.error = Some(match status.error.take() {
+                    Some(prev) => format!("{prev}; {msg}"),
+                    None => msg,
+                });
+            }
+        }
+        status
+    }
+
     /// An image's `Config.StopSignal` (e.g. `SIGRTMIN+3`), or `None` when unset. The
     /// template-pull verify WARNs when a pulled template lacks the clean-stop signal (clones
     /// off it hang 20 s on stop before SIGKILL — gotcha #5).
@@ -1042,6 +1205,134 @@ impl DockerCtl {
         Ok(res.id)
     }
 
+    /// Full inspect of our own container (Config + HostConfig + NetworkSettings), the input
+    /// to [`SelfSpec::from_inspect`].
+    pub async fn inspect_self(&self, self_id: &str) -> Result<ContainerInspectResponse> {
+        self.daemon()?
+            .inspect_container(self_id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+            .with_context(|| format!("inspecting self container {self_id}"))
+    }
+
+    /// Create + start a container from a captured [`SelfSpec`], reusing the container name.
+    /// The caller must have already removed any container holding that name (the swap does
+    /// stop→remove→create). The image is `spec.new_image_ref` (the fallback path passes a
+    /// spec whose `new_image_ref` was set to the old image id). Returns the new container id.
+    pub async fn create_and_start_from_spec(&self, spec: &SelfSpec) -> Result<String> {
+        let c = &spec.config;
+        let body = ContainerCreateBody {
+            hostname: c.hostname.clone(),
+            env: c.env.clone(),
+            labels: c.labels.clone(),
+            exposed_ports: c.exposed_ports.clone(),
+            entrypoint: c.entrypoint.clone(),
+            cmd: c.cmd.clone(),
+            stop_signal: c.stop_signal.clone(),
+            stop_timeout: c.stop_timeout,
+            image: Some(spec.new_image_ref.clone()),
+            host_config: Some(spec.host_config.clone()),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: Some(spec.networks.clone()),
+            }),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::new().name(&spec.container_name).build();
+        let docker = self.daemon()?;
+        let id = docker
+            .create_container(Some(opts), body)
+            .await
+            .with_context(|| format!("recreating container {}", spec.container_name))?
+            .id;
+        if let Err(e) = docker
+            .start_container(&id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+        {
+            // Create succeeded but start failed: the created-but-stopped container still holds
+            // the name. Remove it (best-effort, 404-tolerant) so a fallback recreate / retry
+            // won't 409 on the name and leave the host with a stopped container and nothing
+            // running — the exact state the create-error fallback exists to prevent.
+            let _ = self.remove_container(&id).await;
+            return Err(e)
+                .with_context(|| format!("starting recreated container {}", spec.container_name));
+        }
+        Ok(id)
+    }
+
+    /// Launch the detached `self-upgrade` helper container from `new_image` (already pulled).
+    /// It mounts the docker socket + the /data volume (so it can read the handoff + config)
+    /// and runs `rmng-control-server self-upgrade`. Named `rmng-self-upgrade`, NOT
+    /// `rmng.managed`-labeled (ephemeral infra, kept out of managed sweeps), `network: none`,
+    /// pre-cleaned. The helper outlives the old container's removal. `socket` is
+    /// `config.docker.socket` — the docker.sock is bound directly (respects a custom path)
+    /// rather than discovered, because Compose stores it under Mounts, not HostConfig.Binds.
+    pub async fn launch_upgrade_helper(&self, new_image: &str, self_id: &str, socket: &str) -> Result<()> {
+        const HELPER_NAME: &str = "rmng-self-upgrade";
+        // Reclaim a leftover helper from a crashed earlier run (idempotent, 404-ok).
+        let _ = self.remove_container(HELPER_NAME).await;
+
+        // Discover our /data source (named volume or bind) so the helper reads the same
+        // handoff + config. `mounts` covers BOTH compose (long-syntax → Mounts) and the
+        // one-liner. docker.sock is bound directly from `socket` below.
+        let me = self.inspect_self(self_id).await?;
+        let mut mounts: Vec<Mount> = Vec::new();
+        if let Some(ms) = me.mounts.clone() {
+            for m in ms {
+                if m.destination.as_deref() == Some("/data") {
+                    let is_vol = m.name.is_some();
+                    mounts.push(Mount {
+                        target: Some("/data".to_string()),
+                        source: m.name.clone().or(m.source.clone()),
+                        typ: Some(if is_vol { MountTypeEnum::VOLUME } else { MountTypeEnum::BIND }),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        if mounts.is_empty() {
+            tracing::warn!(
+                target: "update",
+                "no /data mount discovered on self ({self_id}); launching the self-upgrade helper \
+                 without it — the helper won't see the handoff/config and the update op may stay \
+                 stuck Running"
+            );
+        }
+        let host_config = HostConfig {
+            // docker.sock as a bind (source == target == the configured socket path).
+            binds: Some(vec![format!("{socket}:{socket}")]),
+            mounts: if mounts.is_empty() { None } else { Some(mounts) },
+            network_mode: Some("none".to_string()),
+            auto_remove: Some(false),
+            // The control-server itself runs `--privileged` (which bypasses AppArmor). This
+            // helper is deliberately unprivileged (it only needs docker.sock + /data), but in
+            // RMNG's nested-Docker-in-LXC deployment the host denies loading the docker-default
+            // AppArmor profile ("apparmor_parser … Access denied"), so an unprivileged container
+            // is stuck in `Created` and never starts. Opt out of AppArmor so the helper starts
+            // wherever the privileged main container does. No-op on hosts without AppArmor.
+            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
+            ..Default::default()
+        };
+        let body = ContainerCreateBody {
+            image: Some(new_image.to_string()),
+            entrypoint: Some(vec![
+                "/usr/local/bin/rmng-control-server".to_string(),
+                "self-upgrade".to_string(),
+                "/data/update-handoff.json".to_string(),
+            ]),
+            cmd: Some(Vec::new()),
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::new().name(HELPER_NAME).build();
+        let docker = self.daemon()?;
+        let id = docker.create_container(Some(opts), body).await.context("creating self-upgrade helper")?.id;
+        docker
+            .start_container(&id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+            .context("starting self-upgrade helper")?;
+        Ok(())
+    }
+
     /// Ensure a named volume exists (idempotent — create is safe to repeat).
     async fn ensure_volume(&self, name: &str) -> Result<()> {
         let opts = VolumeCreateOptions {
@@ -1071,6 +1362,21 @@ impl DockerCtl {
             Err(BollardError::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
             Err(e) => Err(anyhow!("stopping container {id}: {e}")),
         }
+    }
+
+    /// Restart our own container in place (the programmatic twin of `docker restart rmng`) —
+    /// the daemon stops+starts the same container, which re-reads config.json on boot. Used
+    /// to apply restart-required settings. The `--restart unless-stopped` policy is a backstop
+    /// if the daemon's restart is interrupted. Uses the systemd stop timeout.
+    pub async fn restart_self(&self, self_id: &str) -> Result<()> {
+        let opts = bollard::query_parameters::RestartContainerOptionsBuilder::new()
+            .t(STOP_TIMEOUT_SECS)
+            .build();
+        self.daemon()?
+            .restart_container(self_id, Some(opts))
+            .await
+            .with_context(|| format!("restarting self container {self_id}"))?;
+        Ok(())
     }
 
     /// Remove a container (force + volumes-owned-by-container). Tolerates 404 (gone). The
@@ -1474,7 +1780,7 @@ fn prefix_to_mask(prefix: u8) -> u32 {
 /// Split an image reference into `(name-without-tag, tag)`, defaulting the tag to
 /// `latest`. Handles a registry host with a port (`host:5000/img:tag`) by only treating
 /// the final `:` after the last `/` as the tag separator.
-fn split_reference(reference: &str) -> (String, String) {
+pub fn split_reference(reference: &str) -> (String, String) {
     let last_slash = reference.rfind('/').map(|i| i + 1).unwrap_or(0);
     match reference[last_slash..].rfind(':') {
         Some(rel) => {
@@ -1582,6 +1888,15 @@ fn cpu_percent(cpu_total: u64, precpu_total: u64, system: u64, presystem: u64, o
 fn short_id(id: &str) -> String {
     let id = id.strip_prefix("sha256:").unwrap_or(id);
     id.chars().take(12).collect()
+}
+
+/// Whether a remote digest represents an update over the running one. Unknown local digest
+/// (dev build / no RepoDigest) → true (can't prove up-to-date, so offer the update).
+fn is_update_available(current_digest: Option<&str>, remote_digest: &str) -> bool {
+    match current_digest {
+        Some(cur) => cur != remote_digest,
+        None => true,
+    }
 }
 
 /// The lxcfs `/proc` binds for a clone's `HostConfig`, given the cached probe verdict
@@ -1734,6 +2049,38 @@ impl LineSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- self-spec projection ---------------------------------------------------------
+
+    #[test]
+    fn self_spec_from_inspect_projects_fields() {
+        // Minimal ContainerInspectResponse JSON (bollard models are Deserialize).
+        let json = r#"{
+            "Id": "abc123",
+            "Name": "/rmng",
+            "Image": "sha256:oldimageid",
+            "Config": { "Hostname": "rmng", "Env": ["RUST_LOG=info"], "Image": "rmng:latest" },
+            "HostConfig": { "Privileged": true, "PidMode": "host" },
+            "NetworkSettings": { "Networks": { "rmng": { "Aliases": ["rmng-control"] } } }
+        }"#;
+        let resp: super::ContainerInspectResponse = serde_json::from_str(json).unwrap();
+        let spec = super::SelfSpec::from_inspect(&resp, "pegasis0/rmng:latest").unwrap();
+        assert_eq!(spec.container_name, "rmng"); // leading slash stripped
+        assert_eq!(spec.old_image_id, "sha256:oldimageid");
+        assert_eq!(spec.new_image_ref, "pegasis0/rmng:latest");
+        assert_eq!(spec.host_config.privileged, Some(true));
+        assert_eq!(spec.host_config.pid_mode.as_deref(), Some("host"));
+        // Config (hostname) must survive the projection — the recreated container needs it.
+        assert_eq!(spec.config.hostname.as_deref(), Some("rmng"));
+        // The network attachment AND its rmng-control alias must survive — the design's key
+        // guarantee so the recreated server keeps its stable in-network address.
+        let net = spec.networks.get("rmng").expect("rmng network preserved");
+        assert!(
+            net.aliases.iter().flatten().any(|a| a == "rmng-control"),
+            "rmng-control alias must survive projection, got {:?}",
+            net.aliases
+        );
+    }
 
     // --- client construction ----------------------------------------------------------
 
@@ -2012,6 +2359,16 @@ mod tests {
     fn short_id_strips_sha_prefix() {
         assert_eq!(short_id("sha256:abcdef0123456789"), "abcdef012345");
         assert_eq!(short_id("abcdef0123456789"), "abcdef012345");
+    }
+
+    #[test]
+    fn is_update_available_compares_digests() {
+        // No local digest known → treat as available (can't prove up-to-date).
+        assert!(super::is_update_available(None, "sha256:bbb"));
+        // Same digest → up to date.
+        assert!(!super::is_update_available(Some("sha256:aaa"), "sha256:aaa"));
+        // Different digest → update available.
+        assert!(super::is_update_available(Some("sha256:aaa"), "sha256:bbb"));
     }
 
     #[test]

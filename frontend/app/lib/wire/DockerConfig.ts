@@ -38,4 +38,11 @@ cloneMemoryMb: number,
  * pulled image's RepoTags will contain. Immediate-apply (read fresh per pull); no
  * secret (public image over the local daemon), so it passes through the redacted view.
  */
-templateReference: string, };
+templateReference: string, 
+/**
+ * Registry reference the in-product self-update pulls the control-server image from
+ * (and digest-compares against for update-available detection). Immediate-apply (read
+ * fresh per check/update); no secret (public image over the local daemon), so it
+ * passes through the redacted view.
+ */
+serverImage: string, };
