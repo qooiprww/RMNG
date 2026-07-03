@@ -177,6 +177,8 @@ pub enum OperationKind {
     #[serde(alias = "bootstrap")]
     Pull,
     Commit,
+    /// Self-update the control-server: pull a new image + swap the running container.
+    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

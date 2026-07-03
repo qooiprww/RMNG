@@ -77,6 +77,7 @@ fn make_op(kind: OperationKind, target: &str, source: Option<&str>) -> Operation
         OperationKind::Pull => format!("queued template pull → {target}"),
         OperationKind::Commit => format!("queued commit of {}", source.unwrap_or("?")),
         OperationKind::Delete => format!("queued delete of {target}"),
+        OperationKind::Update => "queued control-server update".to_string(),
     };
     Operation {
         id: new_op_id(),
@@ -475,6 +476,106 @@ async fn run_pull(app: App, op_id: String, name: String, reference: String) {
     schedule_prune(app.clone(), op_id, PRUNE_DONE_MS);
 }
 
+/// Validate + register a control-server self-update op, then drive it in the background.
+/// Guard: reject if ANY operation is running — the swap kills the server, which would abort
+/// every in-flight clone/pull/commit. `reference` is `config.docker.serverImage`.
+pub fn start_update(app: &App, reference: &str) -> Result<Operation, JobError> {
+    let st = app.store.get();
+    if st.operations.iter().any(|o| o.status == OperationStatus::Running) {
+        return Err(JobError(
+            "another operation is in flight; wait for it to finish before updating".into(),
+        ));
+    }
+    let op = make_op(OperationKind::Update, "control-server", None);
+    let (ret, op_id) = (op.clone(), op.id.clone());
+    app.store.mutate(|s| s.operations.push(op));
+    let (app2, reference) = (app.clone(), reference.to_string());
+    tokio::spawn(async move { run_update(app2, op_id, reference).await });
+    Ok(ret)
+}
+
+async fn run_update(app: App, op_id: String, reference: String) {
+    // 1. Determine our own container id (can't self-update in dev mode).
+    let self_id = match app.docker.env().await.self_container {
+        Some(id) => id,
+        None => {
+            return fail_op(&app, &op_id, "not running as a container (dev mode) — nothing to update".into());
+        }
+    };
+
+    // 2. Pull the new image (2–80% of the bar). patch_op writes each tick into the op; the
+    //    pull callback borrows (app_cb, op_cb) and calls patch_op directly — no separate
+    //    progress closure to fight the borrow checker.
+    patch_op(&app, &op_id, |op| {
+        op.step = "pull".into();
+        op.message = format!("pulling {reference}");
+    });
+    {
+        let (app_cb, op_cb) = (app.clone(), op_id.clone());
+        let pull = app
+            .docker
+            .pull_image(&reference, |ev| match ev {
+                crate::docker::PullEvent::Status { layer, status } => {
+                    patch_op(&app_cb, &op_cb, |op| {
+                        op.log.push(format!("pull: {layer}: {status}"));
+                        if op.log.len() > 200 {
+                            let d = op.log.len() - 200;
+                            op.log.drain(0..d);
+                        }
+                    });
+                }
+                crate::docker::PullEvent::Bytes { frac } => {
+                    patch_op(&app_cb, &op_cb, |op| {
+                        op.pct = op.pct.max(2.0 + frac * 78.0);
+                        op.message = format!("pulling {reference}: {}%", (frac * 100.0) as i64);
+                    });
+                }
+            })
+            .await;
+        if let Err(e) = pull {
+            return fail_op(&app, &op_id, format!("pull failed: {e:#}"));
+        }
+    }
+
+    // 3. Capture our run-spec.
+    patch_op(&app, &op_id, |op| {
+        op.step = "capture".into();
+        op.message = "capturing run-spec".into();
+    });
+    let resp = match app.docker.inspect_self(&self_id).await {
+        Ok(r) => r,
+        Err(e) => return fail_op(&app, &op_id, format!("inspecting self: {e:#}")),
+    };
+    let spec = match crate::docker::SelfSpec::from_inspect(&resp, &reference) {
+        Ok(s) => s,
+        Err(e) => return fail_op(&app, &op_id, format!("capturing run-spec: {e:#}")),
+    };
+
+    // 4. Resolve the target digest (for boot reconcile). Best-effort.
+    let target_digest = app.docker.registry_digest(&reference).await.ok();
+
+    // 5. Write the handoff + launch the detached helper from the NEW image.
+    patch_op(&app, &op_id, |op| {
+        op.step = "handoff".into();
+        op.message = "handing off to the updater".into();
+    });
+    let handoff = crate::update::Handoff { spec, op_id: op_id.clone(), target_digest };
+    if let Err(e) = crate::update::write_handoff(&handoff) {
+        return fail_op(&app, &op_id, format!("writing handoff: {e:#}"));
+    }
+    let socket = app.config().docker.socket;
+    if let Err(e) = app.docker.launch_upgrade_helper(&reference, &self_id, &socket).await {
+        crate::update::clear_handoff();
+        return fail_op(&app, &op_id, format!("launching updater: {e:#}"));
+    }
+    // The helper now stops us; this task dies with the container. Leave the op Running at 85%
+    // — the rebooted server's reconcile_pending finalizes it.
+    patch_op(&app, &op_id, |op| {
+        op.pct = op.pct.max(85.0);
+        op.message = "updater launched — the server will restart on the new image".into();
+    });
+}
+
 /// Validate + register a commit-from-clone op, then drive it in the background. Guards:
 /// the host is a managed clone, the target tag is free (no existing image AND no in-flight
 /// commit racing for it), and the host has no operation already in flight.
@@ -693,5 +794,15 @@ mod tests {
         assert_eq!(op.pct, 50.0);
         assert_eq!(op.message, "pulling docker.io/x:y: 55%");
         assert_eq!(op.log.len(), log_len_before); // no new log line from a Pct/Bytes tick
+    }
+
+    /// The self-update swap kills the server, aborting every in-flight clone/pull/commit, so
+    /// `start_update` refuses while ANY op is Running.
+    #[tokio::test]
+    async fn start_update_rejects_when_an_op_is_running() {
+        let app = test_app();
+        app.store.mutate(|s| s.operations.push(running_op("op_x", "some-clone")));
+        let err = start_update(&app, "pegasis0/rmng:latest").unwrap_err();
+        assert!(err.0.contains("in flight") || err.0.contains("already"), "got: {}", err.0);
     }
 }

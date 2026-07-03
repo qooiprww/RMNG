@@ -860,6 +860,8 @@ pub fn step_pct(kind: wire::OperationKind, step: &str) -> Option<f64> {
         wire::OperationKind::Pull => pull_pct(step),
         wire::OperationKind::Commit => commit_pct(step),
         wire::OperationKind::Delete => delete_pct(step),
+        // Self-update has no provision step table — `jobs::run_update` drives its pct directly.
+        wire::OperationKind::Update => None,
     }
 }
 

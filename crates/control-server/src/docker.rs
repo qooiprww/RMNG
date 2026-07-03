@@ -1235,6 +1235,66 @@ impl DockerCtl {
         Ok(id)
     }
 
+    /// Launch the detached `self-upgrade` helper container from `new_image` (already pulled).
+    /// It mounts the docker socket + the /data volume (so it can read the handoff + config)
+    /// and runs `rmng-control-server self-upgrade`. Named `rmng-self-upgrade`, NOT
+    /// `rmng.managed`-labeled (ephemeral infra, kept out of managed sweeps), `network: none`,
+    /// pre-cleaned. The helper outlives the old container's removal. `socket` is
+    /// `config.docker.socket` — the docker.sock is bound directly (respects a custom path)
+    /// rather than discovered, because Compose stores it under Mounts, not HostConfig.Binds.
+    pub async fn launch_upgrade_helper(&self, new_image: &str, self_id: &str, socket: &str) -> Result<()> {
+        const HELPER_NAME: &str = "rmng-self-upgrade";
+        // Reclaim a leftover helper from a crashed earlier run (idempotent, 404-ok).
+        let _ = self.remove_container(HELPER_NAME).await;
+
+        // Discover our /data source (named volume or bind) so the helper reads the same
+        // handoff + config. `mounts` covers BOTH compose (long-syntax → Mounts) and the
+        // one-liner. docker.sock is bound directly from `socket` below.
+        let me = self.inspect_self(self_id).await?;
+        let mut mounts: Vec<Mount> = Vec::new();
+        if let Some(ms) = me.mounts.clone() {
+            for m in ms {
+                if m.destination.as_deref() == Some("/data") {
+                    let is_vol = m.name.is_some();
+                    mounts.push(Mount {
+                        target: Some("/data".to_string()),
+                        source: m.name.clone().or(m.source.clone()),
+                        typ: Some(if is_vol { MountTypeEnum::VOLUME } else { MountTypeEnum::BIND }),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        let host_config = HostConfig {
+            // docker.sock as a bind (source == target == the configured socket path).
+            binds: Some(vec![format!("{socket}:{socket}")]),
+            mounts: if mounts.is_empty() { None } else { Some(mounts) },
+            network_mode: Some("none".to_string()),
+            auto_remove: Some(false),
+            ..Default::default()
+        };
+        let body = ContainerCreateBody {
+            image: Some(new_image.to_string()),
+            entrypoint: Some(vec![
+                "/usr/local/bin/rmng-control-server".to_string(),
+                "self-upgrade".to_string(),
+                "/data/update-handoff.json".to_string(),
+            ]),
+            cmd: Some(Vec::new()),
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::new().name(HELPER_NAME).build();
+        let docker = self.daemon()?;
+        let id = docker.create_container(Some(opts), body).await.context("creating self-upgrade helper")?.id;
+        docker
+            .start_container(&id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+            .context("starting self-upgrade helper")?;
+        Ok(())
+    }
+
     /// Ensure a named volume exists (idempotent — create is safe to repeat).
     async fn ensure_volume(&self, name: &str) -> Result<()> {
         let opts = VolumeCreateOptions {

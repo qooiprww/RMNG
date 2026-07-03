@@ -93,7 +93,7 @@ export interface Host {
   forwards?: PortForward[];
 }
 
-export type OperationKind = "clone" | "delete" | "pull" | "commit";
+export type OperationKind = "clone" | "delete" | "pull" | "commit" | "update";
 export type OperationStatus = "running" | "done" | "error";
 
 export interface Operation {
