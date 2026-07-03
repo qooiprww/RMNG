@@ -46,6 +46,25 @@ core-graphics = "0.25"
 # NSEvent (local monitor API + deltaX/deltaY), NSCursor (hide/unhide), NSEventMask.
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSCursor"] }
+objc2-app-kit = { version = "0.3", features = [
+    # pointer-lock (pre-existing)
+    "NSEvent",
+    "NSCursor",
+    # native_titlebar: NSWindow titlebar configuration
+    "NSWindow",
+    "NSResponder",
+    # native_titlebar: titlebar accessory view controller
+    "NSTitlebarAccessoryViewController",
+    "NSViewController",
+    # native_titlebar: container view + subviews
+    "NSView",
+    # native_titlebar: NSButton action bridge
+    "NSButton",
+    "NSControl",
+    # native_titlebar: NSImage (SF Symbol icons)
+    "NSImage",
+    # native_titlebar: NSLayoutAttribute::Right for accessory placement
+    "NSLayoutConstraint",
+] }
 # Block closures for the addLocalMonitorForEventsMatchingMask:handler: callback.
 block2 = "0.6"
