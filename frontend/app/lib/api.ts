@@ -48,6 +48,13 @@ export const reorder = (order: string[]) => postJson("/api/reorder", { order });
 export const cloneHost = (image: string, payload: ClonePayload) =>
   postJson("/api/clone", { image, ...payload });
 export const deleteHost = (id: string) => postJson("/api/delete", { id });
+/** Replace a host's port-forward rules. New rules omit `id` (server derives it as
+ *  `f<localPort>`). 400 on a local-port conflict (validated server-side); the UI
+ *  refreshes from the next `/events` frame. */
+export const putForwards = (
+  hostId: string,
+  forwards: Array<{ id?: string; remotePort: number; localPort: number; enabled: boolean; label?: string }>,
+) => putJson(`/api/hosts/${encodeURIComponent(hostId)}/forwards`, { forwards });
 
 // --- images (clone-source templates) ---------------------------------------
 

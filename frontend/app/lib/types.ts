@@ -7,6 +7,8 @@
 // invisibly. In-progress clones are kept OUT of `hosts` until they are fully
 // provisioned, so the client never tries to connect to a half-built container.
 
+import type { PortForward } from "~/lib/wire/PortForward";
+
 export interface MonitorSpec {
   width: number;
   height: number;
@@ -86,6 +88,9 @@ export interface Host {
    * last viewed. Drives the sidebar unread dot; cleared when you switch to it.
    */
   unread?: boolean;
+  /** Local port-forward rules; the native viewer runs the listeners. Live status
+   *  arrives separately via the `forwards` SSE event, keyed by host id then rule id. */
+  forwards?: PortForward[];
 }
 
 export type OperationKind = "clone" | "delete" | "pull" | "commit";
