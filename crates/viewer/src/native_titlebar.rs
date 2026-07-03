@@ -130,8 +130,9 @@ impl ActionTarget {
 
 /// Install a native macOS titlebar on `window`.
 ///
-/// Must be called **after** `window.present()` so that the surface is about to be realized.
-/// The actual AppKit work happens inside `connect_realize`, which runs on the main thread.
+/// Call this **before** `window.present()`: it registers a `connect_realize` handler,
+/// and `present()` is what triggers realize. The actual AppKit work happens inside that
+/// handler, which runs on the main thread once the surface (and its NSWindow) exists.
 ///
 /// `primary` — if `true`, adds both the fullscreen button AND the server-address button;
 /// if `false`, adds only fullscreen (secondary monitor windows in the future).
@@ -270,8 +271,9 @@ fn install_on_realized(
 
     // Keep the action target alive (it stores the closure). Since we `forget` it here,
     // it will never be deallocated — acceptable for a spike (it lives as long as the app).
-    // SAFETY: `Retained<ActionTarget>` is intentionally leaked; the ObjC object remains
-    // referenced by the button's `target` property, so there is no use-after-free.
+    // SAFETY: `Retained<ActionTarget>` is intentionally leaked; that leaked +1 is what
+    // keeps the object alive. AppKit's `target` is an unretained (assign) reference and
+    // does NOT own it, so the leak — not the button — is what prevents a use-after-free.
     std::mem::forget(fs_target);
 
     // ── 5b. Settings button (primary window only) ─────────────────────────────────────
