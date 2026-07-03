@@ -208,6 +208,7 @@ async fn clone(
 
     let image = str_field("image").filter(|s| !s.is_empty()).ok_or_else(|| bad("body must include { image }".into()))?;
     let claude_account = str_field("claudeAccount");
+    let codex_account = str_field("codexAccount");
     let agent_instructions = str_field("agentInstructions");
     let claude_instructions = str_field("claudeInstructions");
     let cfg = app.config();
@@ -251,6 +252,7 @@ async fn clone(
             new_hostname: hostname,
             linear: Some(LinearMeta { display_name: Some(display), ..Default::default() }),
             claude_account,
+            codex_account,
             first_message: Some(message).filter(|m| !m.is_empty()),
             agent_instructions,
             claude_instructions,
@@ -281,6 +283,7 @@ async fn clone(
         new_hostname: hostname,
         linear: Some(meta),
         claude_account,
+        codex_account,
         first_message: None,
         agent_instructions,
         claude_instructions,
