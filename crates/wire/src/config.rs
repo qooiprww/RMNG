@@ -214,6 +214,35 @@ impl Default for ClaudeConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../frontend/app/lib/wire/")]
+pub struct CodexConfig {
+    /// Usage poll interval (seconds, floored at 15 by the poller).
+    pub poll_secs: u64,
+    /// Account email pinned to the top of the usage list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_email: Option<String>,
+    /// Hot-swap a clone to another account when its usage is exhausted.
+    #[serde(default)]
+    pub auto_swap_on_exhaustion: bool,
+    /// Poll the ChatGPT usage endpoint. When false, the poller still refreshes + pushes
+    /// tokens and publishes base views (with an explanatory `error`), but skips the usage
+    /// fetch — an escape hatch if the unofficial `/wham/usage` shape drifts.
+    #[serde(default = "default_true")]
+    pub usage_polling: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self { poll_secs: 600, pinned_email: None, auto_swap_on_exhaustion: false, usage_polling: true }
+    }
+}
+
 /// Full server config (with secrets). Loaded from `config.json`; serialized back
 /// atomically at 0600. Not exported to TS — the browser only sees the redacted view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,10 +281,16 @@ pub struct AppConfig {
     pub docker: DockerConfig,
     #[serde(default)]
     pub claude: ClaudeConfig,
+    #[serde(default)]
+    pub codex: CodexConfig,
     /// Named account pools a clone can be bound to for rotation (members are
     /// emails of imported accounts, from the server's `claude-accounts.json`).
     #[serde(default)]
     pub clone_groups: Vec<CloneGroup>,
+    /// Named Codex account pools a clone can be bound to for rotation (members are emails
+    /// of imported Codex accounts, from the server's `codex-accounts.json`).
+    #[serde(default)]
+    pub codex_groups: Vec<CloneGroup>,
     /// Clone presets (env vars + Linear key + auto-select ticket labels). Auto-selected
     /// by ticket label when cloning from a ticket; required pick otherwise.
     #[serde(default)]
@@ -285,7 +320,9 @@ impl Default for AppConfig {
             monitors: Vec::new(),
             docker: DockerConfig::default(),
             claude: ClaudeConfig::default(),
+            codex: CodexConfig::default(),
             clone_groups: Vec::new(),
+            codex_groups: Vec::new(),
             presets: Vec::new(),
             chroma: ChromaMode::default(),
             detector_inference_url: default_inference_url(),
@@ -335,7 +372,9 @@ impl AppConfig {
             monitors: self.monitors.clone(),
             docker: self.docker.clone(),
             claude: self.claude.clone(),
+            codex: self.codex.clone(),
             clone_groups: self.clone_groups.clone(),
+            codex_groups: self.codex_groups.clone(),
             presets: self.presets.iter().map(Preset::redacted).collect(),
             chroma: self.chroma,
             detector_inference_url: self.detector_inference_url.clone(),
@@ -358,7 +397,9 @@ pub struct AppConfigRedacted {
     pub monitors: Vec<MonitorSpec>,
     pub docker: DockerConfig,
     pub claude: ClaudeConfig,
+    pub codex: CodexConfig,
     pub clone_groups: Vec<CloneGroup>,
+    pub codex_groups: Vec<CloneGroup>,
     pub presets: Vec<PresetRedacted>,
     pub chroma: ChromaMode,
     pub detector_inference_url: String,
@@ -498,6 +539,41 @@ mod tests {
         // Missing field → empty list.
         let c: AppConfig = serde_json::from_str("{}").unwrap();
         assert!(c.presets.is_empty());
+    }
+
+    #[test]
+    fn codex_config_defaults_and_passthrough() {
+        // Defaults: 600s poll, no pinned email, no auto-swap, usage polling ON.
+        let c = AppConfig::default();
+        assert_eq!(c.codex.poll_secs, 600);
+        assert!(c.codex.pinned_email.is_none());
+        assert!(!c.codex.auto_swap_on_exhaustion);
+        assert!(c.codex.usage_polling, "usage_polling defaults to true");
+        assert!(c.codex_groups.is_empty());
+        // Missing keys fall back to defaults (older config.json stays valid).
+        let d: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.codex.poll_secs, 600);
+        assert!(d.codex.usage_polling);
+        assert!(d.codex_groups.is_empty());
+        // usage_polling can be turned off from JSON (camelCase).
+        let off: AppConfig =
+            serde_json::from_str(r#"{ "codex": { "pollSecs": 300, "usagePolling": false } }"#).unwrap();
+        assert_eq!(off.codex.poll_secs, 300);
+        assert!(!off.codex.usage_polling);
+        // Redaction passes codex + codex_groups through (non-secret).
+        let r = AppConfig {
+            codex: CodexConfig { poll_secs: 120, usage_polling: false, ..Default::default() },
+            codex_groups: vec![CloneGroup { name: "g".into(), accounts: vec!["z@o".into()] }],
+            ..Default::default()
+        }
+        .redacted();
+        assert_eq!(r.codex.poll_secs, 120);
+        assert!(!r.codex.usage_polling);
+        assert_eq!(r.codex_groups.len(), 1);
+        // Round-trips as camelCase.
+        let v = serde_json::to_value(&CodexConfig::default()).unwrap();
+        assert!(v.get("usagePolling").is_some());
+        assert!(v.get("autoSwapOnExhaustion").is_some());
     }
 
     #[test]

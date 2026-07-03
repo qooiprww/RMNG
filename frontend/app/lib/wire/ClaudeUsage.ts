@@ -12,7 +12,7 @@ export type ClaudeUsage = {
  */
 id: string, email: string, provider: Provider | null, active: boolean, 
 /**
- * Whether the account can run a clone: true for every imported Claude
- * account (the server owns its token lifecycle); Codex accounts never.
+ * Whether the account can run a clone: true for every imported account of either
+ * provider (the server owns each account's token lifecycle).
  */
 assignable: boolean | null, error: string | null, stale: boolean | null, lastUpdated: bigint, fiveHour: ClaudeUsageWindow | null, sevenDay: ClaudeUsageWindow | null, spend: ClaudeSpend | null, };
