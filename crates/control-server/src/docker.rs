@@ -85,6 +85,22 @@ const CTD_TARGET: &str = "/var/lib/containerd";
 /// Extra swap over the memory limit, in bytes (+8 GiB, matching LXC parity).
 const SWAP_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 
+/// The host directory lxcfs serves its cgroup-aware `/proc` replacements from, when the
+/// optional `lxcfs` package is installed + mounted on the Docker host.
+const LXCFS_PROC_DIR: &str = "/var/lib/lxcfs/proc";
+/// The proc files lxcfs virtualizes; each is bound over a clone's matching `/proc/<file>`
+/// (by [`lxcfs_proc_mounts`]) so `free`/`nproc`/`htop` reflect the clone's cgroup limits
+/// instead of the host totals. `meminfo` doubles as the availability-probe target.
+const LXCFS_PROC_FILES: [&str; 6] = ["meminfo", "cpuinfo", "stat", "uptime", "loadavg", "swaps"];
+/// The single lxcfs file the availability probe stats — its presence ⇒ lxcfs is mounted
+/// and [`lxcfs_proc_mounts`] may safely bind the clone `/proc` files.
+const LXCFS_PROBE_FILE: &str = "/var/lib/lxcfs/proc/meminfo";
+/// Cap on how long the managed-mode lxcfs probe waits for its throwaway container to exit.
+/// A `test -f` is near-instant; this only guards against a wedged daemon so `self_setup`
+/// can never hang on the probe. On timeout the probe is treated as absent and the
+/// container force-removed.
+const LXCFS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 // --- Report ---------------------------------------------------------------------------
 
 /// The self-setup verdict, filled by [`DockerCtl::self_setup`] and served as
@@ -119,6 +135,12 @@ pub struct EnvReport {
     pub sock_mount_detail: String,
     /// `/dev/dri/renderD128` exists (required for the media/streaming plane).
     pub dri_ok: bool,
+    /// lxcfs is installed on the Docker host (optional) — probed by
+    /// [`DockerCtl::probe_lxcfs`]. When true, new clones get lxcfs's cgroup-aware `/proc`
+    /// files bound over their own so `free`/`nproc`/`htop` reflect the clone's limits;
+    /// when false, clones keep host-wide `/proc` (graceful degradation). Not a *required*
+    /// check — absence is advisory only.
+    pub lxcfs_ok: bool,
 }
 
 impl EnvReport {
@@ -130,7 +152,8 @@ impl EnvReport {
 
     /// Project into the wire DTO `GET /api/setup/env` returns. Rows, in order: daemon
     /// reachability, self-container detection (info — absence = dev mode), sock-mount
-    /// presence (required), `/dev/dri/renderD128` presence (required).
+    /// presence (required), `/dev/dri/renderD128` presence (required), lxcfs availability
+    /// (advisory — absence = clones see host-wide `/proc`).
     pub fn to_setup_env(&self) -> SetupEnv {
         let daemon_detail = match (&self.daemon_ok, &self.daemon_version) {
             (true, Some(v)) => format!("Docker {v}"),
@@ -178,6 +201,18 @@ impl EnvReport {
                         "/dev/dri/renderD128 not found — the video plane needs a render node".into()
                     },
                     required: true,
+                },
+                EnvCheckRow {
+                    id: "lxcfs".into(),
+                    label: "LXCFS (clones see their own CPU/RAM limits)".into(),
+                    ok: self.lxcfs_ok,
+                    // Advisory: absence just means clones see host-wide /proc.
+                    detail: if self.lxcfs_ok {
+                        "present".into()
+                    } else {
+                        "not installed on the Docker host — clones see host-wide /proc values; apt install lxcfs".into()
+                    },
+                    required: false,
                 },
             ],
         }
@@ -339,7 +374,8 @@ impl DockerCtl {
     ///    mode); connect self under the alias when both a self-container and the network
     ///    exist,
     /// 5. sock-mount discovery from our own mounts (required),
-    /// 6. `dri_ok` = `/dev/dri/renderD128` exists.
+    /// 6. `dri_ok` = `/dev/dri/renderD128` exists,
+    /// 7. `lxcfs_ok` = lxcfs installed on the host (optional — junk-free probe).
     ///
     /// Never bails on a down daemon — it records the failure in the report so the wizard
     /// can render it. `setup_complete` is passed in by the caller (`App` reads config). A
@@ -421,6 +457,11 @@ impl DockerCtl {
         // 6. render node.
         report.dri_ok = std::path::Path::new("/dev/dri/renderD128").exists();
 
+        // 7. lxcfs (optional): can each clone see its own cgroup limits in /proc? Probed
+        // without creating host-side junk — see `probe_lxcfs`. Absence degrades gracefully
+        // (clones keep host-wide /proc); a later `apt install lxcfs` + restart re-probes.
+        report.lxcfs_ok = self.probe_lxcfs(report.self_container.as_deref()).await;
+
         *self.env.write().await = report.clone();
         report
     }
@@ -461,6 +502,118 @@ impl DockerCtl {
             }
         }
         None
+    }
+
+    /// Whether lxcfs is available on the Docker host — i.e. [`LXCFS_PROBE_FILE`] exists —
+    /// so [`lxcfs_proc_mounts`] may bind the clone `/proc` files. Cached on
+    /// [`EnvReport::lxcfs_ok`] and re-probed on every `self_setup` (boot / config test /
+    /// wizard finish), so installing lxcfs then restarting the server (or Settings→Test)
+    /// picks it up with no extra plumbing. Any docker error ⇒ treated as absent (logged),
+    /// never fatal to boot.
+    ///
+    /// Two probe paths, both junk-free:
+    /// - **Dev mode** (server on the host, `self_container = None`): stat the path directly
+    ///   — same idiom as `dri_ok`, and it's the exact host path a clone bind would source
+    ///   from, so it predicts the clone binds precisely.
+    /// - **Managed mode** (server in a container): our mount namespace can't see the host
+    ///   fs, and a docker bind whose source is missing would silently CREATE a directory
+    ///   there — poisoning later detection and breaking clone starts (a dir bound over a
+    ///   proc file). So we probe from a throwaway container off our OWN image (guaranteed
+    ///   present on the daemon) that stats the host path through a read-only bind of `/`
+    ///   (binding `/` can never create junk).
+    async fn probe_lxcfs(&self, self_container: Option<&str>) -> bool {
+        match self_container {
+            None => std::path::Path::new(LXCFS_PROBE_FILE).exists(),
+            Some(id) => match self.lxcfs_container_probe(id).await {
+                Ok(present) => present,
+                Err(e) => {
+                    tracing::warn!(target: "docker", "lxcfs probe failed (treating as absent): {e:#}");
+                    false
+                }
+            },
+        }
+    }
+
+    /// The managed-mode lxcfs probe: run a short-lived container off our own image that
+    /// `test -f`s the host lxcfs file via a read-only bind of `/`. Returns whether it
+    /// exited 0 (file present). The probe container is deterministically named per
+    /// control-server and force-removed after — a crashed earlier run is reclaimed by the
+    /// pre-clean, so it never leaves host-side junk. Deliberately NOT `rmng.managed`-
+    /// labeled: it's ephemeral infra, not a fleet member (keeps it out of the managed
+    /// sweeps in `binswap`/`web`). We do our own removal (not `auto_remove`) so the exit
+    /// code can be read without racing the daemon's autoremoval of a sub-second container.
+    async fn lxcfs_container_probe(&self, self_id: &str) -> Result<bool> {
+        let docker = self.daemon()?;
+        // Our own image (the digest id `Image` reports) — guaranteed present on the
+        // daemon, and ubuntu-based so `sh`/`test` exist.
+        let image = docker
+            .inspect_container(self_id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+            .context("inspecting self for the lxcfs probe image")?
+            .image
+            .ok_or_else(|| anyhow!("self container has no image id"))?;
+
+        let name = format!("rmng-lxcfs-probe-{}", short_id(self_id));
+        // Reclaim a probe container a crashed earlier run may have left (idempotent, 404-ok).
+        let _ = self.remove_container(&name).await;
+
+        let host_config = HostConfig {
+            // Read-only bind of the host root: the source `/` always exists (never creates
+            // junk) and the probe only READS `/host/var/lib/lxcfs/proc/meminfo` through it.
+            binds: Some(vec!["/:/host:ro".to_string()]),
+            // No network needed; keep the probe off the rmng bridge entirely.
+            network_mode: Some("none".to_string()),
+            ..Default::default()
+        };
+        let body = ContainerCreateBody {
+            image: Some(image),
+            // `sh -c` uses the shell's builtin `test`, so it works regardless of coreutils
+            // layout; exit 0 ⇒ file present ⇒ lxcfs available.
+            entrypoint: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("test -f /host{LXCFS_PROBE_FILE}"),
+            ]),
+            cmd: Some(Vec::new()), // clear any inherited Cmd
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::new().name(&name).build();
+        let id = docker
+            .create_container(Some(opts), body)
+            .await
+            .context("creating the lxcfs probe container")?
+            .id;
+
+        // Run + read the exit code, then ALWAYS remove the probe container (any outcome).
+        let outcome = self.wait_lxcfs_probe(&docker, &id).await;
+        let _ = self.remove_container(&id).await;
+        outcome
+    }
+
+    /// Start the lxcfs probe container and read its exit code. `Ok(true)` = exited 0 (file
+    /// present); `Ok(false)` = exited non-zero (absent — bollard surfaces a non-zero exit
+    /// as [`BollardError::DockerContainerWaitError`], an expected quiet result, not a probe
+    /// failure); `Err` only for genuine transport failures the caller logs. No `auto_remove`
+    /// on the container, so the exited-but-present container still yields its stored exit
+    /// code here without racing removal.
+    async fn wait_lxcfs_probe(&self, docker: &Docker, id: &str) -> Result<bool> {
+        docker
+            .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+            .context("starting the lxcfs probe container")?;
+        let mut waits =
+            docker.wait_container(id, None::<bollard::query_parameters::WaitContainerOptions>);
+        let frame = tokio::time::timeout(LXCFS_PROBE_TIMEOUT, waits.next())
+            .await
+            .map_err(|_| anyhow!("lxcfs probe container did not exit within {LXCFS_PROBE_TIMEOUT:?}"))?;
+        match frame {
+            Some(Ok(resp)) => Ok(resp.status_code == 0),
+            // test = 1 (absent) or 127 (no `test`) — both mean "not available", quietly.
+            Some(Err(BollardError::DockerContainerWaitError { .. })) => Ok(false),
+            Some(Err(e)) => Err(e.into()),
+            None => Err(anyhow!("lxcfs probe wait returned no frames")),
+        }
     }
 
     /// Discover the host source of the shared clone-socket mount from our own container's
@@ -834,6 +987,14 @@ impl DockerCtl {
                 ..Default::default()
             });
         }
+        // lxcfs (optional): when the host has it installed (probed by `self_setup`), bind
+        // its cgroup-aware /proc files over the clone's so `free`/`nproc`/htop reflect the
+        // clone's cpu/memory limits. No-op when absent — the clone keeps host-wide /proc.
+        // These are container config: they mount before /sbin/init and are NEVER baked
+        // into a commit (a commit captures the image fs, not HostConfig binds). Only NEW
+        // clones created after the probe saw lxcfs get them; existing containers are
+        // untouched.
+        mounts.extend(lxcfs_proc_mounts(self.env.read().await.lxcfs_ok));
 
         let mem = (spec.memory_mb as i64) * 1024 * 1024;
         let host_config = HostConfig {
@@ -1423,6 +1584,38 @@ fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
+/// The lxcfs `/proc` binds for a clone's `HostConfig`, given the cached probe verdict
+/// (`lxcfs_ok`). Pure (no I/O) so it's unit-testable and safe: it emits binds ONLY when
+/// the probe confirmed lxcfs is present, which is the single guard against the
+/// missing-source-creates-a-junk-directory hazard.
+///
+/// Empty when `!lxcfs_ok` — the clone keeps today's host-wide `/proc` (graceful
+/// degradation). When available, each of the six virtualized files ([`LXCFS_PROC_FILES`])
+/// is bind-mounted over the clone's matching `/proc/<file>` so cgroup-aware tools
+/// (`free`, `nproc`, `htop`) report the clone's cpu/memory limits, not the host totals.
+///
+/// - **rw, not ro**: mirrors the lxcfs upstream Docker README example
+///   (`-v /var/lib/lxcfs/proc/…:/proc/…:rw`). The FUSE fs serves them read-mostly, but the
+///   canonical container bind is rw (some readers open the files rw).
+/// - **`Mount` API, not `-v` binds**: a missing source ERRORS the create rather than
+///   silently materializing a host directory over the proc file — defense-in-depth, though
+///   the `lxcfs_ok` guard already means the sources exist.
+fn lxcfs_proc_mounts(lxcfs_ok: bool) -> Vec<Mount> {
+    if !lxcfs_ok {
+        return Vec::new();
+    }
+    LXCFS_PROC_FILES
+        .iter()
+        .map(|f| Mount {
+            target: Some(format!("/proc/{f}")),
+            source: Some(format!("{LXCFS_PROC_DIR}/{f}")),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Whether an exec-stdin write error is the *expected* result of the exec process
 /// exiting before consuming all of its stdin (a script that `exit`s early, a `set -e`
 /// bail, a bash parse error): the daemon tears the stdin stream down and the tail write
@@ -1865,16 +2058,17 @@ mod tests {
             sock_mount_ok: true,
             sock_mount_detail: "dev".into(),
             dri_ok: true,
+            lxcfs_ok: true,
         };
         assert!(report.required_ok());
         let env = report.to_setup_env();
-        assert_eq!(env.rows.len(), 4);
+        assert_eq!(env.rows.len(), 5);
 
         // A network / self-attach failure is non-fatal: it doesn't fail the required checks
         // (the wizard-finish caller surfaces `network_detail` as a warning) and adds no row.
         let net_fail = EnvReport { network_detail: Some("connect self to rmng failed".into()), ..report.clone() };
         assert!(net_fail.required_ok());
-        assert_eq!(net_fail.to_setup_env().rows.len(), 4);
+        assert_eq!(net_fail.to_setup_env().rows.len(), 5);
         let by = |id: &str| env.rows.iter().find(|r| r.id == id).unwrap();
         assert!(by("dockerDaemon").ok && by("dockerDaemon").required);
         // self-container info row: not required, ok even in dev mode.
@@ -1882,6 +2076,16 @@ mod tests {
         assert!(by("selfContainer").detail.contains("dev mode"));
         assert!(by("sockMount").required);
         assert!(by("renderNode").required);
+        // lxcfs is advisory (never required); present ⇒ ok + "present".
+        assert!(by("lxcfs").ok && !by("lxcfs").required);
+        assert_eq!(by("lxcfs").detail, "present");
+        // Absent lxcfs stays non-required (advisory) and doesn't fail the required set.
+        let no_lxcfs = EnvReport { lxcfs_ok: false, ..report.clone() };
+        assert!(no_lxcfs.required_ok());
+        let no_lxcfs_env = no_lxcfs.to_setup_env();
+        let lxcfs_row = no_lxcfs_env.rows.iter().find(|r| r.id == "lxcfs").unwrap();
+        assert!(!lxcfs_row.ok && !lxcfs_row.required);
+        assert!(lxcfs_row.detail.contains("apt install lxcfs"));
 
         // A missing sock mount fails the required check.
         let bad = EnvReport { sock_mount_ok: false, ..report.clone() };
@@ -1905,5 +2109,30 @@ mod tests {
     #[test]
     fn dind_volume_name_shape() {
         assert_eq!(DockerCtl::dind_volume_name("pega-dev-1"), "rmng-dind-pega-dev-1");
+    }
+
+    #[test]
+    fn lxcfs_proc_mounts_gated_on_probe() {
+        // Absent ⇒ no binds at all (the clone keeps host-wide /proc; no junk risk).
+        assert!(lxcfs_proc_mounts(false).is_empty());
+
+        // Present ⇒ exactly the six virtualized files, each host lxcfs source bound rw over
+        // the clone's matching /proc/<same-basename> target.
+        let mounts = lxcfs_proc_mounts(true);
+        assert_eq!(mounts.len(), 6);
+        for m in &mounts {
+            assert_eq!(m.typ, Some(MountTypeEnum::BIND));
+            assert_eq!(m.read_only, Some(false), "lxcfs binds are rw (upstream convention)");
+            let src = m.source.as_deref().unwrap();
+            let tgt = m.target.as_deref().unwrap();
+            assert!(src.starts_with("/var/lib/lxcfs/proc/"), "source under lxcfs dir: {src}");
+            assert!(tgt.starts_with("/proc/"), "target under /proc: {tgt}");
+            // Same basename on both sides (meminfo → /proc/meminfo, etc.).
+            assert_eq!(src.rsplit('/').next(), tgt.rsplit('/').next());
+        }
+        let targets: Vec<&str> = mounts.iter().map(|m| m.target.as_deref().unwrap()).collect();
+        for want in ["/proc/meminfo", "/proc/cpuinfo", "/proc/stat", "/proc/uptime", "/proc/loadavg", "/proc/swaps"] {
+            assert!(targets.contains(&want), "missing bind target {want}");
+        }
     }
 }

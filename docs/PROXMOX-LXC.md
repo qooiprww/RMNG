@@ -12,8 +12,9 @@ Use an Ubuntu 26.04 CT template. The RMNG clones need nested Docker and a GPU re
 the CT needs these node-side settings (`/etc/pve/lxc/<id>.conf`):
 
 ```conf
-# Nested containers + keyring (Docker-in-LXC).
-features: nesting=1,keyctl=1
+# Nested containers + keyring (Docker-in-LXC). `fuse=1` is only needed for the OPTIONAL
+# lxcfs feature (§2b) — clones seeing their own CPU/RAM limits in /proc; harmless otherwise.
+features: nesting=1,keyctl=1,fuse=1
 
 # GPU render node passthrough for VA-API (encode on the control-server, capture in clones).
 dev0: /dev/dri/renderD128,mode=0666
@@ -28,7 +29,7 @@ lxc.mount.entry: /dev/null sys/module/apparmor/parameters/enabled none bind,opti
 lxc.mount.auto: cgroup:mixed proc:rw sys:mixed
 ```
 
-Set them via `pct set <id> --features nesting=1,keyctl=1` and edit the conf for the `dev0` /
+Set them via `pct set <id> --features nesting=1,keyctl=1,fuse=1` and edit the conf for the `dev0` /
 `lxc.apparmor.profile` lines, then restart the CT. Give it enough cores/RAM/disk for the
 fleet you intend to run (clones default to 16 cores / 32 GiB each — tune
 `docker.cloneCpus` / `docker.cloneMemoryMb` in the wizard).
@@ -60,6 +61,25 @@ apt-get update && apt-get install -y curl ca-certificates
 curl -fsSL https://get.docker.com | sh
 ```
 
+## 2b. (Optional) Install lxcfs so clones see their own CPU/RAM limits
+
+Clones get cgroup limits (16 cpu / 32 GiB by default), but the kernel's `/proc` isn't
+namespaced — so inside a clone `free -h`/`nproc`/`htop` otherwise report the whole host's
+RAM and cores. Install **lxcfs** in the CT and RMNG binds its cgroup-aware `/proc` files
+over each *new* clone's `/proc/{meminfo,cpuinfo,stat,uptime,loadavg,swaps}`:
+
+```sh
+apt-get install -y lxcfs
+# The lxcfs service starts on install and mounts /var/lib/lxcfs/proc/*; confirm with:
+ls /var/lib/lxcfs/proc/            # cpuinfo loadavg meminfo stat swaps uptime
+```
+
+This needs the CT feature `fuse=1` (set in §1). It's entirely optional: without lxcfs,
+clones just see host-wide `/proc` values and everything else works. RMNG auto-detects it —
+the setup wizard's environment checklist shows an advisory **LXCFS** row (present / not
+installed). Install it, then restart the control-server (or hit Settings → Test) and
+re-create clones to pick it up.
+
 ## 3. Verify the daemon before deploying RMNG
 
 ```sh
@@ -78,4 +98,5 @@ own inner Docker, but the CT's *outer* Docker still needs overlay2.
 Now the CT is just a Docker host. Continue with [DEPLOY.md](DEPLOY.md): pull/build the image,
 `docker compose up -d` (or the `docker run` one-liner), open `http://<ct-ip>:9000`, and run
 the setup wizard. The wizard's environment checklist (`GET /api/setup/env`) will confirm the
-Docker daemon, the `/srv/rmng-sock` mount, and `/dev/dri/renderD128` from inside the CT.
+Docker daemon, the `/srv/rmng-sock` mount, and `/dev/dri/renderD128` from inside the CT, plus
+the advisory lxcfs row (§2b).

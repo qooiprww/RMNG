@@ -250,6 +250,25 @@ clone restarts (the PID changes) and prunes stopped/deleted clones. Reach it thr
 Omit `--pid host` and this feature is simply off (the server logs a one-time hint per clone);
 nothing else is affected.
 
+## Clone `/proc` limits (lxcfs)
+
+Clones get cgroup limits (16 cpu / 32 GiB by default) but the kernel's `/proc` isn't
+namespaced, so by default `free -h`/`nproc`/`htop` inside a clone report the whole host's
+RAM and cores. Install **lxcfs** on the Docker host and RMNG binds its cgroup-aware `/proc`
+files (`meminfo`, `cpuinfo`, `stat`, `uptime`, `loadavg`, `swaps`) over each *new* clone's,
+so those tools reflect the clone's own 16-cpu / 32-GiB limits.
+
+- **Optional, auto-detected.** RMNG probes for lxcfs at boot / on Settings → Test / at wizard
+  finish and shows the result as an advisory row in the setup checklist ("LXCFS"). Without
+  lxcfs, clones just keep host-wide `/proc` — everything else works.
+- **Install** it on the host (on a Proxmox LXC CT the CT also needs the `fuse=1` feature — see
+  [PROXMOX-LXC.md](PROXMOX-LXC.md) §1/§2b): `apt install lxcfs` (its service mounts
+  `/var/lib/lxcfs/proc/*`).
+- **Pick it up:** after installing, **restart the control-server (or hit Settings → Test) and
+  re-create clones**. The binds are applied at clone-create time, so only clones created after
+  the probe saw lxcfs get them; existing clones keep their old view until re-created. The
+  binds are container config only — never baked into a committed image.
+
 ## The image build
 
 `docker build -t rmng:latest .` produces the **control-server image only** — it no longer
