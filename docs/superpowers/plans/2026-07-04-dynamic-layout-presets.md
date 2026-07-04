@@ -12,7 +12,7 @@
 
 - **No app loss:** switching a layout MUST NOT restart gnome-headless or the clone session. The existing `apply-monitors.sh` path (restarts GNOME) is deleted, not reused.
 - **Fleet-wide scope:** activating a preset applies to **all running clones** (one global active layout). No per-clone layouts.
-- **Approach A only:** count/resolution changes are done by diffing `RecordVirtual` streams on the live Mutter session. No session-rebuild fallback.
+- **Approach A′ (make-before-break session swap):** Phase 0 proved Mutter can't add a monitor to a started session, so a live switch builds a fresh Mutter session with the full desired set, switches capture + input to it, then stops the old session (new outputs exist before old drop → no window collapse, no app close). gnome-shell is never restarted.
 - **Server is source of truth:** the active layout is pushed to daemons over the clone socket on `Hello` and on activation. Baked `RMNG_MONITORS` is only a pre-connect boot default.
 - **No-env invariant:** the control-server reads config only from `config.json` (no new `RMNG_*` env). Config changes go through `PUT /api/config` / `config::save`.
 - **ts-rs generation:** wire types deriving `TS` regenerate `frontend/app/lib/wire/*.ts` on `cargo test -p wire` (or the build). Never hand-edit generated files; DO hand-edit the parallel hand-written `frontend/app/lib/types.ts`.
@@ -817,97 +817,63 @@ git commit -m "refactor(jobs): drop restart-based apply_monitors on clone create
 
 ---
 
-## Phase 3 — Clone-daemon live reconfiguration (Approach A)
+## Phase 3 — Clone-daemon live reconfiguration (Approach A′: make-before-break session swap)
 
-The heart of the feature. Uses Phase 0 findings. Restructures `run_shipping` so the Mutter `Session` and per-monitor capture are owned by a reconfigurable controller reachable by a control channel.
+**Phase 0 result (binding):** Mutter (GNOME 48, Ubuntu 26.04) **cannot add a virtual monitor to an already-started session** — `RecordVirtual` after `Session.Start` no-ops and re-`Start` errors `Already started`. Validated instead: a **fresh** RemoteDesktop+ScreenCast session records+starts a new monitor set **live** alongside existing monitors, and `RemoteDesktop.Session.Stop` / `ScreenCast.Stream.Stop` remove monitors live — **apps never close, gnome-shell never restarts**.
 
-### Task 3.1: Make the Mutter `Session` reconfigurable (hold proxies; add stream helpers)
+So reconfiguration is a **make-before-break session swap**: build a fresh Mutter session with the full desired monitor set → start capture on its nodes + point input at it → stop the old session. Because the new outputs exist before the old ones drop, gnome-shell never sees zero outputs (no window collapse). All monitors re-key once per switch (new PipeWire nodes) — a single brief IDR, the accepted A′ cost. Restructures `run_shipping` so the session-bound tasks (capture, input inject, clipboard, MCP) read a **shared active-session handle** the controller swaps.
+
+### Task 3.1: Add `Session::stop()` + a shared active-session handle
 
 **Files:**
-- Modify: `crates/clone-daemon/src/mutter.rs:84-190` (add `Stream.Stop`; store ScreenCast session proxy + per-stream proxies in `Session`; add `add_monitor` / `stop_monitor`)
+- Modify: `crates/clone-daemon/src/mutter.rs` (add `Session::stop`; ensure `VirtualMonitor: Clone`)
 - Test: none (D-Bus I/O; validated by Phase 0 spike + E2E)
 
 **Interfaces:**
-- Consumes: existing `ScreenCastSessionProxy`, `ScreenCastStreamProxy`, `VirtualMonitor`.
+- Consumes: existing `RemoteDesktopSessionProxy` (already has a `stop()` method, mutter.rs:39), `setup_with_cursor_mode` (unchanged — it builds a full fresh session; this is the rebuild primitive).
 - Produces:
-  - `Session` gains `sc: ScreenCastSessionProxy<'static>`, `conn` (already present), and per-monitor a stored `stream_path`.
-  - `Session::add_monitor(&mut self, monitor_id: u32, w: u32, h: u32) -> Result<VirtualMonitor>`.
-  - `Session::stop_monitor(&mut self, monitor_id: u32) -> Result<()>` (calls `Stream.Stop`, removes from `self.monitors`).
+  - `Session::stop(&self) -> zbus::Result<()>` — stops the RemoteDesktop session, which tears down the linked ScreenCast session and all its virtual monitors (Phase 0: `RD.Session.Stop` removes the monitors live).
+  - `struct SessionRuntime { rd: RemoteDesktopSessionProxy<'static>, streams: HashMap<u32, String> }` (monitor_id/slot → stream path, for absolute-pointer inject) and the alias `type ActiveSession = Arc<tokio::sync::Mutex<SessionRuntime>>` — the handle the input/clipboard tasks read and the controller swaps on reconfigure.
 
-- [ ] **Step 1: Add `Stop` to the Stream proxy**
+- [ ] **Step 1: Add `Session::stop`**
 
-In the `ScreenCastStream` proxy trait (line 107-110), add:
-```rust
-    fn stop(&self) -> zbus::Result<()>;
-```
-
-- [ ] **Step 2: Store the ScreenCast session proxy in `Session`**
-
-Change `struct Session` (line 124-128) to:
-```rust
-pub struct Session {
-    pub conn: zbus::Connection,
-    pub rd: RemoteDesktopSessionProxy<'static>,
-    /// Kept alive so we can RecordVirtual more monitors live (add) after Start.
-    pub sc: ScreenCastSessionProxy<'static>,
-    pub cursor_mode: u32,
-    pub monitors: Vec<VirtualMonitor>,
-}
-```
-In `setup_with_cursor_mode`, keep `sc_session` (currently local) and put it into the returned `Session`, and record `cursor_mode`:
-```rust
-    Ok(Session { conn, rd: rd_session, sc: sc_session, cursor_mode, monitors })
-```
-
-- [ ] **Step 3: Add `add_monitor`**
-
-Add to `impl Session` (create the impl block if none exists):
+Add to `crates/clone-daemon/src/mutter.rs` (in an `impl Session` block):
 ```rust
 impl Session {
-    /// RecordVirtual a new virtual monitor on the live session and resolve its PipeWire
-    /// node id. Appends to `self.monitors`. (Mutter accepts RecordVirtual after Start —
-    /// validated in the Phase 0 spike; this is how gnome-remote-desktop adds RDP monitors.)
-    pub async fn add_monitor(&mut self, monitor_id: u32, w: u32, h: u32) -> Result<VirtualMonitor> {
-        let mut props: HashMap<&str, Value<'_>> = HashMap::new();
-        props.insert("cursor-mode", Value::from(self.cursor_mode));
-        props.insert("is-platform", Value::from(true));
-        props.insert("modes", Value::new(build_modes(w, h)));
-        let stream_path = self.sc.record_virtual(props).await.context("RecordVirtual (add)")?;
-        let stream = ScreenCastStreamProxy::builder(&self.conn).path(stream_path.clone())?.build().await?;
-        let mut added = stream.receive_pipe_wire_stream_added().await?;
-        let sig = added.next().await.context("PipeWireStreamAdded (add)")?;
-        let node_id = sig.args().context("PipeWireStreamAdded args")?.node_id;
-        let vm = VirtualMonitor { monitor_id, stream_path: stream_path.to_string(), node_id, width: w, height: h };
-        self.monitors.push(vm.clone());
-        tracing::info!(monitor_id, node_id, w, h, "virtual monitor added live");
-        Ok(vm)
-    }
-
-    /// Stop one virtual monitor's stream (removing the Mutter output) and forget it.
-    pub async fn stop_monitor(&mut self, monitor_id: u32) -> Result<()> {
-        if let Some(pos) = self.monitors.iter().position(|m| m.monitor_id == monitor_id) {
-            let vm = self.monitors.remove(pos);
-            let stream = ScreenCastStreamProxy::builder(&self.conn).path(vm.stream_path.clone())?.build().await?;
-            stream.stop().await.context("Stream.Stop")?;
-            tracing::info!(monitor_id, node_id = vm.node_id, "virtual monitor stopped live");
-        }
-        Ok(())
+    /// Stop this Mutter session — tears down the RemoteDesktop session, its linked
+    /// ScreenCast session, and all virtual monitors. Used by the make-before-break swap
+    /// to drop the OLD session after the new one is capturing (Phase 0: apps survive).
+    pub async fn stop(&self) -> zbus::Result<()> {
+        self.rd.stop().await
     }
 }
 ```
-Add `#[derive(Clone)]` to `VirtualMonitor` if not already (extraction shows it already derives `Clone`). Ensure `use futures::StreamExt;` is in scope (it is, per line 10).
+Confirm `VirtualMonitor` derives `Clone` (it does per extraction). No `Stream.Stop`, `sc`, or `cursor_mode` field is needed — the swap rebuilds via `setup_with_cursor_mode`, and the caller already knows `cursor_mode` (from `main`).
 
-- [ ] **Step 4: Update all `Session` constructors**
+- [ ] **Step 2: Add the `SessionRuntime` handle type**
 
-`setup_with_cursor_mode` is the only constructor. Ensure the returned struct includes `sc` and `cursor_mode` (Step 2). Build:
+In `crates/clone-daemon/src/main.rs` (or a small new module), add:
+```rust
+/// The session-bound state the input/clipboard tasks need, swapped atomically by the
+/// reconfigure controller. `rd` injects input; `streams` maps monitor_id → stream path
+/// for absolute-pointer motion (`notify_pointer_motion_absolute(stream, x, y)`).
+struct SessionRuntime {
+    rd: mutter::RemoteDesktopSessionProxy<'static>,
+    streams: std::collections::HashMap<u32, String>,
+}
+type ActiveSession = std::sync::Arc<tokio::sync::Mutex<SessionRuntime>>;
+```
+
+- [ ] **Step 3: Build**
+
 Run: `cargo build -p clone-daemon`
-Expected: compiles (the `run_capture_test` + MCP paths that read `session.rd`/`session.monitors` are unaffected by the added fields).
+Expected: compiles (the type is not wired in yet; Task 3.3 consumes it).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add crates/clone-daemon/src/mutter.rs
-git commit -m "feat(daemon/mutter): reconfigurable Session — add/stop virtual monitors live"
+git add crates/clone-daemon/src/mutter.rs crates/clone-daemon/src/main.rs
+git commit -m "feat(daemon): Session::stop + swappable active-session handle"
 ```
 
 ### Task 3.2: Read real connector names from `GetCurrentState` for `apply_layout`
@@ -919,21 +885,30 @@ git commit -m "feat(daemon/mutter): reconfigurable Session — add/stop virtual 
 **Interfaces:**
 - Produces: `fn parse_connectors(get_current_state_stdout: &str) -> Vec<(String /*connector*/, u32 /*w*/, u32 /*h*/)>` and an updated `apply_layout` that maps desired monitors to real connector names (by matching current mode `WxH`), instead of hard-coding `Meta-<i>`.
 
-- [ ] **Step 1: Paste a real GetCurrentState blob from the spike**
+- [ ] **Step 1: The real GetCurrentState format (captured in Phase 0)**
 
-From Phase 0 Step 2, save the exact `gdbus ... GetCurrentState` stdout to use as the test fixture. (The structure: a serial `uint32`, then an array of monitors each with a connector string and a list of modes with `WxH@rate`.)
+The `gdbus ... GetCurrentState` stdout on a 2-monitor clone is (structure is stable; scales list trimmed here):
+```
+(uint32 3, [(('Meta-0', 'MetaVendor', 'Virtual remote monitor', '0x000001'), [('2560x1440@60.000', 2560, 1440, 60.0, 1.0, [1.0, 1.25], {'is-current': <true>, 'is-preferred': <true>})], {'is-builtin': <false>, ...}), (('Meta-1', 'MetaVendor', 'Virtual remote monitor', '0x000002'), [('2560x1440@60.000', 2560, 1440, 60.0, 1.0, [1.0], {'is-current': <true>, 'is-preferred': <true>})], {...})], [(2560, 0, 1.0, uint32 0, true, [('Meta-0', 'MetaVendor', 'Virtual remote monitor', '0x000001')], @a{sv} {}), (0, 0, 1.0, 0, false, [('Meta-1', ...)], {})], {'layout-mode': <uint32 1>, ...})
+```
+Parsing rule: each monitor group starts `(('Meta-N', ...` — the connector is the **first single-quoted string** in the group; its **current mode** is the mode tuple whose props contain `'is-current': <true>`, and its `WxH` is the two integers right after that mode's `'WxH@rate'` id (e.g. `'2560x1440@60.000', 2560, 1440`). The serial is the leading `uint32 N`.
 
 - [ ] **Step 2: Write the failing test**
 
 ```rust
     #[test]
     fn parses_connectors_and_current_modes() {
-        // Fixture captured from `gdbus ... GetCurrentState` on a 2-monitor clone (Phase 0).
-        let blob = r#"<PASTE THE REAL BLOB FROM THE SPIKE HERE>"#;
+        // Real GetCurrentState shape from Phase 0 (CT 113, GNOME 48), scales trimmed.
+        let blob = "(uint32 3, [(('Meta-0', 'MetaVendor', 'Virtual remote monitor', '0x000001'), \
+[('2560x1440@60.000', 2560, 1440, 60.0, 1.0, [1.0, 1.25], {'is-current': <true>, 'is-preferred': <true>})], \
+{'is-builtin': <false>}), (('Meta-1', 'MetaVendor', 'Virtual remote monitor', '0x000002'), \
+[('1920x1080@60.000', 1920, 1080, 60.0, 1.0, [1.0], {'is-current': <true>, 'is-preferred': <true>})], \
+{'is-builtin': <false>})], [(2560, 0, 1.0, uint32 0, true, [('Meta-0', 'x', 'y', '0x1')], @a{sv} {}), \
+(0, 0, 1.0, 0, false, [('Meta-1', 'x', 'y', '0x2')], {})], {'layout-mode': <uint32 1>})";
         let conns = parse_connectors(blob);
         assert_eq!(conns.len(), 2);
-        assert_eq!(conns[0].0, "Meta-0");
-        assert!(conns.iter().any(|(_, w, h)| *w == 2560 && *h == 1440));
+        assert_eq!(conns[0], ("Meta-0".to_string(), 2560, 1440));
+        assert_eq!(conns[1], ("Meta-1".to_string(), 1920, 1080));
     }
 ```
 
@@ -964,131 +939,163 @@ git add crates/clone-daemon/src/main.rs
 git commit -m "feat(daemon): map layout to real Mutter connectors via GetCurrentState"
 ```
 
-### Task 3.3: Reconfigurable capture controller + the diff
+### Task 3.3: Session-swap reconfigure controller
 
 **Files:**
-- Modify: `crates/clone-daemon/src/main.rs:290-456` (`run_shipping` — own `Session` + capture handles; replace the final `pending()` with a control loop)
+- Modify: `crates/clone-daemon/src/main.rs:290-456` (`run_shipping` — own `Session` + capture handles + the `ActiveSession`; replace the final `pending()` with a control loop; input/clipboard read the `ActiveSession`)
 - Modify: `crates/clone-daemon/src/main.rs:501-546` (`spawn_pw_monitor` — return a stop handle)
-- Test: `crates/clone-daemon/src/main.rs` (`#[cfg(test)]` — pure diff function)
+- Test: none pure-unit here (the swap is D-Bus/PipeWire I/O). Coverage: the connector-parse test (3.2) + Phase 7 E2E (which exercises add / remove / resize live).
 
 **Interfaces:**
-- Consumes: `Session::add_monitor` / `stop_monitor` (3.1), `apply_layout` (3.2), `parse_monitors`/`MonitorCfg`.
+- Consumes: `Session::stop` + `mutter::setup_with_cursor_mode` (3.1), `ActiveSession`/`SessionRuntime` (3.1), `apply_layout` (3.2), `parse_monitors`/`MonitorCfg`.
 - Produces:
-  - `fn diff_monitors(current: &[VirtualMonitor], desired: &[MonitorCfg]) -> MonitorDiff` where `struct MonitorDiff { keep: Vec<(u32 /*slot*/, u32 /*existing node_id*/)>, add: Vec<(u32 /*slot*/, u32 /*w*/, u32 /*h*/)>, stop: Vec<u32 /*monitor_id to stop*/> }`.
-  - A `tokio::sync::mpsc` channel carrying `Vec<MonitorCfg>` from the reader thread to the controller.
-  - `spawn_pw_monitor(...) -> Arc<AtomicBool>` (a `stop` flag the capture loop checks; set to stop it — belt-and-suspenders even if node-vanish already ends `capture_pw::run`, per spike finding 0.1(d)).
+  - `async fn reconfigure(...)` — the make-before-break session swap.
+  - a `tokio::sync::mpsc` channel carrying `Vec<MonitorCfg>` from the reader thread to the controller loop.
+  - `spawn_pw_monitor(...) -> Arc<AtomicBool>` (a stop flag; belt-and-suspenders — the old session's nodes vanish on `Session::stop`, which already ends `capture_pw::run`).
+  - `enum CaptureHandle { Gst(gst::Pipeline), Pw(Arc<AtomicBool>) }` + `fn stop_capture(h: CaptureHandle)` + `fn spawn_capture_for(mon, embedded, transport, latest, gate) -> CaptureHandle`.
+  - `MonitorCfg` gains `#[derive(PartialEq)]` (for the no-op early-out).
 
-- [ ] **Step 1: Write the failing diff test**
+- [ ] **Step 1: Input inject + clipboard read the `ActiveSession` handle**
 
+Today the input-inject task and clipboard task capture `session.rd.clone()` once (main.rs ~323, ~356). Change them to hold `active: ActiveSession` and read it per event: `let rt = active.lock().await;` then use `rt.rd` for injection and `rt.streams.get(&monitor_id)` for the stream path in `notify_pointer_motion_absolute(stream, x, y)`. Build the initial handle from the startup session before spawning those tasks:
 ```rust
-    #[test]
-    fn diff_keeps_same_size_adds_new_stops_surplus() {
-        let cur = vec![
-            vm(0, 100, 1920, 1080),
-            vm(1, 101, 2560, 1440),
-        ];
-        // Desired: slot 0 same (1920x1080 reused), slot 1 resized to 3840x2160 (add),
-        // and the old 2560x1440 stream is surplus (stop).
-        let desired = vec![mc(1920, 1080), mc(3840, 2160)];
-        let d = diff_monitors(&cur, &desired);
-        assert_eq!(d.keep, vec![(0, 100)]);        // slot 0 reuses node 100
-        assert_eq!(d.add, vec![(1, 3840, 2160)]);  // slot 1 needs a new stream
-        assert_eq!(d.stop, vec![1]);               // old monitor_id 1 (2560x1440) stops
-    }
+    let active: ActiveSession = std::sync::Arc::new(tokio::sync::Mutex::new(SessionRuntime {
+        rd: session.rd.clone(),
+        streams: session.monitors.iter().map(|m| (m.monitor_id, m.stream_path.clone())).collect(),
+    }));
 ```
-Add helpers near the tests:
+Pass `active.clone()` into the input + clipboard tasks instead of the raw `rd` clone. Also create the shared MCP monitor snapshot here (consumed by Task 3.5), which `reconfigure` refreshes:
 ```rust
-    fn vm(id: u32, node: u32, w: u32, h: u32) -> mutter::VirtualMonitor {
-        mutter::VirtualMonitor { monitor_id: id, stream_path: String::new(), node_id: node, width: w, height: h }
-    }
-    fn mc(w: u32, h: u32) -> MonitorCfg { MonitorCfg { w, h, x: 0, y: 0, primary: false } }
+    let live_monitors: std::sync::Arc<std::sync::Mutex<Vec<mutter::VirtualMonitor>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(session.monitors.clone()));
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 2: `spawn_pw_monitor` returns a stop handle**
 
-Run: `cargo test -p clone-daemon diff_keeps_same_size`
-Expected: FAIL — `diff_monitors` undefined.
+Change its signature to return `Arc<AtomicBool>`: create `let stop = Arc::new(AtomicBool::new(false));`, clone it into the capture thread, early-return in `on_frame` when `stop.load(Ordering::Relaxed)`, and return `stop`. (`capture_pw::run` also self-ends when its node vanishes on the old session's teardown — the flag is the deterministic backstop.)
 
-- [ ] **Step 3: Implement `diff_monitors`**
+- [ ] **Step 3: Factor a capture-spawn helper + `CaptureHandle`**
 
-A greedy match by `WxH`: iterate desired slots; for each, find an unused current monitor with the same `(w,h)` → `keep(slot, node_id)`; else `add(slot, w, h)`. Any current monitor never matched → `stop(monitor_id)`.
+Extract the per-monitor spawn used at startup (lines 405-425) into:
 ```rust
-struct MonitorDiff {
-    /// (desired slot index, reused existing node_id)
-    keep: Vec<(u32, u32)>,
-    /// (desired slot index, width, height) — needs a fresh RecordVirtual
-    add: Vec<(u32, u32, u32)>,
-    /// monitor_id of a current stream to Stop (surplus / resized-away)
-    stop: Vec<u32>,
+enum CaptureHandle { Gst(gst::Pipeline), Pw(std::sync::Arc<std::sync::atomic::AtomicBool>) }
+
+fn spawn_capture_for(
+    mon: &mutter::VirtualMonitor, embedded: bool,
+    transport: std::sync::Arc<transport::Transport>, latest: mcp::LatestFrames,
+    gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<CaptureHandle> {
+    if embedded {
+        let (mid,(mw,mh))=(mon.monitor_id,(mon.width,mon.height));
+        let seq=std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let p = capture::start_capture(mon, move |frame| {
+            if gate.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+            let n=seq.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            ship_frame(&transport, mid, mw, mh, n, frame.fourcc, frame.modifier, frame.width, frame.height, &frame.planes, &frame.fds);
+            store_latest(&latest, mid, frame.fourcc, frame.modifier, frame.width.min(mw), frame.height.min(mh), &frame.fds);
+        })?;
+        Ok(CaptureHandle::Gst(p))
+    } else {
+        Ok(CaptureHandle::Pw(spawn_pw_monitor(mon, transport, gate, latest)))
+    }
 }
 
-fn diff_monitors(current: &[mutter::VirtualMonitor], desired: &[MonitorCfg]) -> MonitorDiff {
-    let mut used = vec![false; current.len()];
-    let mut keep = Vec::new();
-    let mut add = Vec::new();
-    for (slot, d) in desired.iter().enumerate() {
-        let slot = slot as u32;
-        if let Some(i) = current.iter().enumerate().position(|(i, c)| {
-            !used[i] && c.width == d.w && c.height == d.h
-        }) {
-            used[i] = true;
-            keep.push((slot, current[i].node_id));
-        } else {
-            add.push((slot, d.w, d.h));
-        }
+fn stop_capture(h: CaptureHandle) {
+    match h {
+        CaptureHandle::Gst(p) => { let _ = p.set_state(gstreamer::State::Null); }
+        CaptureHandle::Pw(flag) => flag.store(true, std::sync::atomic::Ordering::Relaxed),
     }
-    let stop = current.iter().enumerate().filter(|(i, _)| !used[*i]).map(|(_, c)| c.monitor_id).collect();
-    MonitorDiff { keep, add, stop }
+}
+```
+Use `spawn_capture_for` at startup too (replace the inline loop), storing handles in `capture: HashMap<u32, CaptureHandle>`.
+
+- [ ] **Step 4: Implement `reconfigure` (make-before-break)**
+
+```rust
+async fn reconfigure(
+    session: &mut mutter::Session,
+    capture: &mut std::collections::HashMap<u32, CaptureHandle>,
+    in_flight: &mut std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    active: &ActiveSession,
+    live_monitors: &std::sync::Arc<std::sync::Mutex<Vec<mutter::VirtualMonitor>>>,
+    transport: &std::sync::Arc<transport::Transport>,
+    latest: &mcp::LatestFrames,
+    cursor_mode: u32,
+    embedded: bool,
+    desired: &[MonitorCfg],
+) -> anyhow::Result<()> {
+    // 1. Build the NEW full session — its outputs appear ALONGSIDE the old (make-before-break),
+    //    so gnome-shell never sees zero monitors (no window collapse). monitor_id == slot index.
+    let sizes: Vec<(u32, u32)> = desired.iter().map(|m| (m.w, m.h)).collect();
+    let new = mutter::setup_with_cursor_mode(&sizes, cursor_mode).await?;
+    // 2. Start capture on the NEW nodes.
+    let mut new_capture = std::collections::HashMap::new();
+    let mut new_flags = std::collections::HashMap::new();
+    for mon in &new.monitors {
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        new_flags.insert(mon.monitor_id, gate.clone());
+        new_capture.insert(mon.monitor_id, spawn_capture_for(mon, embedded, transport.clone(), latest.clone(), gate)?);
+    }
+    // 3. Point input at the new session BEFORE dropping the old.
+    {
+        let mut rt = active.lock().await;
+        rt.rd = new.rd.clone();
+        rt.streams = new.monitors.iter().map(|m| (m.monitor_id, m.stream_path.clone())).collect();
+    }
+    // 4. Stop the OLD session (old outputs drop; gnome-shell reflows onto the new set), then
+    //    position the new monitors. apply_layout AFTER stop → only the new connectors exist,
+    //    so the connector match (Task 3.2) is unambiguous. (If on-device testing shows the new
+    //    monitors need positioning before the old drop, move apply_layout before session.stop.)
+    let _ = session.stop().await;
+    apply_layout(desired).await;
+    // 5. Stop old capture (nodes already gone; flags are the deterministic backstop).
+    for (_, h) in capture.drain() { stop_capture(h); }
+    for (_, f) in in_flight.drain() { f.store(true, std::sync::atomic::Ordering::Relaxed); }
+    // 6. Swap in the new session/capture/gates + refresh the MCP snapshot.
+    *session = new;
+    *capture = new_capture;
+    *in_flight = new_flags;
+    *live_monitors.lock().unwrap() = session.monitors.clone();
+    // 7. Report the applied layout (id == slot).
+    let layout: Vec<MonitorPlacement> = desired.iter().enumerate()
+        .map(|(i, m)| MonitorPlacement { id: i as u32, x: m.x, y: m.y, width: m.w, height: m.h, primary: m.primary })
+        .collect();
+    transport.send(&DaemonMsg::Layout { monitors: layout }, &[])?;
+    Ok(())
 }
 ```
 
-- [ ] **Step 4: Run the diff test**
+- [ ] **Step 5: Replace the terminal `pending()` with the control loop**
 
-Run: `cargo test -p clone-daemon diff_keeps_same_size`
-Expected: PASS.
-
-- [ ] **Step 5: Give `spawn_pw_monitor` a stop handle**
-
-Change its signature to return `Arc<AtomicBool>` and have `on_frame` early-return + the loop break when the flag is set. Minimal change: create `let stop = Arc::new(AtomicBool::new(false));` clone it into the thread; inside `on_frame`, `if stop.load(Ordering::Relaxed) { return; }`; after `capture_pw::run(...)` returns (it returns when the node vanishes per spike), the thread ends. Return `stop` so the controller can also proactively signal it. (If Phase 0 finding (d) says capture self-terminates reliably, the flag is just belt-and-suspenders; keep it — it also lets us stop a reused-but-now-removed node deterministically.)
-
-- [ ] **Step 6: Restructure `run_shipping` into a controller loop**
-
-Refactor so `run_shipping` keeps `session: Session`, a `capture: HashMap<u32 /*monitor_id*/, CaptureHandle>` (GStreamer `Pipeline` for embedded, or `Arc<AtomicBool>` stop-flag for raw-PW), and the current `Vec<MonitorCfg>`. Replace the terminal `futures::future::pending().await` with:
+Add `#[derive(PartialEq)]` to `MonitorCfg`. Replace `futures::future::pending::<()>().await;` (main.rs:455) with:
 ```rust
-    // Control loop: apply live monitor reconfigurations pushed by the server.
     let mut current_cfg = monitors.to_vec();
     while let Some(desired) = reconfig_rx.recv().await {
-        if let Err(e) = reconfigure(&mut session, &mut capture, &transport, &latest, &in_flight, embedded, &current_cfg, &desired).await {
+        if desired == current_cfg { continue; } // idempotent (e.g. Hello push matching boot layout)
+        if let Err(e) = reconfigure(&mut session, &mut capture, &mut in_flight, &active,
+                                    &live_monitors, &transport, &latest, cursor_mode, embedded, &desired).await {
             tracing::warn!("reconfigure failed: {e:#}");
             continue;
         }
         current_cfg = desired;
     }
 ```
-Add `async fn reconfigure(...)` that:
-1. `let d = diff_monitors(&session.monitors, &desired);`
-2. for each `stop` id: signal/stop its capture handle, `session.stop_monitor(id).await`, remove from `in_flight`/`capture`.
-3. for each `add(slot, w, h)`: `let vm = session.add_monitor(slot, w, h).await?;` create its `in_flight` gate + spawn capture (embedded → `capture::start_capture`, raw-PW → `spawn_pw_monitor`) and store the handle in `capture`.
-4. Re-key: the daemon must renumber `monitor_id` = slot for every monitor (kept + added) so the viewer's windows track slots. Since `keep` reuses an existing stream but its slot may differ, set each kept `VirtualMonitor.monitor_id` to its new slot and re-tag its capture (the capture closure captures `mid` — for kept-but-renumbered monitors, stop+respawn the capture with the new mid, OR carry slot separately). Simplest correct approach: **stop and respawn capture for any monitor whose slot changed**, so the `mid` passed to `ship_frame` always equals the slot. In practice most switches change sizes/counts (already churned) and slots stay aligned; handle the reorder case by respawning.
-5. `apply_layout(&desired).await;` (positions/primary via real connectors — Task 3.2).
-6. Re-send the layout: build `Vec<MonitorPlacement>` from `desired` (id = slot) and `transport.send(&DaemonMsg::Layout { monitors })`.
+`session`, `capture`, `in_flight`, `active`, `live_monitors` must be owned by `run_shipping`'s frame (make `session`/`capture`/`in_flight` `mut` locals; `cursor_mode` is derived from `embedded` as in `main`). Keep `pipelines`/inline capture removed in favor of the `capture` map + `spawn_capture_for`.
 
-Factor the per-monitor capture-spawn (embedded vs raw-PW) used at startup (lines 405-425) into a helper `spawn_capture_for(mon, embedded, transport, latest, gate) -> CaptureHandle` and reuse it in both startup and `reconfigure`.
+- [ ] **Step 6: Wire the reader thread → controller channel**
 
-- [ ] **Step 7: Wire the reader thread → controller channel**
+Add `let (reconfig_tx, mut reconfig_rx) = tokio::sync::mpsc::channel::<Vec<MonitorCfg>>(4);`. Move `reconfig_rx` into the control loop; clone `reconfig_tx` into the `ServerMsg` reader thread (Task 3.4). The reader is a `std::thread`, so it uses `reconfig_tx.blocking_send(...)`.
 
-Add a `tokio::sync::mpsc::channel::<Vec<MonitorCfg>>(4)`; move `reconfig_rx` into the control loop (Step 6) and clone `reconfig_tx` into the `ServerMsg` reader thread (Task 3.4 adds the arm). Because the reader is a `std::thread` and the sender is a tokio mpsc, use `reconfig_tx.blocking_send(...)` there.
+- [ ] **Step 7: Build + test**
 
-- [ ] **Step 8: Build**
+Run: `cargo build -p clone-daemon && cargo test -p clone-daemon`
+Expected: compiles; the connector-parse test (3.2) passes. (Swap behavior is covered by Phase 7 E2E.)
 
-Run: `cargo build -p clone-daemon`
-Expected: compiles. Run `cargo test -p clone-daemon` — the diff + connector tests pass.
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/clone-daemon/src/main.rs
-git commit -m "feat(daemon): live monitor reconfigure controller (diff + add/stop streams)"
+git commit -m "feat(daemon): make-before-break session-swap reconfigure controller"
 ```
 
 ### Task 3.4: `SetMonitors` arm in the daemon's ServerMsg reader
@@ -1146,9 +1153,9 @@ git commit -m "feat(daemon): handle ServerMsg::SetMonitors → live reconfigure"
 **Interfaces:**
 - The MCP task holds a `session.monitors.clone()` snapshot (screenshot/geometry). After a reconfigure it goes stale. Make it read a shared `Arc<Mutex<Vec<VirtualMonitor>>>` the controller updates.
 
-- [ ] **Step 1: Introduce a shared monitors handle**
+- [ ] **Step 1: Point `mcp::serve` at the shared `live_monitors`**
 
-Create `let live_monitors = Arc::new(Mutex::new(session.monitors.clone()));` before spawning capture. The `reconfigure` fn updates it at the end (`*live_monitors.lock().unwrap() = session.monitors.clone();`). Pass `live_monitors.clone()` to `mcp::serve` instead of the `&mons` snapshot; update `mcp::serve`'s signature to take `Arc<Mutex<Vec<VirtualMonitor>>>` and lock it per request.
+`live_monitors` already exists (created in Task 3.3 Step 1 and refreshed by `reconfigure`). Pass `live_monitors.clone()` to `mcp::serve` instead of the `&mons` snapshot; update `mcp::serve`'s signature (mcp.rs:73) to take `Arc<Mutex<Vec<VirtualMonitor>>>` and lock it per request so screenshots/geometry reflect the current monitor set after a swap.
 
 - [ ] **Step 2: Build**
 

@@ -3,6 +3,17 @@
 **Status:** approved design, ready for implementation planning
 **Date:** 2026-07-04
 
+> **Update (2026-07-04, post-spike):** A Phase 0 spike on a real clone (GNOME 48, Ubuntu 26.04)
+> found Mutter **cannot add a virtual monitor to an already-started session** — so the "per-monitor
+> `RecordVirtual` stream diff on the live session" mechanism below is not achievable. The validated,
+> user-approved replacement is **Approach A′ — make-before-break session swap**: build a fresh Mutter
+> session with the full desired monitor set, switch capture + input to it, then stop the old session
+> (new outputs exist before the old drop, so gnome-shell never collapses windows and **apps never
+> close**). All hard requirements (live, immediate, zero app loss, fleet-wide) are unchanged; the only
+> difference is that every monitor re-keys once per switch (one brief IDR) instead of only the changed
+> ones. The implementation plan (`docs/superpowers/plans/2026-07-04-dynamic-layout-presets.md`, Phase 3)
+> reflects A′; the per-stream-diff description in §3 below is superseded.
+
 ## Goal
 
 Let an operator store multiple named **layout presets** (each a full monitor
