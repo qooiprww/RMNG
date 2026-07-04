@@ -109,6 +109,23 @@ export function SetupWizard({
       primary: m.primary,
     }));
 
+  // Round-trip every existing preset — like SettingsPanel's save — instead of sending just
+  // the one being edited. The server's `merge_update` replaces the whole `layoutPresets`
+  // array wholesale (that's how SettingsPanel expresses deletes), so a single-element patch
+  // here would silently delete every other named preset on a mature config.
+  const layoutPresetsPatch = () => {
+    const existing = initialConfig.layoutPresets;
+    if (!existing.length) {
+      return [{ name: layoutName || "Default", monitors: monitorsPatch() }];
+    }
+    const updated = existing.map((p) =>
+      p.name === layoutName ? { ...p, monitors: monitorsPatch() } : p,
+    );
+    return existing.some((p) => p.name === layoutName)
+      ? updated
+      : [...updated, { name: layoutName, monitors: monitorsPatch() }];
+  };
+
   // The pull op is kind "pull" with target === the pulled reference (jobs.rs start_pull →
   // make_op(Pull, reference, None)).
   const imgOp = pullTarget
@@ -147,7 +164,7 @@ export function SetupWizard({
     } else if (step === 1) {
       const ok = await persist({
         docker: { hostnamePrefix, cloneCpus, cloneMemoryMb },
-        layoutPresets: [{ name: layoutName, monitors: monitorsPatch() }],
+        layoutPresets: layoutPresetsPatch(),
         chroma,
         detectorInferenceUrl,
         listen,
