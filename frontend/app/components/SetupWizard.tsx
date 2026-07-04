@@ -74,9 +74,15 @@ export function SetupWizard({
   const [hostnamePrefix, setHostnamePrefix] = useState(initialConfig.docker.hostnamePrefix);
   const [cloneCpus, setCloneCpus] = useState(initialConfig.docker.cloneCpus);
   const [cloneMemoryMb, setCloneMemoryMb] = useState(initialConfig.docker.cloneMemoryMb);
+  // Mirror the server's `effective_monitors()`: the active preset, else the first, else a
+  // single-1080p default (the wizard only edits one layout, so there's no picker here).
+  const activePreset =
+    initialConfig.layoutPresets.find((p) => p.name === initialConfig.activeLayout) ??
+    initialConfig.layoutPresets[0];
+  const layoutName = activePreset?.name || "Default";
   const [monitors, setMonitors] = useState<Mon[]>(
-    initialConfig.monitors.length
-      ? initialConfig.monitors.map((m) => ({ ...m }))
+    activePreset?.monitors.length
+      ? activePreset.monitors.map((m) => ({ ...m }))
       : [{ width: 1920, height: 1080, x: 0, y: 0, primary: true }],
   );
   const [chroma, setChroma] = useState<ChromaMode>(initialConfig.chroma);
@@ -141,7 +147,7 @@ export function SetupWizard({
     } else if (step === 1) {
       const ok = await persist({
         docker: { hostnamePrefix, cloneCpus, cloneMemoryMb },
-        monitors: monitorsPatch(),
+        layoutPresets: [{ name: layoutName, monitors: monitorsPatch() }],
         chroma,
         detectorInferenceUrl,
         listen,

@@ -296,10 +296,6 @@ pub struct AppConfig {
     /// unless the wizard set it.
     #[serde(default)]
     pub setup_complete: bool,
-    /// DEPRECATED (transitional): superseded by `layout_presets` + `active_layout`. Still
-    /// read from legacy config.json for the one-shot migration (Task 1.5); removed in Task 6.4.
-    #[serde(default)]
-    pub monitors: Vec<MonitorSpec>,
     /// Named monitor-layout presets. The operator switches the active one from the
     /// sidebar (`POST /api/layout/activate`); the active preset drives `effective_monitors()`.
     #[serde(default)]
@@ -352,7 +348,6 @@ impl Default for AppConfig {
             static_dir: default_static_dir(),
             clone_socket: default_clone_socket(),
             setup_complete: false,
-            monitors: Vec::new(),
             layout_presets: Vec::new(),
             active_layout: String::new(),
             docker: DockerConfig::default(),
@@ -415,7 +410,6 @@ impl AppConfig {
             static_dir: self.static_dir.clone(),
             clone_socket: self.clone_socket.clone(),
             setup_complete: self.setup_complete,
-            monitors: self.monitors.clone(),
             layout_presets: self.layout_presets.clone(),
             active_layout: self.active_layout.clone(),
             docker: self.docker.clone(),
@@ -443,7 +437,6 @@ pub struct AppConfigRedacted {
     pub static_dir: String,
     pub clone_socket: String,
     pub setup_complete: bool,
-    pub monitors: Vec<MonitorSpec>,
     pub layout_presets: Vec<LayoutPreset>,
     pub active_layout: String,
     pub docker: DockerConfig,
