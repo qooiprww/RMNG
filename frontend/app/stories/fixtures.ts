@@ -287,4 +287,6 @@ export const appConfig: AppConfigRedacted = {
 };
 
 /** Emails a Claude group can draw from (the Settings pool). */
-export const accountEmails: string[] = claudeAccounts.map((a) => a.email);
+export const accountEmails: string[] = claudeAccounts
+  .filter((a) => a.provider !== "codex")
+  .map((a) => a.email);
