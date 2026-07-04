@@ -100,8 +100,8 @@ pub fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Resolve a caller-supplied image — a repo-tag reference (`rmng/template:<name>`), a full
-/// `sha256:…` id, or a bare 64-hex id — to the **canonical** [`wire::ImageInfo`] `reference`
+/// Resolve a caller-supplied image — a repo-tag reference (e.g. `pegasis0/rmng-template:latest`),
+/// a full `sha256:…` id, or a bare 64-hex id — to the **canonical** [`wire::ImageInfo`] `reference`
 /// of the matching clone-source image. `None` when nothing in the listed clone sources
 /// matches (i.e. the input isn't a labeled `rmng.image=1` image at all).
 ///
@@ -325,9 +325,34 @@ async fn clone_container_after_create(
 ) -> Result<()> {
     let docker = &app.docker;
 
-    // Container must be running to upload_tar into it (the daemon extracts into the live
-    // rootfs). systemd PID 1 comes up; we inject the identity/preset files, then the units
-    // pick them up (environment.d is read by `systemd --user` under linger at boot).
+    // Pre-boot binary injection (while the container is still STOPPED): overwrite the
+    // template's baked clone-daemon/agent-wrapper with the control-server's CURRENT payloads
+    // so the daemon's `systemd --user` unit comes up already matching what binswap expects.
+    // That turns the first `Hello` check into a no-op instead of a hot-swap — no unit bounce,
+    // no Mutter-session re-setup churn, clean boot. The binswap engine (Hello re-check +
+    // periodic sweep) is deliberately untouched, so already-running clones still auto-update
+    // on a control-server upgrade; this only fixes the create path. `payload` is None in a
+    // dev checkout with no staged binaries → skip (the template's binaries stand and the
+    // post-boot hot-swap still reconciles them). upload_tar works on a stopped container.
+    let bins: Vec<TarEntry> = REDEPLOY_UNITS
+        .iter()
+        .filter_map(|u| {
+            crate::assets::payload(u.payload).map(|data| TarEntry {
+                path: format!("opt/rmng/bin/{}", u.bin),
+                data,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            })
+        })
+        .collect();
+    if !bins.is_empty() {
+        on_progress("inject", "injecting current clone binaries (pre-boot)");
+        docker.upload_tar(container, bins).await?;
+    }
+
+    // systemd PID 1 comes up; we then inject the identity/preset files and the units pick
+    // them up (environment.d is read by `systemd --user` under linger at boot).
     on_progress("inject", "starting container to inject identity + preset");
     docker.start_container(container).await?;
 
@@ -446,7 +471,7 @@ async fn clone_container_after_create(
 /// per-(layer, status) transitions the retired in-product bootstrap logged.
 #[derive(Debug, Clone)]
 pub enum PullProgress {
-    /// A coarse step transition (`queued`/`pull`/`verify`/`tag`/`done`); maps to [`pull_pct`].
+    /// A coarse step transition (`queued`/`pull`/`verify`/`done`); maps to [`pull_pct`].
     Step { step: String, msg: String },
     /// Fine byte progress inside the `pull` step: an absolute pct (2–90) + a message.
     Pct { pct: f64, msg: String },
@@ -464,37 +489,31 @@ fn pull_pct(step: &str) -> Option<f64> {
         "queued" => 0.0,
         "pull" => 2.0,
         "verify" => 91.0,
-        "tag" => 94.0,
         "done" => 100.0,
         _ => return None,
     })
 }
 
-/// Pull the clone template from `remote_ref` (a registry `repo:tag`) and retag it locally as
-/// `rmng/template:<name>` — the canonical clone-source reference clones are created FROM.
-/// This REPLACES the retired in-product bootstrap (which provisioned a base from `ubuntu`
-/// inside a build container); the template is now built by `template/Dockerfile` and
-/// published to a registry.
+/// Pull the clone template from `remote_ref` (a registry `repo:tag`) and return that same
+/// reference as the canonical clone-source ref clones are created FROM. No local retag: the
+/// pulled image keeps its own repo:tag (e.g. `pegasis0/rmng-template:latest`), which is what
+/// the image picker lists and what `createClone` passes back. This REPLACES the retired
+/// in-product bootstrap (which provisioned a base from `ubuntu` inside a build container); the
+/// template is now built by `template/Dockerfile` and published to a registry.
 ///
 /// Steps (→ pct): `queued` 0, `pull` 2–90 (aggregate byte progress via [`PullProgress::Pct`]),
-/// `verify` 91, `tag` 94, `done` 100. Returns the canonical local reference.
+/// `verify` 91, `done` 100. Returns the pulled reference.
 ///
-/// Order matters: **verify before tag**. The pulled image must carry `rmng.image=1` — else it
-/// isn't an RMNG template and retagging it into `rmng/template:` would poison the image picker
-/// / clone path. A non-standard `StopSignal` only WARNs (clones off it hang 20 s on stop, but
-/// that's no reason to refuse the pull). The remote tag is intentionally KEPT after
-/// retagging: deleting the local `rmng/template:<name>` tag later only *untags* — the image
-/// row re-lists under the remote ref, and a second delete frees the layers (documented in the
-/// docs task).
+/// The pulled image must carry `rmng.image=1` — else it isn't an RMNG template and would just
+/// sit around unused (it never enters the picker, which filters on that label). A non-standard
+/// `StopSignal` only WARNs (clones off it hang 20 s on stop, but that's no reason to refuse the
+/// pull). Re-pulling the same `repo:tag` naturally moves the local tag onto the fresh image
+/// (standard `docker pull`) — that IS the refresh, so there's nothing to guard.
 pub async fn pull_template(
     app: &App,
     remote_ref: &str,
-    name: &str,
     mut on_progress: impl FnMut(PullProgress),
 ) -> Result<String> {
-    if !is_dns_label(name) {
-        bail!("image name must be a DNS label (lowercase letters, digits, hyphens)");
-    }
     let remote = remote_ref.trim();
     if remote.is_empty() {
         bail!("a template reference is required");
@@ -509,17 +528,11 @@ pub async fn pull_template(
     }
 
     let docker = &app.docker;
-    let reference = format!("{}:{}", crate::docker::IMAGE_REPO, name);
 
     on_progress(PullProgress::Step {
         step: "queued".into(),
-        msg: format!("queued template pull {remote} → {reference}"),
+        msg: format!("queued template pull {remote}"),
     });
-
-    // Reject a taken local tag up front — retagging would move the tag off an existing image.
-    if docker.image_exists(&reference).await? {
-        bail!("an image named '{reference}' already exists; pick another name or delete it first");
-    }
 
     // Pull (2–90%): map the aggregate byte fraction onto `2 + frac·88`. `Status` lines (already
     // deduped per-(layer, status) transition by `pull_image`) land in the op LOG + message, as
@@ -547,7 +560,8 @@ pub async fn pull_template(
             .await?;
     }
 
-    // Verify (91%) BEFORE tag: the pulled image must be an RMNG template (`rmng.image=1`).
+    // Verify (91%): the pulled image must be an RMNG template (`rmng.image=1`) — else it isn't
+    // a clone source and would just sit around unlisted (the picker filters on this label).
     on_progress(PullProgress::Step {
         step: "verify".into(),
         msg: format!("verifying {remote} is an RMNG template"),
@@ -571,13 +585,8 @@ pub async fn pull_template(
         ),
     }
 
-    // Tag (94%): retag the pulled image into the canonical rmng/template namespace (the
-    // remote tag is kept — see the fn doc).
-    on_progress(PullProgress::Step { step: "tag".into(), msg: format!("tagging {remote} as {reference}") });
-    docker.tag_image(remote, crate::docker::IMAGE_REPO, name).await?;
-
-    on_progress(PullProgress::Step { step: "done".into(), msg: format!("template {reference} ready") });
-    Ok(reference)
+    on_progress(PullProgress::Step { step: "done".into(), msg: format!("template {remote} ready") });
+    Ok(remote.to_string())
 }
 
 // --- commit clone image ---------------------------------------------------------------
@@ -593,7 +602,7 @@ fn commit_pct(step: &str) -> Option<f64> {
     })
 }
 
-/// Commit a RUNNING clone to a new clone-source image `rmng/template:<name>`. Steps (→ pct):
+/// Commit a RUNNING clone to a new clone-source image `<name>:latest`. Steps (→ pct):
 /// `queued` 0, `prepare` 15, `commit` 40, `done` 100. Returns the committed reference.
 ///
 /// `prepare` runs `sync; truncate -s0 /etc/machine-id` inside the clone so the image doesn't
@@ -614,7 +623,9 @@ pub async fn commit_clone_image(
         bail!("image name must be a DNS label (lowercase letters, digits, hyphens)");
     }
     let docker = &app.docker;
-    let reference = format!("{}:{}", crate::docker::IMAGE_REPO, name);
+    // The name is the full image repository (no `rmng/template` namespace); Docker's default
+    // `latest` tag makes the reference `<name>:latest`.
+    let reference = format!("{name}:latest");
 
     on_progress("queued", &format!("queued commit → {reference}"));
     if docker.image_exists(&reference).await? {
@@ -1026,7 +1037,6 @@ mod tests {
         assert_eq!(step_pct(Pull, "queued"), Some(0.0));
         assert_eq!(step_pct(Pull, "pull"), Some(2.0));
         assert_eq!(step_pct(Pull, "verify"), Some(91.0));
-        assert_eq!(step_pct(Pull, "tag"), Some(94.0));
         assert_eq!(step_pct(Pull, "done"), Some(100.0));
 
         assert_eq!(step_pct(Commit, "prepare"), Some(15.0));

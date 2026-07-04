@@ -170,10 +170,11 @@ pub struct DockerConfig {
     /// Memory limit per clone in MiB (+8 GiB swap), matching LXC parity.
     #[serde(default = "default_clone_memory_mb")]
     pub clone_memory_mb: u32,
-    /// Registry reference the setup wizard pulls the clone template from, then retags
-    /// locally to `rmng/template:<name>`. Short form (`repo:tag`) so it matches what the
-    /// pulled image's RepoTags will contain. Immediate-apply (read fresh per pull); no
-    /// secret (public image over the local daemon), so it passes through the redacted view.
+    /// Registry reference the setup wizard pulls the clone template from. The pulled image
+    /// keeps this `repo:tag` as its clone-source reference (no local retag), so it's also
+    /// exactly what the image picker lists and what clones are created FROM. Immediate-apply
+    /// (read fresh per pull); no secret (public image over the local daemon), so it passes
+    /// through the redacted view.
     #[serde(default = "default_template_reference")]
     pub template_reference: String,
     /// Registry reference the in-product self-update pulls the control-server image from
@@ -491,7 +492,7 @@ pub struct SetupEnv {
 pub struct ImageInfo {
     /// Full image id (`sha256:…`).
     pub id: String,
-    /// Repo tag reference, e.g. `rmng/template:my-base`.
+    /// Repo tag reference, e.g. `pegasis0/rmng-template:latest`.
     pub reference: String,
     pub size_bytes: i64,
     /// ISO timestamp the image was created.

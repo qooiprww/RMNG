@@ -61,7 +61,7 @@ clone → `"unknown clone"`; an unreachable daemon → `"clone-daemon MCP unreac
 |---|---|---|
 | `list_hosts` | — | JSON of `hosts[]` + state |
 | `select` | `clone` | set the viewer's selected host |
-| `clone` | `image`, `hostname` | clone from a source image (`rmng/template:<name>`) → `"clone started: op …"` |
+| `clone` | `image`, `hostname` | clone from a source image (e.g. `pegasis0/rmng-template:latest`) → `"clone started: op …"` |
 | `delete` | `clone` | delete a host → `"delete started: op …"` |
 | `claude_recommended` | — | `{email}` recommended account |
 | `claude_swap` | `clone`, `account?` (email/`auto`) | hot-swap the clone's Claude account |

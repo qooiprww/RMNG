@@ -296,7 +296,7 @@ async fn forwards_put(
 ///   `{ image, plain: { title, message } }`            — no ticket (preset required if any exist)
 /// plus optional `preset` (name; absent/"auto" = label auto-select in ticket mode) /
 /// `claudeAccount` / `agentInstructions` / `claudeInstructions`. `image` is a clone-source
-/// image reference (`rmng/template:<name>`) from `GET /api/images`.
+/// image reference (e.g. `pegasis0/rmng-template:latest`) from `GET /api/images`.
 async fn clone(
     State(app): State<App>,
     Json(body): Json<serde_json::Value>,
@@ -512,18 +512,17 @@ fn fill_in_use_by(images: &mut [wire::ImageInfo], containers: &[crate::docker::M
 
 #[derive(Deserialize)]
 struct PullReq {
-    /// DNS-label image name → local `rmng/template:<name>`.
-    name: String,
     /// Registry reference to pull the template from. Absent/blank ⇒
-    /// `config.docker.templateReference` (the wizard's default).
+    /// `config.docker.templateReference` (the wizard's default). The pulled image keeps this
+    /// `repo:tag` as its clone-source reference — no local retag.
     #[serde(default)]
     reference: Option<String>,
 }
 
 /// `POST /api/images/pull` — pull the clone template from a registry (`reference`, default
-/// `config.docker.templateReference`) and retag it locally as `rmng/template:<name>`.
-/// Returns the driving Operation (kind `pull`, which the wizard watches for). Replaces the
-/// retired in-product `/api/images/bootstrap` build.
+/// `config.docker.templateReference`). The pulled image keeps its own `repo:tag` as the
+/// clone-source reference (no retag). Returns the driving Operation (kind `pull`, which the
+/// wizard watches for). Replaces the retired in-product `/api/images/bootstrap` build.
 async fn images_pull(
     State(app): State<App>,
     Json(req): Json<PullReq>,
@@ -533,7 +532,7 @@ async fn images_pull(
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| app.config().docker.template_reference);
-    jobs::start_pull(&app, &req.name, &reference)
+    jobs::start_pull(&app, &reference)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
 }
@@ -542,12 +541,12 @@ async fn images_pull(
 struct CommitReq {
     /// Host id of the managed clone to commit.
     host: String,
-    /// DNS-label image name → `rmng/template:<name>`.
+    /// DNS-label image name — becomes the full repo of the committed image (`<name>:latest`).
     name: String,
 }
 
 /// `POST /api/images/commit` — commit a running clone to a new clone-source image
-/// `rmng/template:<name>`. Returns the driving Operation (kind `commit`).
+/// `<name>:latest` (the name is the full repo). Returns the driving Operation (kind `commit`).
 async fn images_commit(
     State(app): State<App>,
     Json(req): Json<CommitReq>,
@@ -1245,33 +1244,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn images_pull_rejects_bad_name() {
-        let app = test_app();
-        let err = images_pull(
-            State(app.clone()),
-            Json(PullReq { name: "Bad Name".into(), reference: None }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.contains("DNS label"), "msg: {}", err.1);
-        // A rejected request registers no op.
-        assert!(app.store.get().operations.is_empty());
-    }
-
-    #[tokio::test]
     async fn images_pull_registers_pull_op_and_defaults_reference() {
         let app = test_app();
-        // `reference: None` → defaults to config.docker.template_reference (no panic; op made).
-        let op = images_pull(
-            State(app.clone()),
-            Json(PullReq { name: "my-base".into(), reference: None }),
-        )
-        .await
-        .unwrap()
-        .0;
+        // `reference: None` → defaults to config.docker.template_reference; the op targets that
+        // reference (no local name/retag).
+        let op = images_pull(State(app.clone()), Json(PullReq { reference: None }))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(op.kind, wire::OperationKind::Pull);
-        assert_eq!(op.target, "my-base");
+        assert_eq!(op.target, app.config().docker.template_reference);
         assert_eq!(op.status, wire::OperationStatus::Running);
         // The op is registered in state (the wizard watches it over /events).
         assert!(app.store.get().operations.iter().any(|o| o.id == op.id));
@@ -1280,17 +1262,16 @@ mod tests {
     #[tokio::test]
     async fn images_pull_rejects_duplicate_in_flight() {
         let app = test_app();
-        // A blank reference also defaults; the first pull registers a Running op.
-        let _first = images_pull(
-            State(app.clone()),
-            Json(PullReq { name: "dup".into(), reference: Some("   ".into()) }),
-        )
-        .await
-        .unwrap();
-        // A second pull for the same target is rejected while the first is in flight.
+        // A blank reference defaults to config.docker.template_reference; the first pull
+        // registers a Running op targeting that reference.
+        let _first =
+            images_pull(State(app.clone()), Json(PullReq { reference: Some("   ".into()) }))
+                .await
+                .unwrap();
+        // A second pull for the same reference is rejected while the first is in flight.
         let err = images_pull(
             State(app.clone()),
-            Json(PullReq { name: "dup".into(), reference: Some("pegasis0/rmng-template:latest".into()) }),
+            Json(PullReq { reference: Some("pegasis0/rmng-template:latest".into()) }),
         )
         .await
         .unwrap_err();

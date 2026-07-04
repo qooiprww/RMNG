@@ -89,11 +89,12 @@ at clone time by usage+load score; **hot-swap** from the UI/`/api/claude/swap`/f
 `provision` stitches them into clone-create, template-pull, commit-from-clone, and delete
 flows, streaming progress through a `FnMut(&str, &str)` callback (the old `P step msg` /
 `RESULT` bash protocol is gone); `jobs` wraps each in an `Operation` streamed over `/events`.
-Clone sources are **images** (`rmng.image=1`, `rmng/template:<name>`) — no golden-CT / CoW
-model: the template is built + published ahead of time (`template/Dockerfile`, not by this
-crate — see [DEPLOY.md#publishing-the-template](../../docs/DEPLOY.md#publishing-the-template)),
-`pull_template` pulls + retags it locally, clones are `docker run` off an image, and any clone
-commits to a new image. In-container guest scripts (`apply-monitors.sh`, `claude-import.sh`)
+Clone sources are **images** (`rmng.image=1`, identified by their own `repo:tag` such as
+`pegasis0/rmng-template:latest`) — no golden-CT / CoW model: the template is built + published
+ahead of time (`template/Dockerfile`, not by this crate — see
+[DEPLOY.md#publishing-the-template](../../docs/DEPLOY.md#publishing-the-template)),
+`pull_template` pulls it (no local retag — it keeps its own `repo:tag`), clones are `docker run`
+off an image, and any clone commits to a new image. In-container guest scripts (`apply-monitors.sh`, `claude-import.sh`)
 run over `docker exec bash -s`. See [DEPLOY.md](../../docs/DEPLOY.md) and
 [SCRIPTS.md](../../docs/SCRIPTS.md).
 

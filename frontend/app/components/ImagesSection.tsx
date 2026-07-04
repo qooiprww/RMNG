@@ -2,17 +2,14 @@
 // the reference, a "base" badge for the wizard-pulled template, size, age and the count
 // of live clones running on it. Delete is confirm-gated and disabled while the
 // image is in use (a live clone's `source` points at it). A "+ Pull template" action
-// pulls the configured (or overridden) registry reference and tags it locally
-// (prompts for the reference, then a DNS-label local name).
-import { X } from "lucide-react";
+// pulls a registry reference you enter (prefilled with the configured template) — the
+// pulled image keeps its own `repo:tag` (no local retag). A "Pull latest" action re-pulls
+// the configured reference in one click (confirm-gated); re-pulling the same `repo:tag`
+// naturally moves the tag onto the fresh image, which is the refresh.
+import { RefreshCw, X } from "lucide-react";
 
 import { formatBytes, relativeAge } from "~/lib/format";
 import type { ImageInfo } from "~/lib/wire/ImageInfo";
-
-/** Mirror of the server's `is_dns_label` (local image name → `rmng/template:<name>`). */
-function isDnsLabel(s: string): boolean {
-  return s.length <= 63 && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(s);
-}
 
 export function ImagesSection({
   images,
@@ -28,7 +25,7 @@ export function ImagesSection({
   pullBusy: boolean;
   /** Configured `docker.templateReference`, prefilled into the reference prompt. */
   templateRef: string;
-  onPull: (name: string, reference: string) => void;
+  onPull: (reference: string) => void;
   onDelete: (reference: string) => void;
 }) {
   function pull() {
@@ -40,14 +37,15 @@ export function ImagesSection({
       alert("Enter a template reference.");
       return;
     }
-    const rawName = window.prompt("Name for the local image (→ rmng/template:<name>)", "base");
-    if (rawName == null) return;
-    const name = rawName.trim();
-    if (!isDnsLabel(name)) {
-      alert("Invalid name: lowercase letters, digits and hyphens only (no leading/trailing hyphen, ≤63 chars).");
-      return;
-    }
-    onPull(name, reference);
+    onPull(reference);
+  }
+
+  // One-click refresh: re-pull the configured template reference (no prompts). Re-pulling the
+  // same `repo:tag` moves the local tag onto the freshly pulled image — that IS the refresh.
+  function pullLatest() {
+    if (pullBusy) return;
+    if (!confirm(`Pull the latest template (${templateRef || "configured reference"})?`)) return;
+    onPull(templateRef);
   }
 
   return (
@@ -56,15 +54,27 @@ export function ImagesSection({
         <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
           Images ({images.length})
         </h2>
-        <button
-          type="button"
-          onClick={pull}
-          disabled={pullBusy}
-          title="Pull the clone template (Ubuntu 26.04) from Docker Hub"
-          className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300"
-        >
-          + Pull template
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={pullLatest}
+            disabled={pullBusy}
+            title={`Pull the latest template (${templateRef || "configured reference"})`}
+            className="flex items-center gap-1 rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300"
+          >
+            <RefreshCw className="size-3" />
+            Pull latest
+          </button>
+          <button
+            type="button"
+            onClick={pull}
+            disabled={pullBusy}
+            title="Pull the clone template (Ubuntu 26.04) from Docker Hub"
+            className="rounded px-1 text-[11px] font-medium text-slate-400 hover:bg-slate-200 hover:text-slate-600 disabled:opacity-40 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300"
+          >
+            + Pull template
+          </button>
+        </div>
       </div>
 
       {loading && images.length === 0 ? (

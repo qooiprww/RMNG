@@ -123,7 +123,7 @@ export interface SettingsPanelProps {
   imagesLoading: boolean;
   /** True while a template-pull op is running (disables the pull action). */
   pullBusy: boolean;
-  onPullTemplate: (name: string, reference: string) => void;
+  onPullTemplate: (reference: string) => void;
   onDeleteImage: (reference: string) => void;
 }
 
@@ -725,8 +725,8 @@ export function SettingsPanel({
                   />
                   <p className="mt-0.5 text-xs text-slate-400 dark:text-slate-500">
                     Registry <code>repo:tag</code> the wizard/Images panel pulls the clone template
-                    from, then retags locally to <code>rmng/template:&lt;name&gt;</code>. Read fresh on
-                    each pull.
+                    from. The pulled image keeps this reference and clones are created from it.
+                    Read fresh on each pull.
                   </p>
                 </div>
                 {/* Subnet is baked into the rmng bridge + every clone's static IP at first-run
@@ -791,7 +791,7 @@ export function SettingsPanel({
             <Section
               title="Images"
               effect="immediate"
-              hint="Clone-source images (rmng.image=1). Pull the template from a registry (retagged locally as rmng/template:<name>) or delete an unused one; a live clone running on an image blocks its delete."
+              hint="Clone-source images (rmng.image=1). Pull the template from a registry (it keeps its own repo:tag) or delete an unused one; a live clone running on an image blocks its delete."
             >
               <ImagesSection
                 images={images}

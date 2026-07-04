@@ -35,7 +35,7 @@ export interface Host {
    * retired `ctid`/`container` keys load unmanaged — serde drops the stale keys.
    */
   managed?: boolean;
-  /** The clone-source image reference this host was cloned from (`rmng/template:<name>`). */
+  /** The clone-source image reference this host was cloned from (`pegasis0/rmng-template:latest`). */
   source?: string;
   /**
    * Email of the Claude account assigned to this host at clone time (its

@@ -11,7 +11,7 @@ export type ImageInfo = {
  */
 id: string, 
 /**
- * Repo tag reference, e.g. `rmng/template:my-base`.
+ * Repo tag reference, e.g. `pegasis0/rmng-template:latest`.
  */
 reference: string, sizeBytes: bigint, 
 /**

@@ -42,7 +42,6 @@ use bollard::query_parameters::{
     CommitContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
     ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder,
     RemoveVolumeOptionsBuilder, StatsOptionsBuilder, StopContainerOptionsBuilder,
-    TagImageOptionsBuilder,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -59,8 +58,6 @@ pub const NETWORK: &str = "rmng";
 /// `RMNG_CONTROL_URL`/`AGENT_CONTROL_MCP_URL` through this name, so the operator's
 /// container name doesn't matter and recreating the container never strands the URLs.
 pub const CONTROL_ALIAS: &str = "rmng-control";
-/// Repository namespace for clone-source images (`rmng/template:<name>`).
-pub const IMAGE_REPO: &str = "rmng/template";
 /// The in-clone Linux user the agent + desktop run as (uid 1000).
 pub const CLONE_USER: &str = "rmng";
 /// Stop timeout for systemd-PID-1 clones (with `StopSignal=SIGRTMIN+3` baked in).
@@ -858,20 +855,8 @@ impl DockerCtl {
         }
     }
 
-    /// Tag an existing image (`source`, a reference or id) as `repo:tag` — e.g. tagging a
-    /// freshly pulled upstream template into RMNG's own [`IMAGE_REPO`] namespace
-    /// ([`crate::provision::pull_template`]).
-    pub async fn tag_image(&self, source: &str, repo: &str, tag: &str) -> Result<()> {
-        let opts = TagImageOptionsBuilder::new().repo(repo).tag(tag).build();
-        self.daemon()?
-            .tag_image(source, Some(opts))
-            .await
-            .with_context(|| format!("tagging {source} as {repo}:{tag}"))?;
-        Ok(())
-    }
-
     /// An image's labels (`ImageInspect.Config.Labels`), or an empty map if it has none.
-    /// The template-pull verify reads this to require `rmng.image=1` before retagging.
+    /// The template-pull verify reads this to require `rmng.image=1` on the pulled image.
     pub async fn image_labels(&self, reference: &str) -> Result<HashMap<String, String>> {
         let info = self
             .daemon()?
@@ -1009,13 +994,8 @@ impl DockerCtl {
         let mut out: Vec<ImageInfo> = summaries
             .into_iter()
             .map(|s| {
-                let reference = s
-                    .repo_tags
-                    .iter()
-                    .find(|t| t.starts_with(&format!("{IMAGE_REPO}:")))
-                    .or_else(|| s.repo_tags.first())
-                    .cloned()
-                    .unwrap_or_else(|| s.id.clone());
+                let reference =
+                    s.repo_tags.first().cloned().unwrap_or_else(|| s.id.clone());
                 ImageInfo {
                     id: s.id,
                     reference,
@@ -1032,7 +1012,9 @@ impl DockerCtl {
         Ok(out)
     }
 
-    /// Commit a container to an image at `rmng/template:<name>`. With `set_boot_config`,
+    /// Commit a container to an image at `<name>:latest` — the user-supplied name is the
+    /// full repository (no `rmng/template` namespace); Docker defaults the tag to `latest`.
+    /// With `set_boot_config`,
     /// bakes the systemd-PID-1 boot overrides so clones off this image stop cleanly
     /// (gotcha #5): Entrypoint `/sbin/init`, Cmd cleared, `StopSignal=SIGRTMIN+3`, and
     /// `container=docker` in Env. `labels` are always applied (merged over the boot
@@ -1049,8 +1031,10 @@ impl DockerCtl {
     ) -> Result<String> {
         let opts = CommitContainerOptionsBuilder::new()
             .container(container)
-            .repo(IMAGE_REPO)
-            .tag(name)
+            // The user's name IS the repository — no `rmng/template` prefix. Docker requires
+            // a tag, so we default it to `latest` (image lists show `<name>:latest`).
+            .repo(name)
+            .tag("latest")
             .pause(pause)
             .build();
 
@@ -1070,8 +1054,8 @@ impl DockerCtl {
             .daemon()?
             .commit_container(opts, config)
             .await
-            .with_context(|| format!("committing {container} to {IMAGE_REPO}:{name}"))?;
-        tracing::info!(target: "docker", "committed {container} -> {IMAGE_REPO}:{name} ({})", short_id(&res.id));
+            .with_context(|| format!("committing {container} to {name}:latest"))?;
+        tracing::info!(target: "docker", "committed {container} -> {name}:latest ({})", short_id(&res.id));
         Ok(res.id)
     }
 

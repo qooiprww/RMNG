@@ -27,7 +27,7 @@ disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}
 | POST | `/api/delete` | Destroy a clone / unregister a plain host | 200 `Operation` |
 | GET | `/api/setup/env` | Setup wizard environment preflight rows | 200 `SetupEnv` |
 | GET | `/api/images` | List clone-source images (`rmng.image=1`) | 200 `ImageInfo[]` |
-| POST | `/api/images/pull` | Pull the clone template from a registry and tag it `rmng/template:<name>` | 200 `Operation` |
+| POST | `/api/images/pull` | Pull the clone template from a registry (keeps its own `repo:tag`) | 200 `Operation` |
 | POST | `/api/images/commit` | Commit a running clone to a new image | 200 `Operation` |
 | POST | `/api/images/delete` | Remove a clone-source image | 200 `{ok}` |
 | GET | `/api/notes/:id` | Fetch a host's rich-text notes | 200 `[block]` |
@@ -134,7 +134,7 @@ agent's first message ([chat::kickoff_agent](../crates/control-server/src/chat.r
 Body (one of three task modes + optional account/instructions):
 ```jsonc
 {
-  "image": "rmng/template:base",      // required: clone-source image reference (from GET /api/images)
+  "image": "pegasis0/rmng-template:latest", // required: clone-source image reference (from GET /api/images)
   // -- pick ONE task mode --
   "ticket": "DEV-123",              // existing Linear ticket, OR
   "create": { "team": "dev", "title": "...", "description": "..." },      // new ticket, OR
@@ -151,7 +151,7 @@ Body (one of three task modes + optional account/instructions):
   "claudeInstructions": "..."       // extra instructions for Claude Code
 }
 ```
-`image` accepts a `rmng/template:<name>` reference, a full `sha256:…` id, or a bare 64-hex id;
+`image` accepts a `repo:tag` reference (e.g. `pegasis0/rmng-template:latest`), a full `sha256:…` id, or a bare 64-hex id;
 whatever form is passed is canonicalized to the reference and recorded on the host as
 `source`. The image must carry the `rmng.image=1` label (a raw non-image id is rejected). The
 selected preset's vars are written into the clone's session env, plus `LINEAR_API_KEY=<preset
@@ -178,45 +178,45 @@ progress over `/events`.
 
 ## Images (clone-source templates) & setup
 
-Clone sources are images labeled `rmng.image=1`, repo `rmng/template:<name>` — there is no
-golden-CT / CoW model. `POST` bodies (references contain `/` and `:`, so nothing uses path
-params).
+Clone sources are images labeled `rmng.image=1`, identified by their own `repo:tag` (e.g.
+`pegasis0/rmng-template:latest`) — there is no local retag and no golden-CT / CoW model. `POST`
+bodies (references contain `/` and `:`, so nothing uses path params).
 
 ### `GET /api/images` → `ImageInfo[]`
 List clone-source images, newest first. Each `ImageInfo` carries `id` (`sha256:…`),
-`reference` (`rmng/template:<name>`), `size_bytes`, `created_at`, `base` (true for the
-published clone template, `rmng.base=1`), `created_from` (lineage, `rmng.created-from`), and
-`in_use_by` (host ids of live clones whose `source` is this image). `502` if the daemon is
-unreachable.
+`reference` (the image's own `repo:tag`, e.g. `pegasis0/rmng-template:latest`), `size_bytes`,
+`created_at`, `base` (true for the published clone template, `rmng.base=1`), `created_from`
+(lineage, `rmng.created-from`), and `in_use_by` (host ids of live clones whose `source` is this
+image). `502` if the daemon is unreachable.
 
-### `POST /api/images/pull` — body `{ "name": string, "reference"?: string }`
-Pull the clone template from a registry and retag it locally as `rmng/template:<name>`. `name`
-is a bare DNS label; the server prepends the repo. `reference` is a registry `repo:tag` to pull
-from — absent/blank defaults to `config.docker.templateReference` (default
+### `POST /api/images/pull` — body `{ "reference"?: string }`
+Pull the clone template from a registry. The pulled image keeps its own `repo:tag` as the
+clone-source reference — no local retag. `reference` is a registry `repo:tag` to pull from —
+absent/blank defaults to `config.docker.templateReference` (default
 `pegasis0/rmng-template:latest`); see
 [DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template) for how that image is
-built and published. Rejects a name that already exists, a blank reference, and a
-`repo@sha256:…` digest reference (pull a `repo:tag` instead). Verifies the pulled image
-carries the `rmng.image=1` label **before** retagging (else it isn't an RMNG template) and
-warns — without refusing — if its `StopSignal` isn't `SIGRTMIN+3`. Returns the driving
-`Operation` (kind `pull`, which the setup wizard's "Download template" step watches for,
-showing aggregate byte progress). Replaces the retired in-product `/api/images/bootstrap`
-build — no base OS is built in-product any more, only pulled pre-built.
+built and published. Rejects a blank reference, a `repo@sha256:…` digest reference (pull a
+`repo:tag` instead), and a duplicate pull already in flight for the same reference. Verifies
+the pulled image carries the `rmng.image=1` label (else it isn't an RMNG template) and warns —
+without refusing — if its `StopSignal` isn't `SIGRTMIN+3`. Re-pulling the same `repo:tag`
+naturally moves the local tag onto the fresh image (standard `docker pull`) — that is the
+refresh. Returns the driving `Operation` (kind `pull`, which the setup wizard's "Download
+template" step watches for, showing aggregate byte progress). Replaces the retired in-product
+`/api/images/bootstrap` build — no base OS is built in-product any more, only pulled pre-built.
 
 ### `POST /api/images/commit` — body `{ "host": string, "name": string }`
-Commit a running managed clone (`host`) to a new clone-source image `rmng/template:<name>`
-(kind `commit`). `docker commit` **excludes volume mounts**, so the clone's inner-Docker state
-(`/var/lib/docker`) never enters the image — clones always start with an empty inner Docker.
-On-disk credentials in the clone's home **are** baked in (logged as a warning). Rejects a name
-that already exists.
+Commit a running managed clone (`host`) to a new clone-source image `<name>:latest` — the
+DNS-label `name` is the full repo (kind `commit`). `docker commit` **excludes volume mounts**,
+so the clone's inner-Docker state (`/var/lib/docker`) never enters the image — clones always
+start with an empty inner Docker. On-disk credentials in the clone's home **are** baked in
+(logged as a warning). Rejects a name that already exists.
 
 ### `POST /api/images/delete` — body `{ "reference": string }` → `{ok}`
 Remove a clone-source image. `409` if any host still runs on it (`in_use_by` non-empty) or a
 running operation (clone/commit/pull) references it as its source or target; the daemon's own
-"in use by a container" `409` is surfaced too. Deleting a pulled template's local
-`rmng/template:<name>` tag only untags it while the registry tag is still attached to the same
-layers — the image re-lists under that remaining reference; delete again to actually free them
-(see [DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template)).
+"in use by a container" `409` is surfaced too. If the same image carries more than one tag,
+deleting one `reference` only untags it while the others stay attached to the same layers — the
+image re-lists under a remaining reference; delete again to actually free them.
 
 ### `GET /api/setup/env` → `SetupEnv`
 The setup wizard's environment preflight: `{ rows: EnvCheckRow[] }`, each row `{ id, label,

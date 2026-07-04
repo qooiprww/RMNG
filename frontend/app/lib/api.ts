@@ -46,7 +46,7 @@ export const activate = (id: string | null) =>
   postJson("/api/activate", { id });
 export const reorder = (order: string[]) => postJson("/api/reorder", { order });
 /** Start a clone from a source image (`image` = a canonical reference from
- *  `listImages`, e.g. `rmng/template:my-base`). Progress streams over /events. */
+ *  `listImages`, e.g. `pegasis0/rmng-template:latest`). Progress streams over /events. */
 export const cloneHost = (image: string, payload: ClonePayload) =>
   postJson("/api/clone", { image, ...payload });
 export const deleteHost = (id: string) => postJson("/api/delete", { id });
@@ -64,14 +64,14 @@ export const putForwards = (
  *  clones running on it (`inUseBy`). Powers the sidebar Images section + the
  *  clone dialog's image picker. */
 export const listImages = () => getJson("/api/images") as Promise<ImageInfo[]>;
-/** Pull the clone template from a registry (`reference`, e.g. `pegasis0/rmng-template:latest`)
- *  and retag it locally as `rmng/template:<name>`. Omitted/blank `reference` falls back
- *  server-side to `docker.templateReference`. Returns the driving Operation (kind `pull`);
- *  progress streams over /events. */
-export const pullTemplate = (name: string, reference?: string) =>
-  postJson("/api/images/pull", { name, reference });
-/** Commit a running clone to a new clone-source image `rmng/template:<name>`.
- *  Returns the driving Operation (kind `commit`); progress streams over /events. */
+/** Pull the clone template from a registry (`reference`, e.g. `pegasis0/rmng-template:latest`).
+ *  The pulled image keeps its own `repo:tag` as the clone-source reference (no local retag).
+ *  Omitted/blank `reference` falls back server-side to `docker.templateReference`. Returns the
+ *  driving Operation (kind `pull`); progress streams over /events. */
+export const pullTemplate = (reference?: string) =>
+  postJson("/api/images/pull", { reference });
+/** Commit a running clone to a new clone-source image `<name>:latest` (the name you give it
+ *  is the full repo). Returns the driving Operation (kind `commit`); streams over /events. */
 export const commitImage = (host: string, name: string) =>
   postJson("/api/images/commit", { host, name });
 /** Remove a clone-source image by reference. 409 (with a "…in use by…" message)

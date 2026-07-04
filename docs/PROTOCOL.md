@@ -220,9 +220,10 @@ keys, → `linearKeySet: bool`); `PUT /api/config` returns
 
 Template params are mostly not config: the base OS is fixed in the template build
 (`ubuntu:26.04` in `template/Dockerfile` — the patched gnome-shell is compiled against 26.04's
-GNOME only) and isn't chosen at pull time. The wizard/API pull takes a local name plus an
-optional registry reference (`POST /api/images/pull {name, reference?}` → `rmng/template:<name>`;
-`reference` defaults to `docker.template_reference`). Per-clone CPU / memory limits come from
+GNOME only) and isn't chosen at pull time. The wizard/API pull takes an optional registry
+reference (`POST /api/images/pull {reference?}`; the pulled image keeps its own `repo:tag` as
+the clone-source reference, no retag; `reference` defaults to `docker.template_reference`).
+Per-clone CPU / memory limits come from
 `docker.clone_cpus` / `docker.clone_memory_mb`, applied at clone create — not per image.
 
 ---

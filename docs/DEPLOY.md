@@ -102,10 +102,10 @@ The wizard walks four things:
 2. **Server settings** — the one-time `docker.subnet` (IPv4 CIDR, validated `/16`–`/24`,
    default `10.99.0.0/24`), `docker.hostnamePrefix` (e.g. `pega-`), monitor layout, listen
    ports, and per-clone limits (`docker.cloneCpus`, `docker.cloneMemoryMb`).
-3. **Download template** (`POST /api/images/pull {name, reference?}`) — pulls the pre-built
+3. **Download template** (`POST /api/images/pull {reference?}`) — pulls the pre-built
    clone template (headless GNOME + clone-daemon + agent-wrapper + patched gnome-shell, built
-   on `ubuntu:26.04`) from a registry and tags it locally as `rmng/template:<name>`. `name` is
-   a bare DNS label (default `base`); `reference` defaults to the configured
+   on `ubuntu:26.04`) from a registry. The pulled image keeps its own `repo:tag` as the
+   clone-source reference (no local retag); `reference` defaults to the configured
    `docker.templateReference` (`pegasis0/rmng-template:latest`) and is editable in the wizard.
    Aggregate byte progress streams over the driving `Operation` (kind `pull`). This step is
    **skippable** ("Skip for now") — pull a template later from the Images panel. See
@@ -123,22 +123,25 @@ endpoint.
 ## Images & clones
 
 RMNG uses **image-only templates** — there is no golden-CT / CoW model. A clone-source image
-is any image labeled `rmng.image=1`, repo `rmng/template:<name>`:
+is any image labeled `rmng.image=1`, identified by its own `repo:tag` (e.g.
+`pegasis0/rmng-template:latest`):
 
-- **Pull a template**: `POST /api/images/pull {name, reference?}` (the wizard's step 3,
-  "Download template"; also the pull affordance in the Images panel later). `reference`
-  defaults to `config.docker.templateReference`. The stock published template already carries
-  `rmng.base=1` (baked in by `template/Dockerfile`). See
+- **Pull a template**: `POST /api/images/pull {reference?}` (the wizard's step 3,
+  "Download template"; also the pull affordance in the Images panel later). The pulled image
+  keeps its own `repo:tag` as the clone-source reference (no retag); `reference` defaults to
+  `config.docker.templateReference`. The stock published template already carries `rmng.base=1`
+  (baked in by `template/Dockerfile`). See
   [Publishing the template](#publishing-the-template) for how it's built.
 - **List images**: `GET /api/images` — each with the ids of live clones running on it.
-- **Clone from an image**: `POST /api/clone` takes `image` (a `rmng/template:<name>`
-  reference from the image list) plus a task mode (Linear ticket / new ticket / plain). The
-  clone joins the `rmng` bridge (addressed by container name — Docker DNS; its IP is plain
-  Docker IPAM) with fixed `rmng`/`rmng` credentials, its preset env, and a Claude account.
+- **Clone from an image**: `POST /api/clone` takes `image` (a `repo:tag` reference such as
+  `pegasis0/rmng-template:latest` from the image list) plus a task mode (Linear ticket / new
+  ticket / plain). The clone joins the `rmng` bridge (addressed by container name — Docker DNS;
+  its IP is plain Docker IPAM) with fixed `rmng`/`rmng` credentials, its preset env, and a
+  Claude account.
 - **Commit a clone to a new image**: `POST /api/images/commit {host, name}` — freezes the
-  running clone and commits it to `rmng/template:<name>` (`rmng.created-from` records
-  lineage). On-disk credentials in the clone's home are baked into the image (logged as a
-  warning).
+  running clone and commits it to `<name>:latest` (the name is the full repo; `rmng.created-from`
+  records lineage). On-disk credentials in the clone's home are baked into the image (logged as
+  a warning).
 - **Delete an image**: `POST /api/images/delete {reference}` — 409 if any clone still runs on
   it or a running pull/commit is in flight.
 
@@ -177,13 +180,13 @@ docker push pegasis0/rmng-template:latest
 `:latest`. Nothing is ever overwritten — a rollback is just pointing `docker.templateReference`
 (Settings, or the pull body's `reference`) at a prior dated tag and pulling again.
 
-**Deleting a re-tagged local image only untags it.** `pull_template` keeps the pulled image's
-*original* registry tag (e.g. `pegasis0/rmng-template:latest`) even after retagging it locally
-as `rmng/template:<name>` — both tags point at the same image layers. So `POST
-/api/images/delete {reference: "rmng/template:<name>"}` only removes that one tag; the
-underlying image isn't freed while the registry tag still references it, and `GET /api/images`
-re-lists the same row under whichever tag remains (`pegasis0/rmng-template:latest` or a dated
-tag). Delete it again — using the reference the row now shows — to actually free the layers.
+**A multi-tagged image only untags on the first delete.** `pull_template` does **not** retag —
+the pulled image keeps its own `repo:tag` (e.g. `pegasis0/rmng-template:latest`) as the
+clone-source reference. But if the same image carries more than one tag (say you pulled both
+`:latest` and a dated `:20260703`), `POST /api/images/delete {reference: "…:latest"}` only
+removes that one tag; the underlying layers aren't freed while another tag still references
+them, and `GET /api/images` re-lists the same row under whichever tag remains. Delete it again
+— using the reference the row now shows — to actually free the layers.
 
 **DinD × images are decoupled** (a semantic change from the old LVM-snapshot behavior):
 `docker commit` **excludes volume mounts**, and each clone's inner Docker (`/var/lib/docker`)
@@ -413,7 +416,7 @@ inherits it (there's no per-install control-server payload any more; see
   `config.monitors` is set, the new clone is brought to that layout automatically before the
   op completes (best-effort — see the op log on failure); the template's baked-in default
   layout only matters when no monitors are configured.
-- **Pull a template**: `POST /api/images/pull {name, reference?}` — from the Images panel, any
+- **Pull a template**: `POST /api/images/pull {reference?}` — from the Images panel, any
   time (not just first-run setup).
 - **Commit a clone → image**: `POST /api/images/commit {host, name}`.
 - **Apply a monitor layout** to already-running clones: `POST /api/monitors/apply` (rewrites

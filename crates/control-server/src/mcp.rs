@@ -132,7 +132,7 @@ fn tools_for(scope: Scope) -> Value {
         tools.push(tool("select", "Select the host shown in the viewer", clone_arg.clone(), json!(["clone"])));
         tools.push(tool(
             "clone",
-            "Create a clone from a source image (rmng/template:<name>)",
+            "Create a clone from a source image (e.g. pegasis0/rmng-template:latest)",
             json!({ "image": { "type": "string", "description": "clone-source image reference" }, "hostname": { "type": "string" } }),
             json!(["image", "hostname"]),
         ));

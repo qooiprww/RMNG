@@ -421,7 +421,7 @@ function Dashboard({
           pullBusy={state.operations.some(
             (o) => o.kind === "pull" && o.status === "running",
           )}
-          onPullTemplate={(name, reference) => run(pullTemplate(name, reference))}
+          onPullTemplate={(reference) => run(pullTemplate(reference))}
           onDeleteImage={(reference) => run(deleteImage(reference))}
         />
       ) : null}

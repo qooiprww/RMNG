@@ -33,10 +33,11 @@ cloneCpus: number,
  */
 cloneMemoryMb: number, 
 /**
- * Registry reference the setup wizard pulls the clone template from, then retags
- * locally to `rmng/template:<name>`. Short form (`repo:tag`) so it matches what the
- * pulled image's RepoTags will contain. Immediate-apply (read fresh per pull); no
- * secret (public image over the local daemon), so it passes through the redacted view.
+ * Registry reference the setup wizard pulls the clone template from. The pulled image
+ * keeps this `repo:tag` as its clone-source reference (no local retag), so it's also
+ * exactly what the image picker lists and what clones are created FROM. Immediate-apply
+ * (read fresh per pull); no secret (public image over the local daemon), so it passes
+ * through the redacted view.
  */
 templateReference: string, 
 /**

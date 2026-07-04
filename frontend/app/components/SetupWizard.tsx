@@ -19,15 +19,6 @@ import type { ControlState } from "~/lib/types";
 const input =
   "w-full rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-sm focus:border-slate-400 dark:focus:border-slate-500 focus:outline-none dark:bg-slate-800 dark:text-slate-100";
 
-/** Default local name for the pulled template image. Names are bare DNS labels — the
- *  server itself prepends the repo (`base` → `rmng/template:base`). */
-const DEFAULT_IMAGE_NAME = "base";
-
-/** Mirror of the server's `is_dns_label` (base-image name → `rmng/template:<name>`). */
-function isDnsLabel(s: string): boolean {
-  return s.length <= 63 && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(s);
-}
-
 /** Mirror of the server's `validate_docker_subnet`: an IPv4 CIDR with a /16–/24 prefix. */
 function isValidSubnet(s: string): boolean {
   const [ip, prefix, ...rest] = s.split("/");
@@ -100,7 +91,6 @@ export function SetupWizard({
   const [templateReference, setTemplateReference] = useState(
     initialConfig.docker.templateReference,
   );
-  const [imageName, setImageName] = useState(DEFAULT_IMAGE_NAME);
   const [pulling, setPulling] = useState(false);
   const [pullTarget, setPullTarget] = useState<string | null>(null);
 
@@ -113,8 +103,8 @@ export function SetupWizard({
       primary: m.primary,
     }));
 
-  // The pull op is kind "pull" with target === image name (jobs.rs start_pull →
-  // make_op(Pull, name, None)).
+  // The pull op is kind "pull" with target === the pulled reference (jobs.rs start_pull →
+  // make_op(Pull, reference, None)).
   const imgOp = pullTarget
     ? state.operations.find((o) => o.kind === "pull" && o.target === pullTarget)
     : undefined;
@@ -171,13 +161,15 @@ export function SetupWizard({
   }
 
   async function pull() {
-    const name = imageName.trim();
-    if (!isDnsLabel(name) || pulling || imgRunning) return;
+    // Resolve to the exact reference the server will pull (blank ⇒ configured default), so
+    // `pullTarget` matches the op's target and we can track it over /events.
+    const reference = templateReference.trim() || initialConfig.docker.templateReference;
+    if (!reference || pulling || imgRunning) return;
     setPulling(true);
     setError(null);
     try {
-      await pullTemplate(name, templateReference.trim() || undefined);
-      setPullTarget(name);
+      await pullTemplate(reference);
+      setPullTarget(reference);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -210,9 +202,8 @@ export function SetupWizard({
     }
   }
 
-  const imageNameTrim = imageName.trim();
-  const imageLabelOk = imageNameTrim.length === 0 || isDnsLabel(imageNameTrim);
-  const canPull = isDnsLabel(imageNameTrim) && !pulling && !imgRunning && !imgDone;
+  const canPull =
+    templateReference.trim().length > 0 && !pulling && !imgRunning && !imgDone;
   // Env step blocks Next until required checks pass + a valid subnet; download-template
   // step blocks Next while a pull is running.
   const nextDisabled =
@@ -415,8 +406,9 @@ export function SetupWizard({
             <div className="space-y-4">
               <p className="text-sm text-slate-600 dark:text-slate-300">
                 Pull the pre-built clone template (Ubuntu 26.04, the base our patched GNOME is
-                built for) from Docker Hub and tag it locally under <code>rmng/template</code>.
-                You can skip this and pull it later from the Images panel.
+                built for) from Docker Hub. The pulled image keeps its own{" "}
+                <code>repo:tag</code> as the clone source. You can skip this and pull it later
+                from the Images panel.
               </p>
               <Field label="Template reference">
                 <input
@@ -428,28 +420,9 @@ export function SetupWizard({
                   className={`${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
                 />
                 <span className="mt-0.5 block text-xs text-slate-400 dark:text-slate-500">
-                  Docker Hub <code>repo:tag</code> the template is pulled from.
+                  Docker Hub <code>repo:tag</code> the template is pulled from — clones are
+                  created from this exact reference.
                 </span>
-              </Field>
-              <Field label="Local image name">
-                <input
-                  value={imageName}
-                  onChange={(e) => setImageName(e.target.value)}
-                  placeholder={DEFAULT_IMAGE_NAME}
-                  spellCheck={false}
-                  disabled={imgRunning || imgDone}
-                  className={`${input} disabled:bg-slate-50 dark:disabled:bg-slate-900 disabled:text-slate-400 dark:disabled:text-slate-500`}
-                />
-                {!imageLabelOk ? (
-                  <span className="mt-1 block text-[11px] text-red-600 dark:text-red-400">
-                    lowercase letters, digits and hyphens only (no leading/trailing hyphen, ≤63
-                    chars)
-                  </span>
-                ) : (
-                  <span className="mt-0.5 block text-xs text-slate-400 dark:text-slate-500">
-                    → <code>rmng/template:{imageNameTrim || DEFAULT_IMAGE_NAME}</code>
-                  </span>
-                )}
               </Field>
 
               {imgOp ? <OperationProgress op={imgOp} /> : null}

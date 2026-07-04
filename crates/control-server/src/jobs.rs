@@ -47,7 +47,7 @@ pub struct LinearMeta {
 /// Everything the API hands to `start_clone`.
 #[derive(Debug, Clone, Default)]
 pub struct CloneSpec {
-    /// The clone-source image reference (`rmng/template:<name>`) or id to clone from.
+    /// The clone-source image reference (e.g. `pegasis0/rmng-template:latest`) or id to clone from.
     pub source_image: String,
     pub new_hostname: String,
     pub linear: Option<LinearMeta>,
@@ -483,31 +483,26 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     }
 }
 
-/// Pull the clone template from `reference` (a registry `repo:tag`) and retag it locally as
-/// `rmng/template:<name>`. Drives a `Pull`-kind Operation with the image name as its target;
-/// no Host is registered (a template is not a host). Guards (same shape the retired bootstrap
-/// had): `name` is a DNS label + no op is already in flight for the same target.
-pub fn start_pull(app: &App, name: &str, reference: &str) -> Result<Operation, JobError> {
-    if !is_dns_label(name) {
-        return Err(JobError(
-            "image name must be a DNS label (lowercase letters, digits, hyphens)".into(),
-        ));
-    }
+/// Pull the clone template from `reference` (a registry `repo:tag`) — no local retag; the
+/// pulled image keeps its own `repo:tag`, which becomes the clone-source reference. Drives a
+/// `Pull`-kind Operation with the reference as its target; no Host is registered (a template
+/// is not a host). Guard: no op is already in flight for the same reference.
+pub fn start_pull(app: &App, reference: &str) -> Result<Operation, JobError> {
     let st = app.store.get();
-    if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == name) {
-        return Err(JobError(format!("'{name}' is already being pulled")));
+    if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == reference) {
+        return Err(JobError(format!("'{reference}' is already being pulled")));
     }
-    let op = make_op(OperationKind::Pull, name, None);
+    let op = make_op(OperationKind::Pull, reference, None);
     let (ret, op_id) = (op.clone(), op.id.clone());
     app.store.mutate(|s| s.operations.push(op));
-    let (app2, name, reference) = (app.clone(), name.to_string(), reference.to_string());
-    tokio::spawn(async move { run_pull(app2, op_id, name, reference).await });
+    let (app2, reference) = (app.clone(), reference.to_string());
+    tokio::spawn(async move { run_pull(app2, op_id, reference).await });
     Ok(ret)
 }
 
-async fn run_pull(app: App, op_id: String, name: String, reference: String) {
+async fn run_pull(app: App, op_id: String, reference: String) {
     let progress = pull_op_progress(&app, &op_id);
-    let local_ref = match pull_template(&app, &reference, &name, progress).await {
+    let pulled_ref = match pull_template(&app, &reference, progress).await {
         Ok(r) => r,
         // `{e:#}` (not `e.to_string()`, which prints only the outermost context) — a pull
         // failure's useful part is usually the daemon's verbatim message (e.g. "pull access
@@ -518,7 +513,7 @@ async fn run_pull(app: App, op_id: String, name: String, reference: String) {
         op.status = OperationStatus::Done;
         op.step = "done".into();
         op.pct = 100.0;
-        op.message = format!("template {local_ref} ready");
+        op.message = format!("template {pulled_ref} ready");
         op.finished_at = Some(now_ms());
     });
     schedule_prune(app.clone(), op_id, PRUNE_DONE_MS);
@@ -648,7 +643,7 @@ pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, J
     if !host.managed {
         return Err(JobError(format!("'{host_id}' is not a managed clone — only clones can be committed")));
     }
-    let reference = format!("{}:{}", crate::docker::IMAGE_REPO, name);
+    let reference = format!("{name}:latest");
     // Reject a tag already targeted by another running commit/pull (a race the pure
     // `image_exists` check in provision can't see yet). The existing-image check happens in
     // provision (needs the daemon); here we only guard the in-flight duplicate.
