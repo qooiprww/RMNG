@@ -419,9 +419,10 @@ inherits it (there's no per-install control-server payload any more; see
 - **Pull a template**: `POST /api/images/pull {reference?}` — from the Images panel, any
   time (not just first-run setup).
 - **Commit a clone → image**: `POST /api/images/commit {host, name}`.
-- **Apply a monitor layout** to already-running clones: `POST /api/monitors/apply` (rewrites
-  each clone's `RMNG_MONITORS` + restarts its GNOME/daemon) — for pushing a layout change made
-  after those clones were created.
+- **Activate a layout preset** on already-running clones: `POST /api/layout/activate {name}`
+  — pushes `ServerMsg::SetMonitors` to every connected clone-daemon, which live-swaps to a
+  fresh Mutter session with the new monitors (make-before-break — no GNOME restart, no app
+  loss).
 - **Hot-swap a Claude account**: `POST /api/claude/swap {host, account}` — writes the clone's
   `~/.claude/.credentials.json` live via `docker exec`.
 - **Delete**: `POST /api/delete {id}` (stops + removes the container and its
