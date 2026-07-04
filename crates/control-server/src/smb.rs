@@ -41,10 +41,12 @@ const BASE_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const STABLE_RUN: Duration = Duration::from_secs(60);
 
-/// Render `smb.conf` for the `clones` share rooted at `hosts_root`. Pure (no I/O) so it's
-/// unit-testable. Only `path` varies; every other line is literal per the design. The
-/// section keys are indented for readability — smbd ignores leading whitespace.
-pub fn render_smb_conf(hosts_root: &Path) -> String {
+/// Render `smb.conf` for the `clones` share (rooted at `hosts_root`) and the `feedback` share
+/// (rooted at `feedback_root`). Pure (no I/O) so it's unit-testable. Only the two `path` lines
+/// vary; every other line is literal per the design. The `feedback` share is a plain local
+/// directory (the detector-feedback records) — no `wide links`/`follow symlinks`/`inherit owner`,
+/// which exist on `[clones]` only for `/proc/<pid>/root` traversal.
+pub fn render_smb_conf(hosts_root: &Path, feedback_root: &Path) -> String {
     format!(
         "[global]
    server min protocol = SMB2
@@ -67,8 +69,16 @@ pub fn render_smb_conf(hosts_root: &Path) -> String {
    force group = rmng
    valid users = rmng
    inherit owner = unix only
+
+[feedback]
+   path = {}
+   read only = no
+   force user = root
+   force group = rmng
+   valid users = rmng
 ",
-        hosts_root.display()
+        hosts_root.display(),
+        feedback_root.display()
     )
 }
 
@@ -219,7 +229,13 @@ pub async fn run(app: App) {
     let root = absolute_hosts_root(&cfg.data_dir);
     let _ = std::fs::create_dir_all(&root); // harmless if homes already made it
 
-    match std::fs::write(SMB_CONF, render_smb_conf(&root)) {
+    let feedback = {
+        let fb = PathBuf::from(format!("{}/data/detector-feedback", cfg.data_dir));
+        std::path::absolute(&fb).unwrap_or(fb)
+    };
+    let _ = std::fs::create_dir_all(&feedback);
+
+    match std::fs::write(SMB_CONF, render_smb_conf(&root, &feedback)) {
         Ok(()) => tracing::info!(target: "smb", "wrote {SMB_CONF} (share root {})", root.display()),
         Err(e) => tracing::error!(target: "smb", "writing {SMB_CONF}: {e}"),
     }
@@ -234,7 +250,10 @@ mod tests {
 
     #[test]
     fn render_smb_conf_has_load_bearing_lines() {
-        let out = render_smb_conf(Path::new("/data/data/hosts"));
+        let out = render_smb_conf(
+            Path::new("/data/data/hosts"),
+            Path::new("/data/data/detector-feedback"),
+        );
         for needle in [
             "[global]",
             "server min protocol = SMB2",
@@ -242,13 +261,15 @@ mod tests {
             "smb ports = 445",
             "[clones]",
             "path = /data/data/hosts",
-            "read only = no",
             "wide links = yes",
             "follow symlinks = yes",
+            "inherit owner = unix only",
+            "[feedback]",
+            "path = /data/data/detector-feedback",
+            "read only = no",
             "force user = root",
             "force group = rmng",
             "valid users = rmng",
-            "inherit owner = unix only",
         ] {
             assert!(out.contains(needle), "smb.conf missing `{needle}`:\n{out}");
         }
@@ -256,11 +277,29 @@ mod tests {
 
     #[test]
     fn render_smb_conf_interpolates_the_share_path() {
-        // The share root must be exactly where the reconciler links, else the share is
+        // The clones share root must be exactly where the reconciler links, else the share is
         // silently empty — so `path` tracks the argument, not a hardcoded default.
-        let out = render_smb_conf(Path::new("/srv/rmng/data/hosts"));
+        let out = render_smb_conf(
+            Path::new("/srv/rmng/data/hosts"),
+            Path::new("/srv/rmng/data/detector-feedback"),
+        );
         assert!(out.contains("path = /srv/rmng/data/hosts"), "{out}");
         assert!(!out.contains("/data/data/hosts"), "{out}");
+    }
+
+    #[test]
+    fn render_smb_conf_feedback_is_a_plain_share() {
+        let out = render_smb_conf(
+            Path::new("/data/data/hosts"),
+            Path::new("/srv/rmng/data/detector-feedback"),
+        );
+        assert!(out.contains("[feedback]"), "{out}");
+        assert!(out.contains("path = /srv/rmng/data/detector-feedback"), "{out}");
+        // The feedback section must NOT carry the /proc-traversal options — those are clones-only.
+        let feedback = &out[out.find("[feedback]").expect("feedback section")..];
+        assert!(!feedback.contains("wide links"), "feedback must not enable wide links:\n{out}");
+        assert!(!feedback.contains("follow symlinks"), "{out}");
+        assert!(!feedback.contains("inherit owner"), "{out}");
     }
 
     #[test]
