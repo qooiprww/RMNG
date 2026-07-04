@@ -33,7 +33,7 @@ the local daemon) · `provision` (clone/pull/commit/delete flows over those prim
 hot-swap: hash-check on daemon `Hello` + a periodic sweep) · `linear` · `claude` (usage poll
 + token refresh/push + assign/swap) · `chat` (agent-wrapper proxy + per-host SSE) · `monitor`
 (host poller) · `homes` (clone-home symlinks under `data/hosts/`) · `smb` (smbd supervisor +
-read-write `clones` share over `data/hosts` and `feedback` share over `data/detector-feedback`) · `files`
+read-write `clones` and `feedback` shares over `data/hosts` and `data/detector-feedback` respectively) · `files`
 (notes/uploads/detector-feedback) · `assets` (on-disk clone-daemon/agent-wrapper payloads + the
 served frontend).
 
