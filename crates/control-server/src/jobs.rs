@@ -363,8 +363,8 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // selection + the resolved account in state (UI shows it immediately), then install
     // the account's current access token into the clone's ~/.claude/.credentials.json
     // (the server refreshes + re-pushes it thereafter). A group-bound clone records its
-    // group; the rotator re-balances it. "none" installs no token — the clone keeps
-    // whatever (if anything) it inherited from the image.
+    // group; the rotator re-balances it. "none" installs no token AND strips any
+    // credentials the image carried, so the clone boots provably tokenless.
     if let Some(assignment) = crate::claude::resolve_assignment(&app, spec.claude_account.as_deref()) {
         let selection = crate::claude::normalize_selection(spec.claude_account.as_deref());
         let (group, account) = match assignment {
@@ -382,9 +382,24 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             }
         });
         match account {
-            None => patch_op(&app, &op_id, |op| {
-                op.log.push("account: none (no token installed)".into())
-            }),
+            None => {
+                // Explicit "none": strip any credentials the image carried so the clone
+                // boots tokenless, instead of trusting the template to be clean. Idempotent
+                // (`rm -f`), so a clean image just reports "cleared". Best-effort like the
+                // assign arm — a failure is logged, not fatal to the clone create.
+                match crate::claude::clear_clone_token(&app, &spec.new_hostname).await {
+                    Ok(()) => patch_op(&app, &op_id, |op| {
+                        op.log.push("account: none (credentials cleared)".into())
+                    }),
+                    Err(e) => {
+                        tracing::warn!("clear_clone_token({}) failed: {e}", spec.new_hostname);
+                        patch_op(&app, &op_id, |op| {
+                            op.log.push(format!("account: none — failed to clear credentials: {e}"))
+                        });
+                    }
+                }
+                app.claude.forget_pushed(&spec.new_hostname);
+            }
             Some(email) => {
                 let label = match &group {
                     Some(g) => format!("{email} (group {g})"),
@@ -422,9 +437,21 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             }
         });
         match account {
-            None => patch_op(&app, &op_id, |op| {
-                op.log.push("codex account: none (no token installed)".into())
-            }),
+            None => {
+                // Explicit "none": strip any codex auth the image carried (see the Claude block).
+                match crate::codex::clear_clone_token(&app, &spec.new_hostname).await {
+                    Ok(()) => patch_op(&app, &op_id, |op| {
+                        op.log.push("codex account: none (credentials cleared)".into())
+                    }),
+                    Err(e) => {
+                        tracing::warn!("codex clear_clone_token({}) failed: {e}", spec.new_hostname);
+                        patch_op(&app, &op_id, |op| {
+                            op.log.push(format!("codex account: none — failed to clear credentials: {e}"))
+                        });
+                    }
+                }
+                app.codex.forget_pushed(&spec.new_hostname);
+            }
             Some(email) => {
                 let label = match &group {
                     Some(g) => format!("{email} (group {g})"),
