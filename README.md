@@ -33,10 +33,10 @@ One central encoder feeds both the viewer and the agents' screenshots; raw H.264
 - Full gnome in each clone
 - every clone's home dir accessable in one central SMB share
 
-**Automation (MCP + agents)**
+**Automation (CLI + MCP + agents)**
 
-- Fleet management mcp on control-server:9003
-- Computer use mcp in every clone on localhost:9004 
+- `rmng` fleet management CLI in every clone (hosts, clones, images, accounts — over the control-server web API)
+- Computer use mcp: fleet-wide on control-server:9003 (per-`clone` arg), in every clone on localhost:9004
 - Chat with per-clone agent over web ui
 - Needs human detector
 
@@ -71,4 +71,4 @@ Open `http://<host>:9000` → the **first-run setup wizard** (environment checkl
 
 ## Documentation
 
-Architecture, the full port/protocol map, the workspace layout, build prerequisites, and the clean-room policy live in **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**, which also links every deep-reference doc ([API](docs/API.md) · [MCP](docs/MCP.md) · [PROTOCOL](docs/PROTOCOL.md) · [SCRIPTS](docs/SCRIPTS.md) · [DEPLOY](docs/DEPLOY.md) · [PROXMOX-LXC](docs/PROXMOX-LXC.md)).
+Architecture, the full port/protocol map, the workspace layout, build prerequisites, and the clean-room policy live in **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**, which also links every deep-reference doc ([API](docs/API.md) · [CLI](docs/CLI.md) · [MCP](docs/MCP.md) · [PROTOCOL](docs/PROTOCOL.md) · [SCRIPTS](docs/SCRIPTS.md) · [DEPLOY](docs/DEPLOY.md) · [PROXMOX-LXC](docs/PROXMOX-LXC.md)).

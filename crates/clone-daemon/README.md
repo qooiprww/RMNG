@@ -11,7 +11,7 @@ session, that owns everything desktop-side. It does four things:
    identity for games).
 3. Serves the **desktop-automation MCP** on `:9004` (`RMNG_DAEMON_MCP_PORT`): screenshot,
    click/move/scroll/key/type, and window management via gnome-shell `Eval`. The in-clone
-   agent-wrapper calls it on localhost; the control-server's fleet MCP proxies to it. Full
+   agent-wrapper calls it on localhost; the control-server's global MCP proxies to it. Full
    tool list: [docs/MCP.md](../../docs/MCP.md).
 4. Bridges the **clipboard** (rich + lazy) and the **client-drawn cursor** (cursor-mode
    METADATA via a raw-PipeWire path), and runs the **needs-human detector** subcommands.

@@ -10,8 +10,8 @@ The Docker port collapsed RMNG's script surface to almost nothing. The old
 [`docker.rs`](../crates/control-server/src/docker.rs). The `P <step> <msg>` / `RESULT` bash
 protocol died with them: Rust emits progress directly through a `FnMut(&str, &str)` callback,
 and a guest script's own stdout lines are line-buffered into the Operation log. Clone binaries
-also no longer redeploy via a script + endpoint — the control-server hot-swaps them itself
-(hash check + `systemctl --user` bounce driven straight from Rust; see
+also no longer deploy via a script + endpoint — the control-server installs its current
+payloads into each clone at create time, before boot (a tar upload straight from Rust; see
 [DEPLOY.md#upgrades](DEPLOY.md#upgrades)).
 
 The in-product clone-source **build** is gone too: what used to be
@@ -31,7 +31,7 @@ control-server binary and streamed to a container over `docker exec bash -s` —
 | `crates/control-server/scripts/apply-monitors.sh` | in a clone container (`docker exec`) | `provision::apply_monitors` | Re-apply a monitor layout to a running clone without reprovisioning |
 | `crates/control-server/scripts/claude-import.sh` | in a clone container (`docker exec`) | `provision::run_clone_op` (`claude.rs`) | Read `claude auth status` / the credentials file, clear it, or install a token |
 | `crates/control-server/scripts/codex-import.sh` | in a clone container (`docker exec`) | `clone_ops::run_clone_op` (`codex.rs`) | Read `~/.codex/auth.json` status / the auth file, clear it, or install a token |
-| `template/setup/{lib,10-desktop,15-gnome-patch,20-toolbox,30-user}.sh` | in the template build (`RUN`) | `template/Dockerfile` | Provision the clone template rootfs: desktop, patched shell, dev toolbox, the clone user + its units (binaries themselves are `COPY`'d in by the Dockerfile after) |
+| `template/setup/{lib,10-desktop,15-gnome-patch,20-toolbox,30-user}.sh` | in the template build (`RUN`) | `template/Dockerfile` | Provision the clone template rootfs: desktop, patched shell, dev toolbox, the clone user + its units (the RMNG binaries are **not** baked in — the control-server injects them at clone-create time) |
 | `gnome-patch/build-shell-deb.sh` | the `gnome-build` stage of `template/Dockerfile` | `docker build` | Build the patched gnome-shell `.deb` |
 
 The two runtime guest scripts are baked in at compile time
@@ -76,8 +76,8 @@ a running clone's Codex account with no restart (the Codex CLI re-reads auth per
 > `template/setup/30-user.sh` (warn-only — the install step does not fail the build if the
 > CLI is unavailable). Existing clone images built before this change **do not** have the
 > Codex CLI and need a template rebuild (`docker build`) followed by `POST /api/images/pull`
-> to pull the updated template. Hot-swapping the binswap (`clone-daemon` / `agent-wrapper`)
-> does **not** install CLIs — it only replaces the two RMNG binaries.
+> to pull the updated template. The control-server's create-time binary injection does
+> **not** install toolchain CLIs like `codex` — it only ships the RMNG binaries.
 
 ---
 
@@ -98,10 +98,11 @@ inside the script — never baked as image `ENV`, or it would leak into the boot
 | `20-toolbox.sh` | Best-effort dev toolbox: CLI tools, Docker, cloud CLIs, browsers, Cursor/VS Code, HMCL/Mission Center/Monaspace, dconf defaults |
 | `30-user.sh` | The uid-1000 clone user (groups, linger, fish), preset-PATH rc, keyring, shared `CLAUDE.md` + linear MCP, `claude`/`uv`/`rustup`/`nvm` toolchains, and the three `systemd --user` units (`gnome-headless`, `rmng-clone-daemon`, `agent-wrapper`) + wants symlinks |
 
-`30-user.sh` creates `/opt/rmng/bin` (root:root, 0755); `template/Dockerfile` then `COPY
---from`s the built `clone-daemon` + `agent-wrapper` straight into it as the last two layers —
-the same destination [`redeploy_clone`](../crates/control-server/src/provision.rs) hot-swaps
-into later (`REDEPLOY_UNITS`). Unlike the retired `provision-clone.sh`, these scripts never run
+`30-user.sh` creates `/opt/rmng/bin` (root:root, 0755) **empty** — the template no longer
+carries `clone-daemon`/`agent-wrapper`; the control-server installs its own current copies
+(plus the `rmng` CLI at `/usr/local/bin/rmng`) into each clone at create time, before boot
+([`provision.rs`](../crates/control-server/src/provision.rs) `CLONE_BINARIES`). Unlike the
+retired `provision-clone.sh`, these scripts never run
 inside a live container over `docker exec` — they're plain Dockerfile `RUN` steps executed
 once, at `template/Dockerfile` build time; see
 [DEPLOY.md#publishing-the-template](DEPLOY.md#publishing-the-template).
