@@ -412,10 +412,12 @@ inherits it (there's no per-install control-server payload any more; see
 
 ## Day-2 operations (from the dashboard / API / fleet MCP)
 
-- **Clone**: `POST /api/clone` — Linear ticket / new ticket / plain, from a chosen image. If
-  `config.monitors` is set, the new clone is brought to that layout automatically before the
-  op completes (best-effort — see the op log on failure); the template's baked-in default
-  layout only matters when no monitors are configured.
+- **Clone**: `POST /api/clone` — Linear ticket / new ticket / plain, from a chosen image. The
+  new clone is always brought to `config.effective_monitors()` (the active layout preset, or
+  the built-in default when no presets exist) as soon as its clone-daemon connects — the
+  control-server pushes the active layout via `SetMonitors` on the daemon's first `Hello`, so
+  the template's baked-in `RMNG_MONITORS` boot value is corrected immediately and never
+  actually persists.
 - **Pull a template**: `POST /api/images/pull {reference?}` — from the Images panel, any
   time (not just first-run setup).
 - **Commit a clone → image**: `POST /api/images/commit {host, name}`.

@@ -172,8 +172,12 @@ unknown), persists it as `config.activeLayout`, mirrors `activeLayout` +
 preset's monitors to every connected clone-daemon over the clone socket. Each daemon does a
 make-before-break session swap (builds a fresh Mutter session with the new monitors, switches
 capture + input to it, stops the old one) — running apps never close. Returns
-`{ "ok": bool, "applied": string[], "errors": string[] }` (partial success allowed; a
-daemon that's down or slow to ack lands in `errors`, not a request failure).
+`{ "ok": bool, "applied": string[], "errors": string[] }`. `ok` is currently always `true`
+(the activation itself succeeded; per-clone results are in `applied`/`errors`). `applied`/
+`errors` cover only clones whose daemon is currently connected: a daemon whose connection has
+already dropped is silently skipped (absent from both lists), since the server only pushes to
+currently-connected daemons. `errors` captures an immediate socket-send failure only (there is
+no ack).
 
 ### `POST /api/delete` — body `{ "id": string }`
 Destroy a managed clone (stops it with `SIGRTMIN+3`, removes the container and its
