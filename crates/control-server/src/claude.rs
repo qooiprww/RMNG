@@ -446,6 +446,7 @@ fn to_usage(acct: &StoredClaudeAccount, raw: RawUsage) -> ClaudeUsage {
         five_hour: to_window(raw.five_hour),
         seven_day: to_window(raw.seven_day),
         spend,
+        reset_credits: None,
     }
 }
 
@@ -462,6 +463,7 @@ fn claude_base(acct: &StoredClaudeAccount) -> ClaudeUsage {
         five_hour: None,
         seven_day: None,
         spend: None,
+        reset_credits: None,
     }
 }
 

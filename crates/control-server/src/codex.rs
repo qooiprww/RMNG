@@ -508,6 +508,7 @@ fn to_usage(acct: &StoredCodexAccount, raw: RawUsage) -> ClaudeUsage {
         five_hour,
         seven_day,
         spend: None,
+        reset_credits: None,
     }
 }
 
@@ -524,6 +525,7 @@ fn codex_base(acct: &StoredCodexAccount) -> ClaudeUsage {
         five_hour: None,
         seven_day: None,
         spend: None,
+        reset_credits: None,
     }
 }
 

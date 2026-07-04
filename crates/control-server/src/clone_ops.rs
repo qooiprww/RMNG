@@ -193,6 +193,7 @@ mod tests {
                 five_hour: None,
                 seven_day: None,
                 spend: None,
+                reset_credits: None,
             }
         }
         let app = crate::app::App::test_app();
