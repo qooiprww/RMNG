@@ -9,7 +9,7 @@
 //! record + the progress→op-log plumbing; the flows themselves live in `provision`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wire::{Host, Operation, OperationKind, OperationStatus};
 
@@ -124,6 +124,34 @@ pub(crate) fn schedule_prune(app: App, op_id: String, delay_ms: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         app.store.mutate(|s| s.operations.retain(|o| o.id != op_id));
     });
+}
+
+/// After `apply_monitors` restarts headless GNOME (which drops the clone-daemon's mediaplane
+/// connection and clears its cached frame), wait for the daemon to RE-register so that declaring
+/// the clone `done`/100% actually means it's streamable. Bounded + best-effort: if it doesn't
+/// come back in time we return anyway — the clone still completes (same posture as
+/// `clone_container`'s wait-ready timeout path), just with a warning in the log.
+async fn wait_daemon_reregister(app: &App, hostname: &str) {
+    const REREGISTER_TIMEOUT: Duration = Duration::from_secs(45);
+    const REREGISTER_POLL: Duration = Duration::from_secs(1);
+    // Let the freshly-restarted GNOME session settle + push a first frame once the daemon is back.
+    const SETTLE: Duration = Duration::from_secs(2);
+    let deadline = Instant::now() + REREGISTER_TIMEOUT;
+    loop {
+        if app.media.is_connected(hostname) {
+            tokio::time::sleep(SETTLE).await;
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "clone {hostname}: daemon did not re-register within {}s after monitor apply \
+                 (still booting)",
+                REREGISTER_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        tokio::time::sleep(REREGISTER_POLL).await;
+    }
 }
 
 /// A progress callback for op `op_id` of `kind`: maps a streamed `(step, message)` onto the
@@ -297,51 +325,31 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             Err(e) => return fail_op(&app, &op_id, e.to_string()),
         };
 
-    // Register the new managed host. `host` is display-only for managed clones (dials go
-    // by container name == id), so it just records the name. Clones ship with fixed
-    // `rmng`/`rmng` credentials baked into the base image (the old Proxmox
-    // credential-inheritance from a source host is gone — images have no per-host
-    // credentials to inherit). RDP port stays 3389 for the media path.
-    app.store.mutate(|s| {
-        let mut host = Host {
-            id: spec.new_hostname.clone(),
-            host: spec.new_hostname.clone(),
-            port: 3389,
-            username: "rmng".into(),
-            password: "rmng".into(),
-            managed: true,
-            source: Some(image_ref.clone()),
-            ..Default::default()
-        };
-        if let Some(m) = &spec.linear {
-            host.linear_workspace = m.workspace.clone();
-            host.linear_ticket = m.ticket.clone();
-            host.linear_ticket_url = m.ticket_url.clone();
-            host.linear_branch = m.branch.clone();
-            host.display_name = m.display_name.clone();
-            host.linear_label = m.label.clone();
-        }
-        s.hosts.push(host);
-        if let Some(op) = s.operations.iter_mut().find(|o| o.id == op_id) {
-            op.status = OperationStatus::Done;
-            op.step = "done".into();
-            op.pct = 100.0;
-            op.message = format!("clone {} ready", spec.new_hostname);
-            op.finished_at = Some(now_ms());
-        }
-    });
+    // The container is up and its daemon has registered (or timed out still-booting) — the op
+    // now sits at the `ready` step (~80%). The clone is NOT connectable yet: applying the
+    // monitor layout below restarts headless GNOME (which drops the daemon + clears its cached
+    // frame), and the account tokens still have to be pushed. The client treats a host's
+    // PRESENCE in `s.hosts` as "ready to connect", so we keep the host OUT of state and the op
+    // RUNNING until this whole tail settles — otherwise a viewer connecting at "100%" hits a
+    // torn-down daemon and paints nothing. The host is registered + the op marked `done` at the
+    // very end, below, once the clone is genuinely streamable.
+    //
+    // (`progress` at the top of this fn was moved into `clone_container`; make a fresh one for
+    // the remaining `monitors`/`accounts` steps.)
+    let mut progress = op_progress(&app, &op_id, OperationKind::Clone);
     // Bring the fresh clone to the CONFIGURED monitor layout. The pulled template bakes a
     // fixed default (`ARG` on the gnome-shell user unit's `Environment=`), which only matches
     // a deployment's config by coincidence — the old in-product bootstrap baked the config's
     // layout into every clone at build time, so this replaces that. Only reprovision when the
     // operator actually set a layout (`cfg.monitors` non-empty); an empty config means the
     // template default is intentionally fine, so skip the extra exec + GNOME-session restart.
-    // Best-effort: log the outcome but never fail an already-completed clone op over it — the
-    // operator can always re-apply from Settings.
+    // Best-effort: log the outcome but never fail the clone over it — the operator can always
+    // re-apply from Settings.
     //
     // Awaited inline (NOT spawned off) so the agent kickoff further down this tail observes
     // the FINAL configured layout rather than racing this apply.
     if !app.config().monitors.is_empty() {
+        progress("monitors", "applying configured monitor layout");
         match provision::apply_monitors(&app, &spec.new_hostname, |_step, _msg| {}).await {
             Ok(()) => patch_op(&app, &op_id, |op| {
                 op.log.push("monitors: applied configured layout".into())
@@ -355,16 +363,24 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
                 });
             }
         }
+        // `apply_monitors` restarted headless GNOME + the clone-daemon, so the daemon's
+        // mediaplane connection dropped and its cached frame was cleared. Wait (bounded) for it
+        // to re-register before we can call the clone `done` — otherwise 100% would again
+        // precede a streamable desktop.
+        wait_daemon_reregister(&app, &spec.new_hostname).await;
     }
 
-    schedule_prune(app.clone(), op_id.clone(), PRUNE_DONE_MS);
+    progress("accounts", "assigning agent accounts");
 
-    // Assign a Claude account/group (or explicitly none): record the operator's
-    // selection + the resolved account in state (UI shows it immediately), then install
-    // the account's current access token into the clone's ~/.claude/.credentials.json
-    // (the server refreshes + re-pushes it thereafter). A group-bound clone records its
-    // group; the rotator re-balances it. "none" installs no token AND strips any
-    // credentials the image carried, so the clone boots provably tokenless.
+    // Assign a Claude account/group (or explicitly none). The operator's selection + the
+    // resolved account are COLLECTED into locals here and baked into the Host at the terminal
+    // add below (there is no host in `s.hosts` yet); the token itself is installed into the
+    // clone's ~/.claude/.credentials.json now (the server refreshes + re-pushes it thereafter).
+    // A group-bound clone records its group; the rotator re-balances it. "none" installs no
+    // token AND strips any credentials the image carried, so the clone boots provably tokenless.
+    let mut claude_selection: Option<String> = None;
+    let mut claude_account_email: Option<String> = None;
+    let mut claude_group: Option<String> = None;
     if let Some(assignment) = crate::claude::resolve_assignment(&app, spec.claude_account.as_deref()) {
         let selection = crate::claude::normalize_selection(spec.claude_account.as_deref());
         let (group, account) = match assignment {
@@ -372,15 +388,9 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             crate::claude::Assignment::Account(a) => (None, Some(a)),
             crate::claude::Assignment::None => (None, None),
         };
-        let id = spec.new_hostname.clone();
-        let (email, group_set) = (account.clone(), group.clone());
-        app.store.mutate(|s| {
-            if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
-                h.claude_selection = Some(selection.clone());
-                h.claude_account_email = email.clone();
-                h.claude_group = group_set.clone();
-            }
-        });
+        claude_selection = Some(selection);
+        claude_account_email = account.clone();
+        claude_group = group.clone();
         match account {
             None => {
                 // Explicit "none": strip any credentials the image carried so the clone
@@ -419,7 +429,11 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     }
 
     // Assign a Codex account/group (or explicitly none), independently of Claude — a clone
-    // can hold both. Same shape as the Claude block above, reading codex_* state.
+    // can hold both. Same shape as the Claude block above; collected into locals + baked into
+    // the Host at the terminal add below.
+    let mut codex_selection: Option<String> = None;
+    let mut codex_account_email: Option<String> = None;
+    let mut codex_group: Option<String> = None;
     if let Some(assignment) = crate::codex::resolve_assignment(&app, spec.codex_account.as_deref()) {
         let selection = crate::codex::normalize_selection(spec.codex_account.as_deref());
         let (group, account) = match assignment {
@@ -427,15 +441,9 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             crate::codex::Assignment::Account(a) => (None, Some(a)),
             crate::codex::Assignment::None => (None, None),
         };
-        let id = spec.new_hostname.clone();
-        let (email, group_set) = (account.clone(), group.clone());
-        app.store.mutate(|s| {
-            if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
-                h.codex_selection = Some(selection.clone());
-                h.codex_account_email = email.clone();
-                h.codex_group = group_set.clone();
-            }
-        });
+        codex_selection = Some(selection);
+        codex_account_email = account.clone();
+        codex_group = group.clone();
         match account {
             None => {
                 // Explicit "none": strip any codex auth the image carried (see the Claude block).
@@ -471,6 +479,60 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
             }
         }
     }
+
+    // Register the fully-provisioned host and mark the op done — the tail (monitor restart +
+    // daemon re-registration + account pushes) is complete, so the clone is now genuinely
+    // connectable. A host's PRESENCE in `s.hosts` is the client's "ready to connect" signal, so
+    // it is added HERE, at the same instant the bar reaches 100%. `host` is display-only for
+    // managed clones (dials go by container name == id); clones ship with fixed `rmng`/`rmng`
+    // credentials baked into the base image. RDP port stays 3389 for the media path. The Claude
+    // /Codex selection collected above is baked in so the UI shows it the moment the host
+    // appears. `daemon_up` reflects whether the clone actually re-registered (vs. still booting).
+    let daemon_up = app.media.is_connected(&spec.new_hostname);
+    app.store.mutate(|s| {
+        let mut host = Host {
+            id: spec.new_hostname.clone(),
+            host: spec.new_hostname.clone(),
+            port: 3389,
+            username: "rmng".into(),
+            password: "rmng".into(),
+            managed: true,
+            source: Some(image_ref.clone()),
+            claude_selection: claude_selection.clone(),
+            claude_account_email: claude_account_email.clone(),
+            claude_group: claude_group.clone(),
+            codex_selection: codex_selection.clone(),
+            codex_account_email: codex_account_email.clone(),
+            codex_group: codex_group.clone(),
+            ..Default::default()
+        };
+        if let Some(m) = &spec.linear {
+            host.linear_workspace = m.workspace.clone();
+            host.linear_ticket = m.ticket.clone();
+            host.linear_ticket_url = m.ticket_url.clone();
+            host.linear_branch = m.branch.clone();
+            host.display_name = m.display_name.clone();
+            host.linear_label = m.label.clone();
+        }
+        s.hosts.push(host);
+        if let Some(op) = s.operations.iter_mut().find(|o| o.id == op_id) {
+            op.status = OperationStatus::Done;
+            op.step = "done".into();
+            op.pct = 100.0;
+            op.message = if daemon_up {
+                format!("clone {} ready", spec.new_hostname)
+            } else {
+                format!(
+                    "clone {} created but its daemon hasn't registered yet (still booting; \
+                     check it in the UI)",
+                    spec.new_hostname
+                )
+            };
+            op.finished_at = Some(now_ms());
+        }
+    });
+
+    schedule_prune(app.clone(), op_id.clone(), PRUNE_DONE_MS);
 
     // Kick off the agent: hand it the ticket URL (ticket clones) or the plain
     // first message, plus any instruction overrides. Detached; it waits for the

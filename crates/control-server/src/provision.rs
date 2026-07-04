@@ -222,6 +222,12 @@ fn clone_pct(step: &str) -> Option<f64> {
         "inject" => 35.0,
         "start" => 55.0,
         "wait-ready" => 75.0,
+        // `clone_container` returns at `ready`; `run_clone` drives the rest of the tail
+        // (monitors → accounts → done), so 100% is only reached once the clone is actually
+        // connectable — not the moment its daemon first registers.
+        "ready" => 80.0,
+        "monitors" => 85.0,
+        "accounts" => 95.0,
         "done" => 100.0,
         _ => return None,
     })
@@ -231,7 +237,10 @@ fn clone_pct(step: &str) -> Option<f64> {
 /// identity/preset/PATH files, and wait for its daemon to register.
 ///
 /// Steps (→ pct): `queued` 0, `create` 20, `inject` 35, `start` 55, `wait-ready` 75,
-/// `done` 100. Returns the **canonical** image reference on success (`Host.source`; see
+/// `ready` 80 — `ready` is this fn's TERMINAL step (daemon registered, or timed-out
+/// still-booting). The remaining `monitors` 85 / `accounts` 95 / `done` 100 steps are driven
+/// by the caller (`run_clone`), so this fn returning does NOT mean the clone is connectable
+/// yet. Returns the **canonical** image reference on success (`Host.source`; see
 /// [`resolve_reference`] — the caller may have passed an id form, but state must always
 /// record the reference so the commit flow can stamp lineage). The container *name* is the
 /// hostname (== host id) — that's the clone's address (Docker DNS on the rmng bridge; its
@@ -438,7 +447,7 @@ async fn clone_container_after_create(
     let deadline = Instant::now() + WAIT_READY_TIMEOUT;
     loop {
         if app.media.is_connected(hostname) {
-            on_progress("done", &format!("clone {hostname} up + registered"));
+            on_progress("ready", &format!("clone {hostname} up + registered"));
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -447,7 +456,7 @@ async fn clone_container_after_create(
                 // Succeed with a warning: the clone is up but its daemon hasn't registered
                 // yet (headless GNOME + user units can be slow on first boot).
                 on_progress(
-                    "done",
+                    "ready",
                     &format!(
                         "clone {hostname} started but its daemon hasn't registered within {}s \
                          (still booting; check it in the UI)",
@@ -960,6 +969,9 @@ mod tests {
         assert_eq!(step_pct(Clone, "inject"), Some(35.0));
         assert_eq!(step_pct(Clone, "start"), Some(55.0));
         assert_eq!(step_pct(Clone, "wait-ready"), Some(75.0));
+        assert_eq!(step_pct(Clone, "ready"), Some(80.0));
+        assert_eq!(step_pct(Clone, "monitors"), Some(85.0));
+        assert_eq!(step_pct(Clone, "accounts"), Some(95.0));
         assert_eq!(step_pct(Clone, "done"), Some(100.0));
 
         assert_eq!(step_pct(Pull, "queued"), Some(0.0));
@@ -975,5 +987,18 @@ mod tests {
 
         // Unknown step keys yield None (jobs.rs leaves the pct unchanged).
         assert_eq!(step_pct(Clone, "bogus"), None);
+
+        // The clone table must be monotonic non-decreasing in emission order, so the progress
+        // bar never jumps backwards across the create → ready → monitors → accounts → done tail.
+        let clone_order = [
+            "queued", "create", "inject", "start", "wait-ready", "ready", "monitors", "accounts",
+            "done",
+        ];
+        let mut prev = -1.0_f64;
+        for step in clone_order {
+            let pct = step_pct(Clone, step).expect("known clone step");
+            assert!(pct >= prev, "clone step {step} pct {pct} < previous {prev}");
+            prev = pct;
+        }
     }
 }
