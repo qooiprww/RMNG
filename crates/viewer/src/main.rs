@@ -512,21 +512,16 @@ fn build_ui(
                 for (mid, au) in batch {
                     let mut w = windows.borrow_mut();
                     // The "main" window (close button + Settings; closing it quits the whole
-                    // viewer) is the primary monitor from the frontend's monitor layout — a
-                    // stable choice that doesn't depend on which monitor streams first. The
-                    // layout (tag 3) is replayed before the first video AU, so `reported` is
-                    // already populated here; only if it somehow isn't do we fall back to the
-                    // first window built.
-                    let primary = {
-                        let rep = reported.lock().unwrap();
-                        if rep.is_empty() {
-                            w.is_empty()
-                        } else {
-                            rep.iter().any(|m| m.id == mid && m.primary)
-                        }
-                    };
+                    // viewer) is the window for monitor_id 0. monitor_id is the daemon layout's
+                    // slot index (0..n-1), and every layout has ≥1 monitor, so id 0 is present
+                    // in EVERY layout — Task 4.2's reconcile (below) can never destroy it. That
+                    // makes this a stable, frozen-at-build-time designation: unlike the old
+                    // "primary" flag (which lived on a monitor that a live layout switch could
+                    // remove, stranding the operator without a close/Settings control), window 0
+                    // is main for its entire lifetime and never needs to be re-decided.
+                    let is_main = mid == 0;
                     let win = w.entry(mid).or_insert_with(|| {
-                        let win = make_monitor_window(&app, mid, &layout, &writer, &addr, &pointer_lock, &warp, primary);
+                        let win = make_monitor_window(&app, mid, &layout, &writer, &addr, &pointer_lock, &warp, is_main);
                         srcs.insert(mid, win.appsrc.clone());
                         // First monitor window exists: the pre-connection startup window
                         // has served its purpose. `destroy` (not `close`) skips the
@@ -573,11 +568,13 @@ fn build_ui(
                     let mut srcs = srcs.lock().unwrap();
                     let gone: Vec<u32> = w.keys().copied().filter(|id| !live.contains(id)).collect();
                     for id in gone {
-                        // Never destroy the last window: with zero windows GTK quits the
-                        // whole app before a replacement monitor's window can be built
-                        // lazily on its first AU. Task 4.3 replaces this with proper
-                        // main-window preservation; this is just a stopgap against a
-                        // total-swap layout (all old ids gone, all new ids not yet built).
+                        // The main window (monitor_id 0) is never in `gone`: every reported
+                        // layout has ≥1 monitor at slot 0, so `live` always contains 0 — this
+                        // loop structurally can't destroy it (see is_main above). The len<=1
+                        // check below guards a separate, rarer race: a non-main window that
+                        // happens to be the *only* live window right now (id 0's window not
+                        // yet lazily built) getting destroyed here, which would leave zero
+                        // windows and let GTK quit the app before id 0's first AU arrives.
                         if w.len() <= 1 {
                             break;
                         }
@@ -673,7 +670,7 @@ fn make_monitor_window(
     addr: &ServerAddr,
     pointer_lock: &Option<Rc<PointerLock>>,
     warp: &WarpSuppress,
-    primary: bool,
+    is_main: bool,
 ) -> MonitorWindow {
     let (appsrc, paintable, pipeline) = make_decoder(mid).expect("build decoder");
 
@@ -707,9 +704,9 @@ fn make_monitor_window(
         .title(format!("RMNG viewer — monitor {mid}"))
         .default_width(1280)
         .default_height(720)
-        // Only the main window gets a close button; secondary monitor windows
-        // can't be closed individually (their layout mirrors the remote desktop).
-        .deletable(primary)
+        // Only the main window (monitor 0) gets a close button; secondary monitor
+        // windows can't be closed individually (their layout mirrors the remote desktop).
+        .deletable(is_main)
         .build();
     // Tag this as a monitor window so the `window.video-window { background: black }`
     // rule paints its letterbox bars black, without affecting dialogs (Settings).
@@ -721,7 +718,7 @@ fn make_monitor_window(
 
     // ── Title bar ──────────────────────────────────────────────────────────────────────
     // On Linux (and non-macOS): build the GTK HeaderBar with FPS readout, fullscreen
-    // button, and (primary only) server-address button.
+    // button, and (main window only) server-address button.
     // On macOS: skip the GTK HeaderBar entirely; native_titlebar::install wires native
     // NSButton accessories to the real NSWindow titlebar (see native_titlebar.rs).
     // Do NOT call window.set_titlebar(...) on macOS — that path stays Linux-only.
@@ -743,7 +740,7 @@ fn make_monitor_window(
         header.pack_end(&fs_btn);
         // Settings (server address) lives only on the main window's title bar, like the
         // gtk-kasmvnc-client header. pack_end after the fullscreen button puts it to its left.
-        if primary {
+        if is_main {
             let settings = gtk4::Button::from_icon_name("network-server-symbolic");
             settings.set_tooltip_text(Some("Server address"));
             let (win, addr, writer) = (window.clone(), addr.clone(), writer.clone());
@@ -775,7 +772,7 @@ fn make_monitor_window(
     {
         let app = app.clone();
         window.connect_close_request(move |_| {
-            if primary {
+            if is_main {
                 app.quit();
                 glib::Propagation::Proceed
             } else {
@@ -791,7 +788,7 @@ fn make_monitor_window(
     // macOS: register the native titlebar BEFORE present() so connect_realize fires once
     // the surface is actually ready. The closure runs asynchronously on the main thread.
     #[cfg(target_os = "macos")]
-    native_titlebar::install(&window, primary, addr, writer);
+    native_titlebar::install(&window, is_main, addr, writer);
 
     window.present();
 
@@ -820,7 +817,7 @@ fn make_startup_window(app: &gtk4::Application, addr: &ServerAddr, writer: &Writ
         .default_height(270)
         .build();
 
-    // Same Settings button as the primary monitor window's title bar.
+    // Same Settings button as the main monitor window's title bar.
     // On Linux: use the GTK HeaderBar. On macOS: use native NSButton via native_titlebar.
     #[cfg(not(target_os = "macos"))]
     {
