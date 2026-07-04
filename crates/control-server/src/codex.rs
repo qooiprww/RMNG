@@ -20,6 +20,7 @@ use crate::app::App;
 use crate::clone_ops::{extract_json, jwt_claims, now_ms, rand_u64, run_clone_op, shuffle, snippet};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Refresh an access token this far before its expiry (must exceed the worst-case
@@ -474,6 +475,57 @@ async fn fetch_usage(http: &reqwest::Client, token: &str, account_id: &str) -> R
         bail!("usage {}{}", status.as_u16(), snippet(&text));
     }
     Ok(resp.json().await?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConsumeOutcome {
+    Reset,
+    NothingToReset,
+    NoCredit,
+    AlreadyRedeemed,
+    Unknown(String),
+}
+
+fn parse_consume_outcome(body: &str) -> ConsumeOutcome {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    match code.as_str() {
+        "reset" => ConsumeOutcome::Reset,
+        "nothingToReset" => ConsumeOutcome::NothingToReset,
+        "noCredit" => ConsumeOutcome::NoCredit,
+        "alreadyRedeemed" => ConsumeOutcome::AlreadyRedeemed,
+        other => ConsumeOutcome::Unknown(other.to_string()),
+    }
+}
+
+/// A 32-hex-char idempotency key (no `uuid` dep; `rand_u64` from `clone_ops`).
+fn new_request_id() -> String {
+    format!("{:016x}{:016x}", rand_u64(), rand_u64())
+}
+
+/// POST one reset-credit consume. Mirrors `fetch_usage` headers/timeout/error style.
+async fn consume_reset(
+    http: &reqwest::Client,
+    token: &str,
+    account_id: &str,
+    request_id: &str,
+) -> Result<ConsumeOutcome> {
+    let resp = http
+        .post(CONSUME_URL)
+        .timeout(FETCH_TIMEOUT)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("ChatGPT-Account-Id", account_id)
+        .json(&serde_json::json!({ "redeem_request_id": request_id }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("consume {}{}", status.as_u16(), snippet(&text));
+    }
+    Ok(parse_consume_outcome(&text))
 }
 
 /// A rolling window whose `limit_window_seconds` is nearer 5h (18000s) than a week
@@ -1288,5 +1340,23 @@ mod tests {
         assert_eq!(ff.seven_pct, 97.0);
         assert_eq!(ff.seven_reset_at, 222);
         assert_eq!(ff.reset_credits, 3);
+    }
+
+    #[test]
+    fn parse_consume_outcomes() {
+        assert_eq!(parse_consume_outcome(r#"{"code":"reset","windows_reset":2}"#), ConsumeOutcome::Reset);
+        assert_eq!(parse_consume_outcome(r#"{"code":"noCredit"}"#), ConsumeOutcome::NoCredit);
+        assert_eq!(parse_consume_outcome(r#"{"code":"alreadyRedeemed"}"#), ConsumeOutcome::AlreadyRedeemed);
+        assert_eq!(parse_consume_outcome(r#"{"code":"nothingToReset"}"#), ConsumeOutcome::NothingToReset);
+        assert_eq!(parse_consume_outcome(r#"{"code":"wat"}"#), ConsumeOutcome::Unknown("wat".into()));
+        assert_eq!(parse_consume_outcome("not json"), ConsumeOutcome::Unknown(String::new()));
+    }
+
+    #[test]
+    fn request_id_is_nonempty_and_varies() {
+        let a = new_request_id();
+        let b = new_request_id();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
     }
 }
