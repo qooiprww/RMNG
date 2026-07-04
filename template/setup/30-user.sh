@@ -129,6 +129,18 @@ printf 'login' > "$KRDIR/default"
 chown "$USERNAME:$USERNAME" "$KRDIR/login.keyring" "$KRDIR/default"
 chmod 600 "$KRDIR/login.keyring" "$KRDIR/default"
 
+# XDG user dirs (Downloads, Documents, Desktop, …). Normally created at first login by the
+# /etc/xdg/autostart/xdg-user-dirs.desktop entry — but this template launches
+# `gnome-shell --headless` DIRECTLY, with no gnome-session to process autostart, so that
+# never fires and Nautilus/Files opens on a bare home with no standard folders. Bake them at
+# build time instead: xdg-user-dirs-update reads /etc/xdg/user-dirs.defaults, creates the
+# dirs, and writes ~/.config/user-dirs.dirs (the XDG_*_DIR map apps resolve). Run as the user
+# so both the dirs and the config file land user-owned; HOME is set explicitly since runuser
+# doesn't. Load-bearing under set -e: if xdg-user-dirs (a gnome-session Recommends) ever
+# stops shipping, this fails the build here rather than silently regressing to a bare home.
+log "XDG user dirs (Downloads/Documents/…; autostart never runs under headless gnome-shell)"
+runuser -u "$USERNAME" -- env HOME="/home/$USERNAME" xdg-user-dirs-update
+
 # /opt/rmng/bin: created EMPTY here with the intended 0755 root:root perms. The clone-daemon +
 # agent-wrapper binaries are installed by the control-server at clone-create time (pre-boot),
 # not baked into the template — see provision.rs CLONE_BINARIES.
