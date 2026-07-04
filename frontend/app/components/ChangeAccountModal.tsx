@@ -1,6 +1,7 @@
-// Change a clone's Claude account/group after creation. Mirrors the clone modal's
-// picker (auto / account / group); binding to a group lets the server move the clone
-// to another member account when its current one exhausts (sticky otherwise).
+// Change a clone's Claude and Codex account/group after creation (Codex picker shows
+// only when Codex accounts/groups are configured). Mirrors the clone modal's picker
+// (auto / account / group); binding to a group lets the server move the clone to
+// another member account when its current one exhausts (sticky otherwise).
 import { useEffect, useState } from "react";
 
 import { AccountGroupSelect } from "~/components/AccountGroupSelect";
@@ -55,6 +56,10 @@ export function ChangeAccountModal({
       });
   }, []);
 
+  // The Codex picker only shows when Codex accounts/groups are configured; the title
+  // reflects both providers only when both are actually changeable here.
+  const showCodex = codexAccounts.length > 0 || codexGroups.length > 0;
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4"
@@ -68,7 +73,7 @@ export function ChangeAccountModal({
         }}
       >
         <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-          Claude account · <span className="text-emerald-700 dark:text-emerald-400">{host.displayName ?? host.id}</span>
+          {showCodex ? "Accounts" : "Claude account"} · <span className="text-emerald-700 dark:text-emerald-400">{host.displayName ?? host.id}</span>
         </h3>
         <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
           Pick a single account, a group (stays on one account until it exhausts,
@@ -76,7 +81,7 @@ export function ChangeAccountModal({
         </p>
 
         <label className="mt-4 block text-xs font-medium text-slate-600 dark:text-slate-300">
-          Account or group
+          Claude account
           <AccountGroupSelect
             groups={groups}
             accounts={accounts}
@@ -86,15 +91,15 @@ export function ChangeAccountModal({
           />
         </label>
 
-        {codexAccounts.length > 0 || codexGroups.length > 0 ? (
-          <label className="mt-3 block text-xs font-medium text-slate-600">
+        {showCodex ? (
+          <label className="mt-3 block text-xs font-medium text-slate-600 dark:text-slate-300">
             Codex account
             <AccountGroupSelect
               groups={codexGroups}
               accounts={codexAccounts}
               value={codexValue}
               onChange={setCodexValue}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none"
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
             />
           </label>
         ) : null}

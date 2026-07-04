@@ -906,7 +906,7 @@ export function SettingsPanel({
                     className={input}
                   />
                 </Field>
-                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600">
+                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
                   <input
                     type="checkbox"
                     checked={codex.usagePolling}
@@ -914,7 +914,7 @@ export function SettingsPanel({
                   />
                   Poll ChatGPT usage (uncheck if the usage endpoint drifts; refresh + push still run)
                 </label>
-                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600">
+                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
                   <input
                     type="checkbox"
                     checked={codex.autoReset}
@@ -933,10 +933,10 @@ export function SettingsPanel({
             >
               <div className="space-y-3">
                 {codexGroups.length === 0 ? (
-                  <p className="text-xs text-slate-400">No groups.</p>
+                  <p className="text-xs text-slate-400 dark:text-slate-500">No groups.</p>
                 ) : null}
                 {codexGroups.map((g, i) => (
-                  <div key={i} className="rounded border border-slate-200 p-3">
+                  <div key={i} className="rounded border border-slate-200 dark:border-slate-700 p-3">
                     <div className="flex items-center gap-2">
                       <input
                         value={g.name}
@@ -947,7 +947,7 @@ export function SettingsPanel({
                       <button
                         type="button"
                         onClick={() => rmCodexGroup(i)}
-                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
+                        className="shrink-0 rounded px-2 py-1 text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
                         Remove
                       </button>
@@ -959,7 +959,7 @@ export function SettingsPanel({
                     ) : (
                       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
                         {codexAccountEmails.map((email) => (
-                          <label key={email} className="flex items-center gap-1.5 text-xs text-slate-600">
+                          <label key={email} className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
                             <input
                               type="checkbox"
                               checked={g.accounts.includes(email)}
@@ -975,7 +975,7 @@ export function SettingsPanel({
                 <button
                   type="button"
                   onClick={addCodexGroup}
-                  className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                  className="rounded border border-slate-300 dark:border-slate-600 px-2 py-1 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
                 >
                   + Add group
                 </button>

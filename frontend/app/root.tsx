@@ -44,9 +44,9 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
   }
   return (
     <main className="mx-auto max-w-2xl p-8">
-      <h1 className="text-xl font-semibold text-red-600">{message}</h1>
+      <h1 className="text-xl font-semibold text-red-600 dark:text-red-400">{message}</h1>
       {detail ? (
-        <pre className="mt-4 overflow-auto rounded bg-slate-100 p-4 text-xs text-slate-500">
+        <pre className="mt-4 overflow-auto rounded bg-slate-100 p-4 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-400">
           {detail}
         </pre>
       ) : null}

@@ -289,14 +289,14 @@ export function CloneModal({
         ) : null}
 
         {codexAccounts.length > 0 || codexGroups.length > 0 ? (
-          <label className="mt-3 block text-xs font-medium text-slate-500">
+          <label className="mt-3 block text-xs font-medium text-slate-500 dark:text-slate-400">
             Codex account
             <AccountGroupSelect
               groups={codexGroups}
               accounts={codexAccounts}
               value={codexAccount}
               onChange={setCodexAccount}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 focus:border-emerald-500 focus:outline-none"
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900 dark:bg-slate-800 focus:border-emerald-500 focus:outline-none dark:border-slate-600 dark:text-slate-100"
             />
           </label>
         ) : null}

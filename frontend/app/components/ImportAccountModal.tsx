@@ -97,7 +97,9 @@ export function ImportAccountModal({
               onClick={() => setProvider(p)}
               className={
                 "rounded px-3 py-1 text-sm " +
-                (provider === p ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-600")
+                (provider === p
+                  ? "bg-slate-800 text-white dark:bg-slate-600 dark:text-white"
+                  : "bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300")
               }
             >
               {p === "claude" ? "Claude" : "Codex"}
