@@ -19,7 +19,7 @@
 # Stages:
 #   1. bun-build   — frontend (react-router → frontend/build/client) + agent-wrapper
 #                    (bun build --compile).
-#   2. rust-build  — rustup stable; dev deps; cargo build --release clone-daemon
+#   2. rust-build  — rustup stable; dev deps; cargo build --release clone-daemon + rmng-cli
 #                    + control-server.
 #   3. runtime     — ubuntu:26.04, runtime libs + samba (smbd serves clone homes over SMB)
 #                    + /usr/local/share/rmng payloads (2 binaries + static/), a local rmng
@@ -80,15 +80,16 @@ WORKDIR /src
 # frontend/build and the retired root /scripts/ out.
 COPY . .
 
-# Release-build both binaries in one cache-mounted RUN (shared dep graph compiles once).
+# Release-build the binaries in one cache-mounted RUN (shared dep graph compiles once).
 # The `target` cache is a mount, so outputs must be copied OUT in the same RUN (cache
-# mounts don't persist into the image layer). clone-daemon is a payload (the server
-# pushes it into clones); the control-server binary is the image entrypoint.
+# mounts don't persist into the image layer). clone-daemon + the rmng CLI are payloads
+# (the server pushes them into clones); the control-server binary is the image entrypoint.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p clone-daemon -p control-server \
+    cargo build --release -p clone-daemon -p control-server -p rmng-cli \
  && mkdir -p /out \
  && cp target/release/rmng-clone-daemon /out/clone-daemon \
+ && cp target/release/rmng /out/rmng-cli \
  && cp target/release/rmng-control-server /out/rmng-control-server
 
 # ---------------------------------------------------------------------------------------
@@ -139,11 +140,12 @@ LABEL org.opencontainers.image.revision="$GIT_SHA" \
 COPY --from=rust-build /out/rmng-control-server /usr/local/bin/rmng-control-server
 
 # Payloads + frontend on the image filesystem, stored PLAIN (assets.rs / web.rs read
-# these; the binswap engine hot-swaps the same clone-daemon/agent-wrapper bytes into
-# already-running clones at /opt/rmng/bin/<bin> — see binswap.rs. Clones are no longer
-# provisioned from these payloads: they're created FROM the pre-built, separately
-# published clone template (template/Dockerfile), which installs its own copies.
+# these). The control-server injects clone-daemon / agent-wrapper (→ /opt/rmng/bin) and
+# the rmng CLI (→ /usr/local/bin) into every clone at CREATE time — the sole delivery
+# path since the binswap hot-swap engine was retired; the clone template itself
+# (template/Dockerfile) carries none of them.
 COPY --from=rust-build  /out/clone-daemon               /usr/local/share/rmng/clone-daemon
+COPY --from=rust-build  /out/rmng-cli                   /usr/local/share/rmng/rmng-cli
 COPY --from=bun-build   /tmp/agent-wrapper              /usr/local/share/rmng/agent-wrapper
 COPY --from=bun-build   /src/frontend/build/client      /usr/local/share/rmng/static
 
