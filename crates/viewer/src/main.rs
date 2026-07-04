@@ -64,6 +64,11 @@ mod pointer_lock {
 #[cfg(target_os = "macos")]
 mod kvk_evdev;
 
+// Physical-keyboard capture via a raw NSEvent monitor (macOS only): bypasses GDK's
+// IM-mediated key events, which synthesize phantom keycode-0 presses. See keyboard_macos.rs.
+#[cfg(target_os = "macos")]
+mod keyboard_macos;
+
 // Native macOS titlebar: replaces the GTK HeaderBar with NSWindow + NSButton accessories.
 #[cfg(target_os = "macos")]
 mod native_titlebar;
@@ -453,6 +458,13 @@ fn build_ui(
         install_clipboard(&display.clipboard(), writer, inbox);
         pointer_lock = PointerLock::new(&display, writer.clone()).map(Rc::new);
     }
+
+    // macOS: forward PHYSICAL keys from a raw NSEvent monitor instead of GTK's key events.
+    // GDK's macOS backend runs keys through the Cocoa text-input machinery and synthesizes
+    // keycode-0 "null key" events for IME-committed text, which our kVK table mistranslated
+    // to a phantom, out-of-order KEY_A. One app-global monitor (single remote keyboard).
+    #[cfg(target_os = "macos")]
+    keyboard_macos::install(writer.clone());
 
     // A window exists from launch, before any connection: monitor windows are built
     // lazily on each monitor's first video AU, so a wrong/unset server address used
@@ -1298,6 +1310,8 @@ fn install_keyboard(
                 s.contains(gdk::ModifierType::CONTROL_MASK) && s.contains(gdk::ModifierType::ALT_MASK);
             if ctrl_alt && (keyval == gdk::Key::g || keyval == gdk::Key::G) {
                 release_all_input(&w, &state); // drop the leaked Ctrl/Alt before entering the game
+                #[cfg(target_os = "macos")]
+                keyboard_macos::release_all(); // keys are held in the NSEvent monitor's set, not `state`
                 if let Some(pl) = &pl {
                     if pl.is_engaged() {
                         pl.release();
@@ -1315,27 +1329,24 @@ fn install_keyboard(
                     pl.release();
                 }
                 release_all_input(&w, &state);
+                #[cfg(target_os = "macos")]
+                keyboard_macos::release_all(); // keys are held in the NSEvent monitor's set, not `state`
                 return glib::Propagation::Stop;
             }
             // Physical key identity → Linux evdev keycode sent on the wire.
             // Linux/X11: GTK hardware_keycode = evdev + 8; subtract 8 to recover evdev.
-            // macOS: GTK hardware_keycode is Carbon kVK (0-127); translate via lookup table.
-            //        Skip the event (return Proceed) for sentineled / unmapped kVK codes.
             #[cfg(not(target_os = "macos"))]
             {
                 let keycode = code.saturating_sub(8);
                 state.pressed.borrow_mut().insert(keycode);
                 send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
             }
+            // macOS: physical keys are forwarded by the raw NSEvent monitor (keyboard_macos),
+            // NOT from here — GTK's key events on macOS come through the Cocoa text-input
+            // machinery, which synthesizes phantom keycode-0 presses. This handler keeps only
+            // the local shortcuts above; the monitor passes those keys through so they reach it.
             #[cfg(target_os = "macos")]
-            {
-                let keycode = kvk_evdev::translate(code);
-                tracing::debug!("key press: hw={:#04x} evdev={}", code, keycode);
-                if keycode != 0 {
-                    state.pressed.borrow_mut().insert(keycode);
-                    send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
-                }
-            }
+            let _ = code;
             glib::Propagation::Proceed
         });
     }
@@ -1349,15 +1360,9 @@ fn install_keyboard(
                 state.pressed.borrow_mut().remove(&keycode);
                 release_keycode(&w, keycode);
             }
+            // macOS: releases come from the keyboard_macos NSEvent monitor (see key_pressed).
             #[cfg(target_os = "macos")]
-            {
-                let keycode = kvk_evdev::translate(code);
-                tracing::debug!("key release: hw={:#04x} evdev={}", code, keycode);
-                if keycode != 0 {
-                    state.pressed.borrow_mut().remove(&keycode);
-                    release_keycode(&w, keycode);
-                }
-            }
+            let _ = (&w, &state, code);
         });
     }
     window.add_controller(key);
@@ -1366,6 +1371,11 @@ fn install_keyboard(
         let (w, state, window2) = (writer.clone(), state.clone(), window.clone());
         window.connect_is_active_notify(move |win| {
             tracing::debug!("window active: {:?} active={}", win.title().map(|t| t.to_string()), win.is_active());
+            // macOS: gate the NSEvent keyboard monitor on whether a video window is the key
+            // window — so keys reach the remote when looking at it, but stay local (dialogs,
+            // the pre-connection window) otherwise.
+            #[cfg(target_os = "macos")]
+            keyboard_macos::note_window_active(win.is_active());
             if win.is_active() {
                 if state.inside.get() {
                     grab_keys(&window2);
@@ -1373,6 +1383,8 @@ fn install_keyboard(
             } else {
                 ungrab_shortcuts(&window2);
                 release_all_input(&w, &state);
+                #[cfg(target_os = "macos")]
+                keyboard_macos::release_all(); // drop remote-held keys tracked by the monitor
             }
         });
     }
