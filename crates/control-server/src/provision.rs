@@ -23,7 +23,7 @@
 use anyhow::{Result, bail};
 use std::time::{Duration, Instant};
 
-use wire::{AppConfig, EnvVar};
+use wire::EnvVar;
 
 use crate::app::App;
 use crate::docker::{CreateSpec, PullEvent, TarEntry, CLONE_USER};
@@ -45,16 +45,6 @@ const WAIT_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const WAIT_READY_POLL: Duration = Duration::from_secs(2);
 
 // --- pure ports -----------------------------------------------------------------------
-
-/// The monitor layout as the clone-daemon's `RMNG_MONITORS` env: CSV of `WxH+X+Y[*]`
-/// (position in the unified desktop, `*` = primary). Ported verbatim from `orchestrate.rs`.
-pub fn monitors_csv(cfg: &AppConfig) -> String {
-    cfg.effective_monitors()
-        .iter()
-        .map(|m| format!("{}x{}+{}+{}{}", m.width, m.height, m.x, m.y, if m.primary { "*" } else { "" }))
-        .collect::<Vec<_>>()
-        .join(",")
-}
 
 /// A DNS label (host-id / hostname validity + path-traversal guard). Ported verbatim.
 pub fn is_dns_label(s: &str) -> bool {
@@ -804,20 +794,6 @@ async fn sock_source_dir(app: &App) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wire::{LayoutPreset, MonitorSpec};
-
-    fn cfg_with_monitors(mons: Vec<MonitorSpec>) -> AppConfig {
-        let mut c = AppConfig::default();
-        // Empty `mons` must leave `layout_presets` empty too, or effective_monitors()
-        // would resolve the (empty-monitors) active preset instead of falling through
-        // to its hardcoded dual-1440p default — which is exactly what
-        // `monitors_csv_falls_back_to_default` below exercises.
-        if !mons.is_empty() {
-            c.layout_presets = vec![LayoutPreset { name: "T".into(), monitors: mons }];
-            c.active_layout = "T".into();
-        }
-        c
-    }
 
     #[test]
     fn dns_label_validation() {
@@ -863,22 +839,6 @@ mod tests {
         assert_eq!(resolve_reference(&images, ""), None);
         // Empty image list → None.
         assert_eq!(resolve_reference(&[], "rmng/template:base"), None);
-    }
-
-    #[test]
-    fn monitors_csv_format() {
-        let cfg = cfg_with_monitors(vec![
-            MonitorSpec { width: 2560, height: 1440, x: 2560, y: 0, primary: true },
-            MonitorSpec { width: 1920, height: 1080, x: 0, y: 0, primary: false },
-        ]);
-        assert_eq!(monitors_csv(&cfg), "2560x1440+2560+0*,1920x1080+0+0");
-    }
-
-    #[test]
-    fn monitors_csv_falls_back_to_default() {
-        // Empty config → effective_monitors' dual-1440p default.
-        let cfg = cfg_with_monitors(vec![]);
-        assert_eq!(monitors_csv(&cfg), "2560x1440+2560+0*,2560x1440+0+0");
     }
 
     #[test]
