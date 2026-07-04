@@ -218,6 +218,7 @@ export function SettingsPanel({
     pollSecs: 600,
     pinnedEmail: "",
     usagePolling: true,
+    autoReset: false,
   });
   const [codexGroups, setCodexGroups] = useState<{ name: string; accounts: string[] }[]>([]);
   const [listen, setListen] = useState({ web: 9000, video: 9001, cloneMcp: 9002, globalMcp: 9003, daemonMcp: 9004 });
@@ -912,6 +913,15 @@ export function SettingsPanel({
                     onChange={(e) => setCodex({ ...codex, usagePolling: e.target.checked })}
                   />
                   Poll ChatGPT usage (uncheck if the usage endpoint drifts; refresh + push still run)
+                </label>
+                <label className="col-span-2 flex items-center gap-2 text-sm text-slate-600">
+                  <input
+                    type="checkbox"
+                    checked={codex.autoReset}
+                    onChange={(e) => setCodex({ ...codex, autoReset: e.target.checked })}
+                  />
+                  Auto-use Codex reset credits (when every account is &gt;95% weekly and none
+                  reset within 24h, spend one banked reset to bring an account back)
                 </label>
               </div>
             </Section>
