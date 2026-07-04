@@ -30,6 +30,19 @@ use wire::socket::{
 
 use crate::mutter::Session;
 
+/// The session-bound state the input/clipboard tasks need, swapped atomically by the
+/// reconfigure controller. `rd` injects input; `streams` maps monitor_id → stream path
+/// for absolute-pointer motion (`notify_pointer_motion_absolute(stream, x, y)`).
+///
+/// Not yet wired in — Task 3.3 (reconfigure controller) constructs and swaps these.
+#[allow(dead_code)]
+struct SessionRuntime {
+    rd: mutter::RemoteDesktopSessionProxy<'static>,
+    streams: std::collections::HashMap<u32, String>,
+}
+#[allow(dead_code)]
+type ActiveSession = std::sync::Arc<tokio::sync::Mutex<SessionRuntime>>;
+
 /// One configured monitor: size, position (unified-desktop px) + primary flag.
 #[derive(Clone, Copy)]
 struct MonitorCfg {
