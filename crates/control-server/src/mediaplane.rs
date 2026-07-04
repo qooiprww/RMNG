@@ -16,6 +16,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 
 use tokio::sync::broadcast::error::RecvError;
 
@@ -29,9 +31,69 @@ use wire::viewer::ModeMsg;
 
 use crate::app::App;
 
+/// One connected viewer: its id + the sender into its per-viewer writer thread.
+/// The writer thread owns the socket; producers only ever `try_send` here, so a slow
+/// viewer's socket never blocks the encode or metadata threads.
+struct ViewerConn {
+    id: u64,
+    tx: SyncSender<Arc<[u8]>>,
+}
+
+/// The live set of viewers, keyed by id. Held under a short-lived lock only to
+/// snapshot/insert/remove; all sends are non-blocking `try_send`.
+type Viewers = Arc<Mutex<HashMap<u64, ViewerConn>>>;
+
+/// Bounded per-viewer queue depth. `try_send` overflow disconnects the viewer (it
+/// reconnects + re-primes). Bounds worst-case queued memory at CAP × max-AU per slow
+/// viewer; tune here if joins on very bursty desktops need more slack.
+const VIEWER_CHAN_CAP: usize = 128;
+
+/// Monotonic per-process viewer id.
+fn next_viewer_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Fan one pre-framed message out to every viewer. A viewer whose channel is full
+/// (too slow) or disconnected (writer already gone) is removed from the registry;
+/// dropping its stored `tx` lets its writer thread's channel disconnect, which tears
+/// the viewer down. Never blocks: `try_send` is non-blocking.
+fn broadcast_bytes(viewers: &Viewers, buf: &Arc<[u8]>) {
+    let mut guard = viewers.lock().unwrap();
+    let mut dead: Vec<u64> = Vec::new();
+    for v in guard.values() {
+        if v.tx.try_send(buf.clone()).is_err() {
+            dead.push(v.id);
+        }
+    }
+    for id in dead {
+        // NB: if this viewer's writer thread is currently blocked in `write_all` on a
+        // full socket send buffer (not a full channel — that's what got it removed
+        // here), dropping `tx` doesn't wake it. Its writer + reader threads and the
+        // forward ref-count are only reclaimed once the socket itself errors, which
+        // the keepalive backstop guarantees within ~20 s.
+        guard.remove(&id);
+    }
+}
+
+/// Send one pre-framed message to a single viewer; remove it on failure.
+fn send_bytes_to(viewers: &Viewers, id: u64, buf: Arc<[u8]>) {
+    let mut guard = viewers.lock().unwrap();
+    if let Some(v) = guard.get(&id) {
+        if v.tx.try_send(buf).is_err() {
+            guard.remove(&id);
+        }
+    }
+}
+
+/// Idempotently remove a viewer (dropping its `tx`).
+fn remove_viewer(viewers: &Viewers, id: u64) {
+    viewers.lock().unwrap().remove(&id);
+}
+
 /// Central clipboard broker state (rich + lazy). One current `offer` (the selection
 /// owner) + the in-flight `pending` requests so `Data` replies route back to whoever
-/// asked. Source/requester ids are clone ids or [`VIEWER_SRC`].
+/// asked. Source/requester ids are clone ids or a per-viewer [`viewer_src`] id.
 #[derive(Default)]
 struct ClipState {
     offer: Option<(ClipboardOffer, String)>, // (offer, owner source)
@@ -47,8 +109,31 @@ struct LatestFrame {
     height: u32,
 }
 
-/// Pseudo-source id for clipboard that originated at the (single) viewer.
-const VIEWER_SRC: &str = "\0viewer";
+/// Per-viewer clipboard source id. Distinct per connection so the lazy broker can
+/// route a `Request` to the exact viewer that owns the current offer and a `Data`
+/// reply back to the exact requester.
+fn viewer_src(id: u64) -> String {
+    format!("\0viewer:{id}")
+}
+
+/// Parse a viewer source id back to its numeric id; `None` for clone ids.
+fn viewer_src_id(s: &str) -> Option<u64> {
+    s.strip_prefix("\0viewer:").and_then(|n| n.parse().ok())
+}
+
+/// A source (a leaving viewer, or a departed clone) is gone: if it owns the current
+/// offer, drop the offer; remove it from every pending requester list, discarding
+/// lists that become empty.
+fn clip_forget_source(clip: &Mutex<ClipState>, src: &str) {
+    let mut clip = clip.lock().unwrap();
+    if clip.offer.as_ref().is_some_and(|(_, owner)| owner == src) {
+        clip.offer = None;
+    }
+    clip.pending.retain(|_, requesters| {
+        requesters.retain(|r| r != src);
+        !requesters.is_empty()
+    });
+}
 
 #[derive(Default)]
 pub struct MediaHandle {
@@ -92,7 +177,6 @@ impl MediaHandle {
     }
 }
 
-type Viewer = Arc<Mutex<Option<TcpStream>>>;
 /// monitor_id → its H.264 encoder (lazily created for the selected clone).
 /// monitor_id → (encoder, width, height). The size is tracked so a resolution change
 /// (a clone reprovisioned/restarted with different `RMNG_MONITORS`) rebuilds the
@@ -117,15 +201,16 @@ pub fn spawn(app: App) {
     // built with, rather than re-reading it live per connect.
     let chroma = cfg.chroma;
     let handle = app.media.clone();
-    let viewer: Viewer = Arc::new(Mutex::new(None));
+    let viewers: Viewers = Arc::new(Mutex::new(HashMap::new()));
     let encoders: Encoders = Arc::new(Mutex::new(HashMap::new()));
     let last_sel: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    // Port 1 TCP: viewers + their input.
+    // Port 1 TCP: viewers + their input. Each viewer gets a bounded channel + a writer
+    // thread; producers only `try_send`, so a slow viewer never blocks the encoders.
     {
-        let (viewer, handle, app, encoders) = (viewer.clone(), handle.clone(), app.clone(), encoders.clone());
+        let (viewers, handle, app, encoders) =
+            (viewers.clone(), handle.clone(), app.clone(), encoders.clone());
         std::thread::spawn(move || match TcpListener::bind(("0.0.0.0", video_port)) {
-            // (chroma is captured from the spawn-time snapshot above)
             Ok(l) => {
                 tracing::info!("port 1 (video) listening on 0.0.0.0:{video_port}");
                 for stream in l.incoming().flatten() {
@@ -139,26 +224,41 @@ pub fn spawn(app: App) {
                         tracing::warn!("viewer keepalive setup failed: {e}");
                     }
                     tracing::info!("viewer connected: {:?}", stream.peer_addr());
-                    if let Ok(input_sock) = stream.try_clone() {
-                        *viewer.lock().unwrap() = Some(stream);
-                        // Mode handshake FIRST — the viewer must know the chroma mode
-                        // before the first AU so it builds the right decode pipeline.
-                        write_mode(&viewer, chroma);
-                        force_idr_all(&encoders); // fresh keyframes so the viewer paints at once
-                        // Prime the new viewer with the selected clone's last-known state so
-                        // it paints immediately even on a static desktop (METADATA capture is
-                        // damage-driven → no fresh frame until something changes).
-                        prime_viewer(&handle, &encoders, &viewer, app.store.selected(), chroma);
-                        // Advertise the current clipboard offer so the new viewer can
-                        // expose it to local apps (bytes fetched lazily on paste).
-                        if let Some((offer, _)) = handle.clip.lock().unwrap().offer.clone() {
-                            write_clip(&viewer, &ClipboardMsg::Offer(offer));
+                    let read_half = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("viewer clone failed: {e}");
+                            continue;
                         }
-                        // Push the desired forward set so the viewer opens its listeners.
-                        write_forwards(&viewer, &app.store.get(), forward_port);
-                        let (handle, app, viewer2) = (handle.clone(), app.clone(), viewer.clone());
-                        std::thread::spawn(move || read_viewer_input(input_sock, handle, app, viewer2));
-                    }
+                    };
+                    let id = next_viewer_id();
+                    app.forwards.viewer_joined();
+
+                    // Writer thread: drain the channel to the socket; shut down on any
+                    // exit (write error OR channel disconnect) to wake the reader.
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(VIEWER_CHAN_CAP);
+                    let mut write_half = stream;
+                    std::thread::spawn(move || {
+                        while let Ok(buf) = rx.recv() {
+                            if write_half.write_all(&buf).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = write_half.shutdown(std::net::Shutdown::Both);
+                    });
+
+                    let state = app.store.get();
+                    let selected = app.store.selected();
+                    // Queue mode + metadata straight into this viewer's channel (mode is first).
+                    prime_viewer_metadata(&handle, &tx, selected.clone(), chroma, &state, forward_port);
+                    // Register BEFORE the video re-encode so the keyframe reliably fans to this viewer
+                    // (independent of encode latency); mode already leads its channel.
+                    viewers.lock().unwrap().insert(id, ViewerConn { id, tx });
+                    prime_viewer_video(&handle, &encoders, &viewers, selected, chroma);
+
+                    // Reader thread owns teardown.
+                    let (handle, app, viewers) = (handle.clone(), app.clone(), viewers.clone());
+                    std::thread::spawn(move || read_viewer_input(read_half, handle, app, viewers, id));
                 }
             }
             Err(e) => tracing::error!("port 1 bind {video_port} failed: {e}"),
@@ -190,8 +290,8 @@ pub fn spawn(app: App) {
     // cursor / layout. Shares `last_sel` with the frame loop (same mutex, same lock order
     // last_sel → encoders/viewer), so the two paths serialize and never double-prime.
     {
-        let (app, encoders, viewer, last_sel, handle) =
-            (app.clone(), encoders.clone(), viewer.clone(), last_sel.clone(), handle.clone());
+        let (app, encoders, viewers, last_sel, handle) =
+            (app.clone(), encoders.clone(), viewers.clone(), last_sel.clone(), handle.clone());
         std::thread::spawn(move || {
             let (_seed, mut rx) = app.store.subscribe();
             loop {
@@ -199,9 +299,10 @@ pub fn spawn(app: App) {
                     // Any state mutation (or a lag) → re-check the selection; act only on a change.
                     Ok(_) | Err(RecvError::Lagged(_)) => {
                         // A config change (or any mutation) may have altered forwards —
-                        // re-push the full set; the viewer reconciles idempotently.
-                        if viewer.lock().unwrap().is_some() {
-                            write_forwards(&viewer, &app.store.get(), forward_port);
+                        // re-push the full set; each viewer reconciles idempotently.
+                        let state = app.store.get();
+                        if !viewers.lock().unwrap().is_empty() {
+                            broadcast_forwards(&viewers, &state, forward_port);
                         }
                         let sel = app.store.selected();
                         let mut ls = last_sel.lock().unwrap();
@@ -209,12 +310,11 @@ pub fn spawn(app: App) {
                             continue;
                         }
                         *ls = sel.clone();
-                        // No viewer attached → nothing to repaint; the connect path primes on connect.
-                        if viewer.lock().unwrap().is_none() {
+                        // No viewers attached → nothing to repaint; the connect path primes on connect.
+                        if viewers.lock().unwrap().is_empty() {
                             continue;
                         }
-                        force_idr_all(&encoders);
-                        prime_viewer(&handle, &encoders, &viewer, sel, chroma);
+                        reprime_all(&handle, &encoders, &viewers, sel, chroma);
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -237,9 +337,9 @@ pub fn spawn(app: App) {
         loop {
             match listener.accept() {
                 Ok(conn) => {
-                    let (handle, app, encoders, viewer, last_sel) =
-                        (handle.clone(), app.clone(), encoders.clone(), viewer.clone(), last_sel.clone());
-                    std::thread::spawn(move || serve_clone(conn, handle, app, encoders, viewer, last_sel));
+                    let (handle, app, encoders, viewers, last_sel) =
+                        (handle.clone(), app.clone(), encoders.clone(), viewers.clone(), last_sel.clone());
+                    std::thread::spawn(move || serve_clone(conn, handle, app, encoders, viewers, last_sel));
                 }
                 Err(e) => {
                     tracing::error!("clone accept failed: {e}");
@@ -262,12 +362,6 @@ const T_FORWARDS: u8 = 5;
 /// Viewer→server tag 2: a forward rule's status changed (`[2][u32be len][JSON ForwardStatusMsg]`).
 const T_FORWARD_STATUS: u8 = 2;
 
-/// Announce the active chroma mode: `[4u8][u32be len][JSON ModeMsg]`. Sent first on
-/// connect so the viewer picks its decode path before the first AU arrives.
-fn write_mode(viewer: &Viewer, chroma: ChromaMode) {
-    write_json_frame(viewer, T_MODE, &ModeMsg { chroma });
-}
-
 /// Build the viewer's desired forward set: the union of every host's *enabled* rules,
 /// each tagged with its host id, plus the data port.
 fn build_forwards_msg(state: &wire::ControlState, forward_port: u16) -> wire::forward::ForwardsMsg {
@@ -286,63 +380,51 @@ fn build_forwards_msg(state: &wire::ControlState, forward_port: u16) -> wire::fo
     wire::forward::ForwardsMsg { forward_port, rules }
 }
 
-/// Push the current desired forward set to the viewer (port-1 tag 5).
-fn write_forwards(viewer: &Viewer, state: &wire::ControlState, forward_port: u16) {
-    write_json_frame(viewer, T_FORWARDS, &build_forwards_msg(state, forward_port));
+/// Broadcast the current desired forward set to every viewer (port-1 tag 5).
+fn broadcast_forwards(viewers: &Viewers, state: &wire::ControlState, forward_port: u16) {
+    broadcast_json(viewers, T_FORWARDS, &build_forwards_msg(state, forward_port));
 }
 
-/// Frame one H.264 AU to the viewer: `[0u8][u32be monitor_id][u32be len][AnnexB]`.
-/// The 9-byte header + AU are assembled into one buffer and written in a single `write_all`
-/// (built before the lock): one syscall instead of four, the header rides the same TCP
-/// segment as the AU's first bytes (no tiny header-only packet under `TCP_NODELAY`), and the
-/// viewer mutex is held only for the write — not for header marshalling.
-fn write_frame(viewer: &Viewer, monitor_id: u32, au: &[u8]) {
+/// Pre-frame one H.264 AU: `[0u8][u32be monitor_id][u32be len][AnnexB]`. Built once
+/// and cloned (refcount) into each viewer's channel.
+fn frame_video(monitor_id: u32, au: &[u8]) -> Arc<[u8]> {
     let mut framed = Vec::with_capacity(9 + au.len());
     framed.push(T_VIDEO);
     framed.extend_from_slice(&monitor_id.to_be_bytes());
     framed.extend_from_slice(&(au.len() as u32).to_be_bytes());
     framed.extend_from_slice(au);
-    let mut guard = viewer.lock().unwrap();
-    if let Some(sock) = guard.as_mut() {
-        if sock.write_all(&framed).is_err() {
-            *guard = None;
-        }
+    Arc::from(framed)
+}
+
+/// Pre-frame a tagged JSON message: `[tag][u32be len][json]`. `None` if serialization
+/// fails (never for our types).
+fn frame_json<T: serde::Serialize>(tag: u8, msg: &T) -> Option<Arc<[u8]>> {
+    let json = serde_json::to_vec(msg).ok()?;
+    let mut framed = Vec::with_capacity(5 + json.len());
+    framed.push(tag);
+    framed.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&json);
+    Some(Arc::from(framed))
+}
+
+/// Fan one AU out to every viewer.
+fn broadcast_video(viewers: &Viewers, monitor_id: u32, au: &[u8]) {
+    broadcast_bytes(viewers, &frame_video(monitor_id, au));
+}
+
+/// Fan one tagged JSON message out to every viewer.
+fn broadcast_json<T: serde::Serialize>(viewers: &Viewers, tag: u8, msg: &T) {
+    if let Some(buf) = frame_json(tag, msg) {
+        broadcast_bytes(viewers, &buf);
     }
 }
 
-/// Push a clipboard message to the viewer: `[1u8][u32be len][JSON ClipboardMsg]`.
-fn write_clip(viewer: &Viewer, msg: &ClipboardMsg) {
-    write_json_frame(viewer, T_CLIPBOARD, msg);
-}
-
-/// Push a cursor update to the viewer: `[2u8][u32be len][JSON CursorMeta]`.
-fn write_layout(viewer: &Viewer, layout: &[MonitorPlacement]) {
-    write_json_frame(viewer, T_LAYOUT, &layout);
-}
-
-fn write_cursor(viewer: &Viewer, cursor: &CursorMeta) {
-    write_json_frame(viewer, T_CURSOR, cursor);
-}
-
-/// Frame a tagged JSON message to the viewer: `[tag][u32be len][json]`.
-fn write_json_frame<T: serde::Serialize>(viewer: &Viewer, tag: u8, msg: &T) {
-    let Ok(json) = serde_json::to_vec(msg) else { return };
-    let mut guard = viewer.lock().unwrap();
-    if let Some(sock) = guard.as_mut() {
-        let ok = sock
-            .write_all(&[tag])
-            .and_then(|_| sock.write_all(&(json.len() as u32).to_be_bytes()))
-            .and_then(|_| sock.write_all(&json));
-        if ok.is_err() {
-            *guard = None;
+/// Send a clipboard message to one endpoint (a clone by id, or a viewer by src id).
+fn send_clip_to(handle: &MediaHandle, viewers: &Viewers, dest: &str, msg: ClipboardMsg) {
+    if let Some(id) = viewer_src_id(dest) {
+        if let Some(buf) = frame_json(T_CLIPBOARD, &msg) {
+            send_bytes_to(viewers, id, buf);
         }
-    }
-}
-
-/// Send a clipboard message to one endpoint (a clone by id, or the viewer).
-fn send_clip_to(handle: &MediaHandle, viewer: &Viewer, dest: &str, msg: ClipboardMsg) {
-    if dest == VIEWER_SRC {
-        write_clip(viewer, &msg);
         return;
     }
     let conn = handle.conns.lock().unwrap().get(dest).cloned();
@@ -356,20 +438,34 @@ fn send_clip_to(handle: &MediaHandle, viewer: &Viewer, dest: &str, msg: Clipboar
     }
 }
 
+/// Every clipboard destination except `source`: all *other* clones + all *other*
+/// viewers (remote↔local + remote↔remote + viewer↔viewer).
+fn clip_dests(handle: &MediaHandle, viewers: &Viewers, source: &str) -> Vec<String> {
+    let mut dests: Vec<String> =
+        handle.conns.lock().unwrap().keys().cloned().filter(|id| id != source).collect();
+    for id in viewers.lock().unwrap().keys() {
+        let src = viewer_src(*id);
+        if src != source {
+            dests.push(src);
+        }
+    }
+    dests
+}
+
 /// Broker: a new selection is offered by `source`. Becomes the current clipboard;
-/// advertise it to the viewer + every *other* clone (remote↔local + remote↔remote).
-fn broker_offer(handle: &MediaHandle, viewer: &Viewer, offer: ClipboardOffer, source: &str) {
+/// advertise it to every other clone + every other viewer.
+fn broker_offer(handle: &MediaHandle, viewers: &Viewers, offer: ClipboardOffer, source: &str) {
     tracing::debug!(target: "clip", "offer serial={} from {source:?}: {:?}", offer.serial, offer.mime_types);
     handle.clip.lock().unwrap().offer = Some((offer.clone(), source.to_string()));
-    let dests: Vec<String> = clip_dests(handle, source);
+    let dests = clip_dests(handle, viewers, source);
     for d in dests {
-        send_clip_to(handle, viewer, &d, ClipboardMsg::Offer(offer.clone()));
+        send_clip_to(handle, viewers, &d, ClipboardMsg::Offer(offer.clone()));
     }
 }
 
 /// Broker: `requester` wants the current owner's bytes for a MIME — record it and
 /// forward the request to the owner (lazy fetch).
-fn broker_request(handle: &MediaHandle, viewer: &Viewer, req: ClipboardRequest, requester: &str) {
+fn broker_request(handle: &MediaHandle, viewers: &Viewers, req: ClipboardRequest, requester: &str) {
     let owner = {
         let mut clip = handle.clip.lock().unwrap();
         let Some((_, owner)) = clip.offer.clone() else {
@@ -383,11 +479,11 @@ fn broker_request(handle: &MediaHandle, viewer: &Viewer, req: ClipboardRequest, 
         owner
     };
     tracing::debug!(target: "clip", "request serial={} mime={} from {requester:?} -> owner {owner:?}", req.serial, req.mime_type);
-    send_clip_to(handle, viewer, &owner, ClipboardMsg::Request(req));
+    send_clip_to(handle, viewers, &owner, ClipboardMsg::Request(req));
 }
 
 /// Broker: the owner returned bytes — deliver to everyone who requested them.
-fn broker_data(handle: &MediaHandle, viewer: &Viewer, data: ClipboardData) {
+fn broker_data(handle: &MediaHandle, viewers: &Viewers, data: ClipboardData) {
     let requesters = handle
         .clip
         .lock()
@@ -400,17 +496,8 @@ fn broker_data(handle: &MediaHandle, viewer: &Viewer, data: ClipboardData) {
         data.serial, data.mime_type, data.bytes.len()
     );
     for r in requesters {
-        send_clip_to(handle, viewer, &r, ClipboardMsg::Data(data.clone()));
+        send_clip_to(handle, viewers, &r, ClipboardMsg::Data(data.clone()));
     }
-}
-
-/// Every clipboard destination except `source`: the viewer + all other clones.
-fn clip_dests(handle: &MediaHandle, source: &str) -> Vec<String> {
-    let mut dests: Vec<String> = handle.conns.lock().unwrap().keys().cloned().filter(|id| id != source).collect();
-    if source != VIEWER_SRC {
-        dests.push(VIEWER_SRC.to_string());
-    }
-    dests
 }
 
 fn force_idr_all(encoders: &Encoders) {
@@ -419,20 +506,95 @@ fn force_idr_all(encoders: &Encoders) {
     }
 }
 
-/// Prime a freshly-connected viewer with the selected clone's last-known state:
-/// re-encode the last captured frame (so a static, damage-driven METADATA desktop
-/// still paints at once) and replay the last cursor shape (otherwise only sent on
-/// change). No-op if nothing is selected / captured yet.
-fn prime_viewer(
+/// Get-or-create the encoder for a monitor at `w`×`h`; its AUs are framed with
+/// `monitor_id` and broadcast to every viewer. If an encoder exists at a different
+/// resolution it is rebuilt fresh.
+fn encoder_for(
+    encoders: &Encoders,
+    viewers: &Viewers,
+    monitor_id: u32,
+    w: u32,
+    h: u32,
+    chroma: ChromaMode,
+) -> Option<Arc<Encoder>> {
+    let mut map = encoders.lock().unwrap();
+    if let Some((e, ew, eh)) = map.get(&monitor_id) {
+        if *ew == w && *eh == h {
+            return Some(e.clone());
+        }
+        tracing::info!("monitor {monitor_id} resolution {ew}x{eh} → {w}x{h}; rebuilding encoder");
+    }
+    let viewers = viewers.clone();
+    match Encoder::new(chroma, move |au, _idr| broadcast_video(&viewers, monitor_id, &au)) {
+        Ok(e) => {
+            let e = Arc::new(e);
+            map.insert(monitor_id, (e.clone(), w, h));
+            Some(e)
+        }
+        Err(err) => {
+            tracing::error!("encoder for monitor {monitor_id} init failed: {err}");
+            None
+        }
+    }
+}
+
+/// Prime a freshly-connected viewer's metadata: push its mode + the selected clone's
+/// last-known layout/cursor/clipboard offer + the forward set straight into its own
+/// channel (mode FIRST so the viewer picks its decode path before any AU). Touches
+/// only this viewer's `tx` — no encoder, no registry, so it's safe to call before the
+/// viewer is inserted into `viewers`.
+fn prime_viewer_metadata(
+    handle: &MediaHandle,
+    tx: &SyncSender<Arc<[u8]>>,
+    selected: Option<String>,
+    chroma: ChromaMode,
+    state: &wire::ControlState,
+    forward_port: u16,
+) {
+    // Mode FIRST so the viewer picks its decode path before any AU.
+    if let Some(b) = frame_json(T_MODE, &ModeMsg { chroma }) {
+        let _ = tx.try_send(b);
+    }
+    // Forward set so it opens its listeners.
+    if let Some(b) = frame_json(T_FORWARDS, &build_forwards_msg(state, forward_port)) {
+        let _ = tx.try_send(b);
+    }
+    let Some(sel) = selected else { return };
+    // Layout + last cursor shape + current clipboard offer, targeted to this viewer.
+    if let Some(l) = handle.layout.lock().unwrap().get(&sel).cloned() {
+        if let Some(b) = frame_json(T_LAYOUT, &l) {
+            let _ = tx.try_send(b);
+        }
+    }
+    if let Some(c) = handle.cursor.lock().unwrap().get(&sel).cloned() {
+        if let Some(b) = frame_json(T_CURSOR, &c) {
+            let _ = tx.try_send(b);
+        }
+    }
+    if let Some((offer, _)) = handle.clip.lock().unwrap().offer.clone() {
+        if let Some(b) = frame_json(T_CLIPBOARD, &ClipboardMsg::Offer(offer)) {
+            let _ = tx.try_send(b);
+        }
+    }
+}
+
+/// Prime a freshly-connected viewer's video: force a shared keyframe and re-encode
+/// the selected clone's last frame per monitor so it paints at once even on a static,
+/// damage-driven desktop. The re-encode BROADCASTS via the shared encoder (existing
+/// viewers get one redundant keyframe per join — negligible), so the caller must
+/// register the new viewer in `viewers` before calling this — otherwise the new
+/// viewer's own first keyframe would depend on beating the encode (ms) against the
+/// registry insert (µs), a latent race. (`force_idr` only forces the *next* pushed
+/// frame to be a keyframe; it does not retroactively mark frames already encoded.)
+fn prime_viewer_video(
     handle: &MediaHandle,
     encoders: &Encoders,
-    viewer: &Viewer,
+    viewers: &Viewers,
     selected: Option<String>,
     chroma: ChromaMode,
 ) {
     let Some(sel) = selected else { return };
-    // Video: re-encode each monitor's latest frame for an immediate keyframe, so every
-    // monitor of a static, damage-driven METADATA desktop paints at once (not just one).
+    // Video: re-encode each monitor's latest frame (broadcasts via the shared encoder).
     let frames: Vec<(u32, OwnedFd, u32, u64, u32, u32)> = {
         let latest = handle.latest.lock().unwrap();
         latest
@@ -447,50 +609,48 @@ fn prime_viewer(
             .unwrap_or_default()
     };
     for (mid, fd, fourcc, modifier, w, h) in frames {
-        if let Some(enc) = encoder_for(encoders, viewer, mid, w, h, chroma) {
+        if let Some(enc) = encoder_for(encoders, viewers, mid, w, h, chroma) {
             enc.force_idr();
             if let Err(e) = enc.push(fd, fourcc, modifier, w, h) {
                 tracing::warn!("prime re-encode failed: {e}");
             }
         }
     }
-    // Layout: replay so the viewer can place its windows + route drags from the start.
-    if let Some(l) = handle.layout.lock().unwrap().get(&sel).cloned() {
-        write_layout(viewer, &l);
-    }
-    // Cursor: replay the last shape so the client can draw it before it next moves.
-    if let Some(c) = handle.cursor.lock().unwrap().get(&sel).cloned() {
-        write_cursor(viewer, &c);
-    }
 }
 
-/// Get-or-create the encoder for a monitor at `w`×`h`; its AUs are framed with
-/// `monitor_id`. If an encoder exists at a different resolution it is rebuilt fresh.
-fn encoder_for(
+/// Re-prime ALL viewers after a selection change: force fresh keyframes + rebroadcast
+/// the newly-selected clone's last frame / cursor / layout to everyone.
+fn reprime_all(
+    handle: &MediaHandle,
     encoders: &Encoders,
-    viewer: &Viewer,
-    monitor_id: u32,
-    w: u32,
-    h: u32,
+    viewers: &Viewers,
+    selected: Option<String>,
     chroma: ChromaMode,
-) -> Option<Arc<Encoder>> {
-    let mut map = encoders.lock().unwrap();
-    if let Some((e, ew, eh)) = map.get(&monitor_id) {
-        if *ew == w && *eh == h {
-            return Some(e.clone());
-        }
-        tracing::info!("monitor {monitor_id} resolution {ew}x{eh} → {w}x{h}; rebuilding encoder");
+) {
+    force_idr_all(encoders);
+    let Some(sel) = selected else { return };
+    if let Some(l) = handle.layout.lock().unwrap().get(&sel).cloned() {
+        broadcast_json(viewers, T_LAYOUT, &l);
     }
-    let viewer = viewer.clone();
-    match Encoder::new(chroma, move |au, _idr| write_frame(&viewer, monitor_id, &au)) {
-        Ok(e) => {
-            let e = Arc::new(e);
-            map.insert(monitor_id, (e.clone(), w, h));
-            Some(e)
-        }
-        Err(err) => {
-            tracing::error!("encoder for monitor {monitor_id} init failed: {err}");
-            None
+    if let Some(c) = handle.cursor.lock().unwrap().get(&sel).cloned() {
+        broadcast_json(viewers, T_CURSOR, &c);
+    }
+    let frames: Vec<(u32, OwnedFd, u32, u64, u32, u32)> = {
+        let latest = handle.latest.lock().unwrap();
+        latest
+            .get(&sel)
+            .map(|m| {
+                m.values()
+                    .filter_map(|f| {
+                        dup_owned(&f.fd).map(|fd| (f.monitor_id, fd, f.fourcc, f.modifier, f.width, f.height))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for (mid, fd, fourcc, modifier, w, h) in frames {
+        if let Some(enc) = encoder_for(encoders, viewers, mid, w, h, chroma) {
+            enc.push(fd, fourcc, modifier, w, h).ok();
         }
     }
 }
@@ -500,7 +660,7 @@ fn serve_clone(
     handle: Arc<MediaHandle>,
     app: App,
     encoders: Encoders,
-    viewer: Viewer,
+    viewers: Viewers,
     last_sel: Arc<Mutex<Option<String>>>,
 ) {
     let conn = Arc::new(conn);
@@ -528,13 +688,12 @@ fn serve_clone(
                         let mut ls = last_sel.lock().unwrap();
                         if *ls != sel {
                             *ls = sel.clone();
-                            force_idr_all(&encoders);
-                            // Repaint from the newly-selected clone's last frame + cursor.
-                            prime_viewer(&handle, &encoders, &viewer, sel.clone(), chroma);
+                            // Repaint every viewer from the newly-selected clone's last frame + cursor.
+                            reprime_all(&handle, &encoders, &viewers, sel.clone(), chroma);
                         }
                     }
                     if sel.as_deref() == Some(id.as_str()) {
-                        if let Some(enc) = encoder_for(&encoders, &viewer, f.monitor_id, f.width, f.height, chroma) {
+                        if let Some(enc) = encoder_for(&encoders, &viewers, f.monitor_id, f.width, f.height, chroma) {
                             if let Err(e) = enc.push(fd, f.fourcc, f.modifier, f.width, f.height) {
                                 tracing::warn!("encode push failed: {e}");
                             }
@@ -545,16 +704,16 @@ fn serve_clone(
             }
             Ok((DaemonMsg::ClipboardOffer(o), _)) => {
                 if let Some(id) = clone_id.clone() {
-                    broker_offer(&handle, &viewer, o, &id);
+                    broker_offer(&handle, &viewers, o, &id);
                 }
             }
             Ok((DaemonMsg::ClipboardRequest(r), _)) => {
                 if let Some(id) = clone_id.clone() {
-                    broker_request(&handle, &viewer, r, &id);
+                    broker_request(&handle, &viewers, r, &id);
                 }
             }
             Ok((DaemonMsg::ClipboardData(d), _)) => {
-                broker_data(&handle, &viewer, d);
+                broker_data(&handle, &viewers, d);
             }
             Ok((DaemonMsg::Cursor(c), _)) => {
                 if let Some(id) = clone_id.clone() {
@@ -562,9 +721,9 @@ fn serve_clone(
                     if c.shape.is_some() {
                         handle.cursor.lock().unwrap().insert(id.clone(), c.clone());
                     }
-                    // Only the selected clone's cursor reaches the viewer.
+                    // Only the selected clone's cursor reaches the viewers.
                     if app.store.selected().as_deref() == Some(id.as_str()) {
-                        write_cursor(&viewer, &c);
+                        broadcast_json(&viewers, T_CURSOR, &c);
                     }
                 }
             }
@@ -572,13 +731,14 @@ fn serve_clone(
                 if let Some(id) = clone_id.clone() {
                     handle.layout.lock().unwrap().insert(id.clone(), l.clone());
                     if app.store.selected().as_deref() == Some(id.as_str()) {
-                        write_layout(&viewer, &l);
+                        broadcast_json(&viewers, T_LAYOUT, &l);
                     }
                 }
             }
             Err(e) => {
                 if let Some(id) = &clone_id {
                     teardown_if_current(&handle.conns, &handle.latest, id, &conn);
+                    clip_forget_source(&handle.clip, id);
                     tracing::info!("clone-daemon '{id}' disconnected: {e}");
                 }
                 break;
@@ -596,8 +756,8 @@ fn serve_clone(
 /// `latest` is removed while the `conns` lock is still held: a new session can only prime
 /// `latest[id]` after its `Hello` inserted into `conns` (which needs this lock), so no
 /// fresh frame can appear between the identity check and either removal. No other site
-/// nests these two locks (verified: `prime_viewer` holds `latest` in a scoped block that
-/// never touches `conns`), so the conns→latest order cannot invert.
+/// nests these two locks (verified: [`prime_viewer_video`] holds `latest` in a scoped
+/// block that never touches `conns`), so the conns→latest order cannot invert.
 fn teardown_if_current(
     conns: &Mutex<HashMap<String, Arc<Conn>>>,
     latest: &Mutex<HashMap<String, HashMap<u32, LatestFrame>>>,
@@ -612,8 +772,10 @@ fn teardown_if_current(
 }
 
 /// Viewer → server: `[u8 type][u32be len][JSON]`. type 0 = InputMsg (to the selected
-/// clone), type 1 = ClipboardData (broker fans it out to the clones).
-fn read_viewer_input(mut sock: TcpStream, handle: Arc<MediaHandle>, app: App, viewer: Viewer) {
+/// clone), type 1 = ClipboardData (broker fans it out), type 2 = ForwardStatusMsg.
+/// This thread is the SOLE owner of the viewer's teardown.
+fn read_viewer_input(mut sock: TcpStream, handle: Arc<MediaHandle>, app: App, viewers: Viewers, id: u64) {
+    let src = viewer_src(id);
     let mut tag = [0u8; 1];
     let mut hdr = [0u8; 4];
     while sock.read_exact(&mut tag).is_ok() {
@@ -631,15 +793,15 @@ fn read_viewer_input(mut sock: TcpStream, handle: Arc<MediaHandle>, app: App, vi
         match tag[0] {
             T_VIDEO => {
                 let Ok(input) = serde_json::from_slice::<InputMsg>(&body) else { continue };
-                let Some(id) = app.store.selected() else { continue };
-                let _ = handle.send_input(&id, input);
+                let Some(clone) = app.store.selected() else { continue };
+                let _ = handle.send_input(&clone, input);
             }
             T_CLIPBOARD => {
                 if let Ok(msg) = serde_json::from_slice::<ClipboardMsg>(&body) {
                     match msg {
-                        ClipboardMsg::Offer(o) => broker_offer(&handle, &viewer, o, VIEWER_SRC),
-                        ClipboardMsg::Request(r) => broker_request(&handle, &viewer, r, VIEWER_SRC),
-                        ClipboardMsg::Data(d) => broker_data(&handle, &viewer, d),
+                        ClipboardMsg::Offer(o) => broker_offer(&handle, &viewers, o, &src),
+                        ClipboardMsg::Request(r) => broker_request(&handle, &viewers, r, &src),
+                        ClipboardMsg::Data(d) => broker_data(&handle, &viewers, d),
                     }
                 }
             }
@@ -651,9 +813,11 @@ fn read_viewer_input(mut sock: TcpStream, handle: Arc<MediaHandle>, app: App, vi
             _ => break,
         }
     }
-    // Viewer gone → its listeners are gone; drop all runtime status so the UI shows
-    // every rule as offline until a viewer reconnects and re-reports.
-    app.forwards.clear();
+    // Sole teardown: drop from the registry (stops fan-out, disconnects the writer),
+    // forget this viewer's clipboard state, and release its forward ref-count.
+    remove_viewer(&viewers, id);
+    clip_forget_source(&handle.clip, &src);
+    app.forwards.viewer_left();
 }
 
 /// Read the data-plane header: `[u32be len][JSON ForwardHeader]` (len capped at 64 KiB).
@@ -862,5 +1026,97 @@ mod tests {
         let mut got = [0u8; 4];
         client.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ping");
+    }
+
+    #[test]
+    fn broadcast_drops_only_the_full_viewer() {
+        use std::sync::mpsc::sync_channel;
+
+        // Viewer A: capacity 4, actively has room. Viewer B: capacity 1, pre-filled → full.
+        let (tx_a, rx_a) = sync_channel::<Arc<[u8]>>(4);
+        let (tx_b, _rx_b) = sync_channel::<Arc<[u8]>>(1);
+        let filler: Arc<[u8]> = Arc::from(vec![0u8; 1]);
+        tx_b.try_send(filler).unwrap(); // B is now full (nobody drains _rx_b)
+
+        let viewers: Viewers = Arc::new(Mutex::new(HashMap::new()));
+        viewers.lock().unwrap().insert(1, ViewerConn { id: 1, tx: tx_a });
+        viewers.lock().unwrap().insert(2, ViewerConn { id: 2, tx: tx_b });
+
+        let msg: Arc<[u8]> = Arc::from(vec![7u8, 8, 9]);
+        broadcast_bytes(&viewers, &msg);
+
+        // A received the message and stayed; B was full and got removed.
+        assert_eq!(&*rx_a.recv().unwrap(), &[7u8, 8, 9]);
+        assert!(viewers.lock().unwrap().contains_key(&1), "fast viewer was wrongly dropped");
+        assert!(!viewers.lock().unwrap().contains_key(&2), "full viewer was not dropped");
+    }
+
+    #[test]
+    fn remove_viewer_is_idempotent() {
+        use std::sync::mpsc::sync_channel;
+        let (tx, _rx) = sync_channel::<Arc<[u8]>>(1);
+        let viewers: Viewers = Arc::new(Mutex::new(HashMap::new()));
+        viewers.lock().unwrap().insert(5, ViewerConn { id: 5, tx });
+        remove_viewer(&viewers, 5);
+        remove_viewer(&viewers, 5); // second call must be a no-op, not a panic
+        assert!(viewers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn frame_video_layout_matches_wire() {
+        let au = [0xAAu8, 0xBB, 0xCC];
+        let f = frame_video(0x01020304, &au);
+        // [tag=0][monitor_id be][len be][au]
+        assert_eq!(f[0], T_VIDEO);
+        assert_eq!(&f[1..5], &0x01020304u32.to_be_bytes());
+        assert_eq!(&f[5..9], &(au.len() as u32).to_be_bytes());
+        assert_eq!(&f[9..], &au);
+    }
+
+    #[test]
+    fn frame_json_layout_matches_wire() {
+        let f = frame_json(T_CURSOR, &serde_json::json!({"x": 1})).unwrap();
+        let json = serde_json::to_vec(&serde_json::json!({"x": 1})).unwrap();
+        assert_eq!(f[0], T_CURSOR);
+        assert_eq!(&f[1..5], &(json.len() as u32).to_be_bytes());
+        assert_eq!(&f[5..], &json[..]);
+    }
+
+    #[test]
+    fn viewer_src_roundtrips_and_rejects_clone_ids() {
+        let s = viewer_src(42);
+        assert_eq!(viewer_src_id(&s), Some(42));
+        assert_eq!(viewer_src_id("some-clone-host"), None);
+        assert_eq!(viewer_src_id("\0viewer:notanum"), None);
+    }
+
+    #[test]
+    fn clip_forget_source_drops_owned_offer_and_scrubs_pending() {
+        use wire::socket::ClipboardOffer;
+        let clip: Mutex<ClipState> = Mutex::new(ClipState::default());
+        let owner = viewer_src(1);
+        let other = viewer_src(2);
+        {
+            let mut c = clip.lock().unwrap();
+            c.offer = Some((ClipboardOffer { serial: 1, mime_types: vec!["text/plain".into()] }, owner.clone()));
+            // A pending request that the owner (viewer 1) and viewer 2 both wanted.
+            c.pending.insert((1, "text/plain".into()), vec![owner.clone(), other.clone()]);
+        }
+
+        clip_forget_source(&clip, &owner);
+
+        let c = clip.lock().unwrap();
+        assert!(c.offer.is_none(), "offer owned by the leaving viewer should be dropped");
+        // owner scrubbed from the requester list; viewer 2 remains.
+        assert_eq!(c.pending.get(&(1, "text/plain".into())), Some(&vec![other.clone()]));
+    }
+
+    #[test]
+    fn clip_forget_source_removes_empty_pending_entries() {
+        let clip: Mutex<ClipState> = Mutex::new(ClipState::default());
+        let only = viewer_src(9);
+        clip.lock().unwrap().pending.insert((7, "image/png".into()), vec![only.clone()]);
+        clip_forget_source(&clip, &only);
+        assert!(clip.lock().unwrap().pending.is_empty(), "emptied requester list should be removed");
     }
 }
