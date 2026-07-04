@@ -7,6 +7,7 @@ members = [
     "crates/clone-daemon",
     "crates/viewer",
     "crates/control-client",
+    "crates/cli",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ license = "MIT"
 # in-tree
 wire = { path = "crates/wire" }
 media = { path = "crates/media" }
+control-client = { path = "crates/control-client" }
 
 # core
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +30,7 @@ serde_json = "1"
 # prints a "failed to parse serde attribute" pseudo-warning per field.
 ts-rs = { version = "10", features = ["no-serde-warnings"] }
 anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
