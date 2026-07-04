@@ -603,6 +603,10 @@ struct FleetFacts {
 
 /// Extract gate facts from a raw usage response. `None` if the weekly window or its
 /// reset epoch is missing — such an account can't be confirmed, so the gate won't fire.
+///
+/// Deliberately uses the raw (unrounded) weekly `used_percent` for the gate decision,
+/// whereas the display path rounds — so the gate can fire at raw 95.4% while the badge
+/// still shows 95%.
 fn gate_facts(account_id: &str, raw: &RawUsage) -> Option<FleetFacts> {
     let rl = raw.rate_limit.as_ref()?;
     // Weekly window = the one whose length is nearer a week than 5h (never by field order).
@@ -1032,19 +1036,20 @@ async fn poll_inner(app: &App) -> Result<bool> {
         ) {
             let window = target_facts.seven_reset_at;
             let req_id = new_request_id();
-            // Reserve the cooldown mark BEFORE the POST (no outcome can double-spend).
-            app.store.mutate(|s| {
-                s.codex_reset_marks.retain(|m| m.account_id != target_id);
-                s.codex_reset_marks.push(wire::CodexResetMark {
-                    account_id: target_id.clone(),
-                    window_resets_at: window,
-                    consumed_at: now_ms(),
-                    redeem_request_id: req_id.clone(),
-                });
-                prune_marks(&mut s.codex_reset_marks, now_secs);
-            });
             match fresh_access_token(app, &acct.email).await {
                 Ok((fresh, _)) => {
+                    // Reserve the cooldown mark now that the refresh succeeded, still
+                    // BEFORE the POST (no outcome can double-spend).
+                    app.store.mutate(|s| {
+                        s.codex_reset_marks.retain(|m| m.account_id != target_id);
+                        s.codex_reset_marks.push(wire::CodexResetMark {
+                            account_id: target_id.clone(),
+                            window_resets_at: window,
+                            consumed_at: now_ms(),
+                            redeem_request_id: req_id.clone(),
+                        });
+                        prune_marks(&mut s.codex_reset_marks, now_secs);
+                    });
                     match consume_reset(&app.http, &fresh.access_token, &fresh.account_id, &req_id)
                         .await
                     {
@@ -1084,7 +1089,7 @@ async fn poll_inner(app: &App) -> Result<bool> {
                     }
                 }
                 Err(e) => tracing::warn!(
-                    "codex auto-reset: token refresh for {} failed: {e} (mark kept)",
+                    "codex auto-reset: token refresh for {} failed: {e} (no mark reserved, retrying next poll)",
                     acct.email
                 ),
             }
@@ -1353,10 +1358,32 @@ mod tests {
     }
 
     #[test]
+    fn gate_boundary_pct_exactly_95_does_not_fire() {
+        // seven_pct == SEVEN_DAY_CAP_PCT is not > the cap, so it doesn't count as capped.
+        let now = 1_000_000;
+        let f = vec![
+            facts("codex:a", 95.0, now + 2 * DAY, 4),
+            facts("codex:b", 95.0, now + 2 * DAY, 4),
+        ];
+        assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
+    }
+
+    #[test]
     fn gate_blocked_when_any_resets_within_24h() {
         let now = 1_000_000;
         let f = vec![facts("codex:a", 99.0, now + 2 * DAY, 4), facts("codex:b", 99.0, now + 3600, 4)];
         assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
+    }
+
+    #[test]
+    fn gate_boundary_headroom_exactly_24h_fires() {
+        // seven_reset_at - now == RESET_MIN_HEADROOM_SECS satisfies `>=`, so the gate fires.
+        let now = 1_000_000;
+        let f = vec![
+            facts("codex:a", 99.0, now + DAY, 4),
+            facts("codex:b", 99.0, now + DAY, 2),
+        ];
+        assert_eq!(choose_reset_target(&f, 2, &[], now, true), Some("codex:a".into()));
     }
 
     #[test]
@@ -1406,6 +1433,20 @@ mod tests {
         prune_marks(&mut marks, now);
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].account_id, "b");
+    }
+
+    #[test]
+    fn prune_boundary_window_equals_now_is_dropped() {
+        // retain keeps `> now_secs`, so a window that resets exactly now is elapsed.
+        let now = 1_000_000;
+        let mut marks = vec![wire::CodexResetMark {
+            account_id: "a".into(),
+            window_resets_at: now,
+            consumed_at: 0,
+            redeem_request_id: "x".into(),
+        }];
+        prune_marks(&mut marks, now);
+        assert!(marks.is_empty());
     }
 
     #[test]
