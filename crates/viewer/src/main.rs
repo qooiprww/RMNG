@@ -387,8 +387,8 @@ struct WinInput {
 
 /// One monitor's window state we touch on every tick: the video `Picture` (sink
 /// paintable), the client-drawn cursor overlay, the appsrc fed AUs, and the last cursor
-/// version applied. The `ApplicationWindow` itself is kept alive by the GTK application's
-/// window list and the held `WinInput` by the input closures, so neither is stored here.
+/// version applied. The held `WinInput` is kept alive by the input closures, so it isn't
+/// stored here.
 struct MonitorWindow {
     video: gtk4::Picture,
     cursor: gtk4::Picture,
@@ -400,6 +400,10 @@ struct MonitorWindow {
     native_cursor: Option<gdk::Cursor>,
     /// Whether `video`'s cursor is currently hidden (pointer-lock / relative mode).
     cursor_hidden: bool,
+    /// The window itself, so a reconfigure can destroy it when its monitor is removed.
+    window: gtk4::ApplicationWindow,
+    /// The decode pipeline, stopped (not leaked) on window teardown.
+    pipeline: gst::Pipeline,
 }
 
 type Windows = Rc<RefCell<HashMap<u32, MonitorWindow>>>;
@@ -643,7 +647,7 @@ fn make_monitor_window(
     warp: &WarpSuppress,
     primary: bool,
 ) -> MonitorWindow {
-    let (appsrc, paintable) = make_decoder(mid).expect("build decoder");
+    let (appsrc, paintable, pipeline) = make_decoder(mid).expect("build decoder");
 
     let video = gtk4::Picture::for_paintable(&paintable);
     video.set_can_shrink(true);
@@ -763,7 +767,17 @@ fn make_monitor_window(
 
     window.present();
 
-    MonitorWindow { video, cursor, appsrc, paintable, last_version: 0, native_cursor: None, cursor_hidden: false }
+    MonitorWindow {
+        video,
+        cursor,
+        appsrc,
+        paintable,
+        last_version: 0,
+        native_cursor: None,
+        cursor_hidden: false,
+        window: window.clone(),
+        pipeline,
+    }
 }
 
 /// The pre-connection window, shown from launch until the first monitor window
@@ -928,7 +942,7 @@ pub(crate) fn toggle_fullscreen(window: &gtk4::ApplicationWindow) {
 /// One monitor's decode pipeline → `gtk4paintablesink`. Returns the appsrc + the sink's
 /// `GdkPaintable`. Zero-copy GL path (works on Intel, where GStreamer can't export a VA
 /// dmabuf): `vah264dec ! glupload` (EGL dmabuf→GL, shares GTK's GL context) → the sink.
-fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
+fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable, gst::Pipeline)> {
     if VIEWER_CHROMA.load(std::sync::atomic::Ordering::Relaxed) == 1 {
         return make_decoder_yuv444(monitor_id);
     }
@@ -971,8 +985,7 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     let sink = pipeline.by_name("sink").context("gtk4paintablesink")?;
     let paintable = sink.property::<gdk::Paintable>("paintable");
     pipeline.set_state(gst::State::Playing)?;
-    std::mem::forget(pipeline);
-    Ok((appsrc, paintable))
+    Ok((appsrc, paintable, pipeline))
 }
 
 /// AVC444 (`ChromaMode::Yuv444`) decode: the stream is a double-height `W×2H` NV12 carrying the
@@ -991,7 +1004,7 @@ fn make_decoder(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
 /// Do **not** put a `glcolorconvert`/`videoconvert` between the decoder (`glupload` on Linux,
 /// `vtdec_hw` on macOS) and `rmngavc444unpack`: that would 4:2:0-upsample the packed chroma and
 /// destroy the auxiliary view. The element reads the raw Y/UV textures.
-fn make_decoder_yuv444(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
+fn make_decoder_yuv444(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable, gst::Pipeline)> {
     glunpack::register()?;
     // Plain `gtk4paintablesink sync=false` (present on arrival, no audio to clock-sync to) — same as
     // the 4:2:0 path. The "old frame from a few back when downscaling" bug was NOT a sink backlog
@@ -1032,8 +1045,7 @@ fn make_decoder_yuv444(monitor_id: u32) -> Result<(AppSrc, gdk::Paintable)> {
     ));
     let paintable = pipeline.by_name("sink").context("sink")?.property::<gdk::Paintable>("paintable");
     pipeline.set_state(gst::State::Playing)?;
-    std::mem::forget(pipeline);
-    Ok((appsrc, paintable))
+    Ok((appsrc, paintable, pipeline))
 }
 
 /// Source resolution from the sink paintable (0 until the first frame → 1920×1080 default).
