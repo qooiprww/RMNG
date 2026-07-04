@@ -341,6 +341,13 @@ pub struct ControlState {
     pub selected: Option<String>,
     #[serde(default)]
     pub monitors: Vec<MonitorSpec>,
+    /// Name of the active layout preset (mirrored from config so the sidebar switcher
+    /// updates live over `/events`). Empty when no presets exist.
+    #[serde(default)]
+    pub active_layout: String,
+    /// Names of all layout presets, in config order — the sidebar's segmented buttons.
+    #[serde(default)]
+    pub layout_preset_names: Vec<String>,
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
@@ -540,6 +547,18 @@ mod tests {
         assert!(s.contains("\"fiveHour\""));
         let back: ControlState = serde_json::from_str(&s).unwrap();
         assert_eq!(st, back);
+    }
+
+    #[test]
+    fn controlstate_layout_fields_camelcase() {
+        let st = ControlState {
+            active_layout: "Dual 1440p".into(),
+            layout_preset_names: vec!["Dual 1440p".into(), "Single 4K".into()],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(v["activeLayout"], "Dual 1440p");
+        assert_eq!(v["layoutPresetNames"][1], "Single 4K");
     }
 
     #[test]
