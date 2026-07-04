@@ -48,7 +48,6 @@ pub fn router(app: App) -> Router {
         .route("/api/activate", post(activate))
         .route("/api/reorder", post(reorder))
         .route("/api/clone", post(clone))
-        .route("/api/monitors/apply", post(monitors_apply))
         .route("/api/layout/activate", post(layout_activate))
         .route("/api/delete", post(delete))
         .route("/api/notes/:id", get(notes_get).post(notes_save))
@@ -615,30 +614,6 @@ async fn delete(
     jobs::start_delete(&app, &req.id)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
-}
-
-/// `POST /api/monitors/apply` — apply the saved monitor layout to every running clone
-/// (rewrites its `RMNG_MONITORS` + restarts its GNOME session + daemon). Restarts the
-/// clones' desktops, so it's an explicit button rather than part of Save.
-async fn monitors_apply(State(app): State<App>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let clones: Vec<String> =
-        app.store.get().hosts.iter().filter(|h| h.managed).map(|h| h.id.clone()).collect();
-    let mut applied = Vec::new();
-    let mut errors = Vec::new();
-    for id in clones {
-        match crate::provision::apply_monitors(&app, &id, |step, msg| {
-            tracing::info!("apply-monitors {id} {step}: {msg}");
-        })
-        .await
-        {
-            Ok(()) => applied.push(id),
-            Err(e) => errors.push(format!("{id}: {e}")),
-        }
-    }
-    if applied.is_empty() && !errors.is_empty() {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, errors.join("; ")));
-    }
-    Ok(Json(serde_json::json!({ "ok": true, "applied": applied, "errors": errors })))
 }
 
 #[derive(Deserialize)]

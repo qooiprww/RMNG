@@ -9,9 +9,9 @@
 //!
 //! Caller-facing division of responsibility (as with `orchestrate.rs`): `jobs.rs` owns the
 //! `Operation` record + the progress→op-log plumbing and calls the flows here; `claude.rs`
-//! drives credential ops via [`run_clone_op`]; `web.rs` calls [`apply_monitors`]. These
-//! functions address a clone by its container *name*, which equals the host id (`Host.managed`
-//! rows) — no container id is stored anywhere.
+//! drives credential ops via [`run_clone_op`]. These functions address a clone by its
+//! container *name*, which equals the host id (`Host.managed` rows) — no container id is
+//! stored anywhere.
 //!
 //! Guest scripts are embedded (`include_str!`) and streamed over `docker exec bash -s`:
 //! [`crate::docker::DockerCtl::exec_script`]. Binaries (clone-daemon, agent-wrapper) are
@@ -28,7 +28,6 @@ use wire::{AppConfig, EnvVar};
 use crate::app::App;
 use crate::docker::{CreateSpec, PullEvent, TarEntry, CLONE_USER};
 
-const APPLY_MONITORS_SCRIPT: &str = include_str!("../scripts/apply-monitors.sh");
 const IMPORT_SCRIPT: &str = include_str!("../scripts/claude-import.sh");
 
 /// The clone user's uid/gid inside every image (created uid 1000 by `template/setup/30-user.sh`
@@ -750,36 +749,6 @@ pub const CLONE_BINARIES: &[CloneBinary] = &[
     CloneBinary { payload: "clone-daemon", bin: "rmng-clone-daemon" },
     CloneBinary { payload: "agent-wrapper", bin: "agent-wrapper" },
 ];
-
-// --- monitors -------------------------------------------------------------------------
-
-/// Apply the configured monitor layout to a RUNNING clone without reprovisioning: streams
-/// [`APPLY_MONITORS_SCRIPT`] over `docker exec bash -s` as root with args `<user> <csv>`. Its
-/// `[ct]` lines flow to the progress callback (as `apply` steps).
-pub async fn apply_monitors(
-    app: &App,
-    container: &str,
-    mut on_progress: impl FnMut(&str, &str),
-) -> Result<()> {
-    let cfg = app.config();
-    let csv = monitors_csv(&cfg);
-    on_progress("queued", "applying monitor layout");
-    let args = vec![CLONE_USER.to_string(), csv];
-    let code = app
-        .docker
-        .exec_script(container, APPLY_MONITORS_SCRIPT, &[], &args, |_stream, line| {
-            let msg = line.trim_start().strip_prefix("[ct] ").unwrap_or(line);
-            if !msg.trim().is_empty() {
-                on_progress("apply", msg);
-            }
-        })
-        .await?;
-    if code != 0 {
-        bail!("apply-monitors.sh failed in {container} (exit {code})");
-    }
-    on_progress("done", "monitor layout applied");
-    Ok(())
-}
 
 // --- claude-import backend ------------------------------------------------------------
 
