@@ -1,5 +1,7 @@
 # RMNG
 
+![RMNG](docs/hero.webp)
+
 > **Hardware-accelerated, fleet-scale cloud desktops for the agentic era.**
 
 A self-contained Rust system for running, viewing, and automating a fleet of cloud GNOME desktops. A single **control-server** container orchestrates **clone containers** on a local Docker daemon, hardware-encodes the selected clone's GPU frames to a **native hardware-decode GTK viewer**, and brokers the desktop-automation **MCP** that per-clone Claude agents drive. Each clone runs a thin **clone-daemon** that captures frames, injects input, and bridges the clipboard.
