@@ -32,6 +32,9 @@ const STAGGER: Duration = Duration::from_millis(400);
 const SESSION_HEADROOM_PCT: f64 = 20.0;
 const SEVEN_DAY_CAP_PCT: f64 = 95.0;
 const ROTATE_SECS: u64 = 600;
+/// Auto-reset only fires when every account's 7d window is at least this far from
+/// resetting (spec: "more than 24h from the next 7d reset").
+const RESET_MIN_HEADROOM_SECS: i64 = 24 * 3600;
 
 const IMPORT_SCRIPT: &str = include_str!("../scripts/codex-import.sh");
 
@@ -535,6 +538,80 @@ fn codex_base(acct: &StoredCodexAccount) -> ClaudeUsage {
         spend: None,
         reset_credits: None,
     }
+}
+
+/// Per-account inputs the fleet gate needs, extracted from a fresh raw usage fetch
+/// (epoch-seconds based, so the gate never round-trips the display ISO string).
+struct FleetFacts {
+    account_id: String,
+    seven_pct: f64,
+    seven_reset_at: i64,
+    reset_credits: i64,
+}
+
+/// Extract gate facts from a raw usage response. `None` if the weekly window or its
+/// reset epoch is missing — such an account can't be confirmed, so the gate won't fire.
+fn gate_facts(account_id: &str, raw: &RawUsage) -> Option<FleetFacts> {
+    let rl = raw.rate_limit.as_ref()?;
+    // Weekly window = the one whose length is nearer a week than 5h (never by field order).
+    let seven = [rl.primary_window.as_ref(), rl.secondary_window.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|w| {
+            let s = w.limit_window_seconds.unwrap_or(0);
+            (s - 604_800).abs() <= (s - 18_000).abs()
+        })?;
+    Some(FleetFacts {
+        account_id: account_id.to_string(),
+        seven_pct: seven.used_percent.unwrap_or(0.0),
+        seven_reset_at: seven.reset_at?,
+        reset_credits: raw
+            .rate_limit_reset_credits
+            .as_ref()
+            .and_then(|c| c.available_count)
+            .unwrap_or(0),
+    })
+}
+
+/// The fleet gate. Returns the account id to spend one reset on, or `None`.
+fn choose_reset_target(
+    facts: &[FleetFacts],
+    account_count: usize,
+    marks: &[wire::CodexResetMark],
+    now_secs: i64,
+    enabled: bool,
+) -> Option<String> {
+    if !enabled || account_count == 0 || facts.len() != account_count {
+        return None; // off, no accounts, or incomplete fresh data → never fire.
+    }
+    let all_capped = facts.iter().all(|f| f.seven_pct > SEVEN_DAY_CAP_PCT);
+    let none_soon = facts
+        .iter()
+        .all(|f| f.seven_reset_at - now_secs >= RESET_MIN_HEADROOM_SECS);
+    if !all_capped || !none_soon {
+        return None;
+    }
+    let mut eligible: Vec<&FleetFacts> = facts
+        .iter()
+        .filter(|f| {
+            f.reset_credits > 0
+                && !marks.iter().any(|m| {
+                    m.account_id == f.account_id && m.window_resets_at == f.seven_reset_at
+                })
+        })
+        .collect();
+    // Most credits first; tie-break by soonest reset.
+    eligible.sort_by(|a, b| {
+        b.reset_credits
+            .cmp(&a.reset_credits)
+            .then(a.seven_reset_at.cmp(&b.seven_reset_at))
+    });
+    eligible.first().map(|f| f.account_id.clone())
+}
+
+/// Drop marks whose 7d window has already elapsed (account is now in a new window).
+fn prune_marks(marks: &mut Vec<wire::CodexResetMark>, now_secs: i64) {
+    marks.retain(|m| m.window_resets_at > now_secs);
 }
 
 // --- scoring + assignment (mirrors claude.rs) -----------------------------
@@ -1115,5 +1192,101 @@ mod tests {
         ];
         let picked: Vec<String> = auto_pool_clones(&hosts).into_iter().map(|h| h.id).collect();
         assert_eq!(picked, vec!["auto1"]);
+    }
+
+    fn facts(id: &str, pct: f64, reset_at: i64, credits: i64) -> FleetFacts {
+        FleetFacts { account_id: id.into(), seven_pct: pct, seven_reset_at: reset_at, reset_credits: credits }
+    }
+    const DAY: i64 = 24 * 3600;
+
+    #[test]
+    fn gate_fires_picks_max_credits_when_all_capped_and_far() {
+        let now = 1_000_000;
+        let f = vec![
+            facts("codex:a", 96.0, now + 2 * DAY, 1),
+            facts("codex:b", 99.0, now + 3 * DAY, 4),
+        ];
+        assert_eq!(choose_reset_target(&f, 2, &[], now, true), Some("codex:b".into()));
+    }
+
+    #[test]
+    fn gate_blocked_when_setting_off() {
+        let now = 1_000_000;
+        let f = vec![facts("codex:a", 99.0, now + 2 * DAY, 4)];
+        assert_eq!(choose_reset_target(&f, 1, &[], now, false), None);
+    }
+
+    #[test]
+    fn gate_blocked_when_any_account_below_cap() {
+        let now = 1_000_000;
+        let f = vec![facts("codex:a", 96.0, now + 2 * DAY, 4), facts("codex:b", 90.0, now + 2 * DAY, 4)];
+        assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
+    }
+
+    #[test]
+    fn gate_blocked_when_any_resets_within_24h() {
+        let now = 1_000_000;
+        let f = vec![facts("codex:a", 99.0, now + 2 * DAY, 4), facts("codex:b", 99.0, now + 3600, 4)];
+        assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
+    }
+
+    #[test]
+    fn gate_blocked_when_facts_incomplete() {
+        // Only 1 of 2 accounts reported fresh usage → never fire on partial data.
+        let now = 1_000_000;
+        let f = vec![facts("codex:a", 99.0, now + 2 * DAY, 4)];
+        assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
+    }
+
+    #[test]
+    fn gate_skips_accounts_out_of_credit_or_on_cooldown() {
+        let now = 1_000_000;
+        let f = vec![
+            facts("codex:a", 99.0, now + 2 * DAY, 0), // no credit
+            facts("codex:b", 99.0, now + 2 * DAY, 2), // on cooldown this window
+        ];
+        let marks = vec![wire::CodexResetMark {
+            account_id: "codex:b".into(),
+            window_resets_at: now + 2 * DAY,
+            consumed_at: 0,
+            redeem_request_id: "x".into(),
+        }];
+        assert_eq!(choose_reset_target(&f, 2, &marks, now, true), None);
+    }
+
+    #[test]
+    fn cooldown_clears_when_window_rolls() {
+        let now = 1_000_000;
+        let f = vec![facts("codex:b", 99.0, now + 9 * DAY, 2)]; // new window resets_at
+        let marks = vec![wire::CodexResetMark {
+            account_id: "codex:b".into(),
+            window_resets_at: now + 2 * DAY, // stale window
+            consumed_at: 0,
+            redeem_request_id: "x".into(),
+        }];
+        assert_eq!(choose_reset_target(&f, 1, &marks, now, true), Some("codex:b".into()));
+    }
+
+    #[test]
+    fn prune_drops_elapsed_windows() {
+        let now = 1_000_000;
+        let mut marks = vec![
+            wire::CodexResetMark { account_id: "a".into(), window_resets_at: now - 10, consumed_at: 0, redeem_request_id: "x".into() },
+            wire::CodexResetMark { account_id: "b".into(), window_resets_at: now + 10, consumed_at: 0, redeem_request_id: "y".into() },
+        ];
+        prune_marks(&mut marks, now);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].account_id, "b");
+    }
+
+    #[test]
+    fn gate_facts_extracts_weekly_window_and_credits() {
+        let raw: RawUsage = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_at":111},"secondary_window":{"used_percent":97,"limit_window_seconds":604800,"reset_at":222}},"rate_limit_reset_credits":{"available_count":3}}"#,
+        ).unwrap();
+        let ff = gate_facts("codex:a", &raw).unwrap();
+        assert_eq!(ff.seven_pct, 97.0);
+        assert_eq!(ff.seven_reset_at, 222);
+        assert_eq!(ff.reset_credits, 3);
     }
 }
