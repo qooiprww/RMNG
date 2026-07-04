@@ -561,6 +561,34 @@ fn build_ui(
                     *layout.borrow_mut() = compute_layout(&mut mons);
                 }
             }
+            // Reconcile windows against the reported layout: destroy any monitor window
+            // whose id vanished (a preset with fewer monitors). New ids are still built
+            // lazily on their first AU; resized ids keep their window (the decoder
+            // renegotiates from the new SPS). Runs on the GTK main thread.
+            {
+                let rep = reported.lock().unwrap();
+                if !rep.is_empty() {
+                    let live: std::collections::HashSet<u32> = rep.iter().map(|m| m.id).collect();
+                    let mut w = windows.borrow_mut();
+                    let mut srcs = srcs.lock().unwrap();
+                    let gone: Vec<u32> = w.keys().copied().filter(|id| !live.contains(id)).collect();
+                    for id in gone {
+                        // Never destroy the last window: with zero windows GTK quits the
+                        // whole app before a replacement monitor's window can be built
+                        // lazily on its first AU. Task 4.3 replaces this with proper
+                        // main-window preservation; this is just a stopgap against a
+                        // total-swap layout (all old ids gone, all new ids not yet built).
+                        if w.len() <= 1 {
+                            break;
+                        }
+                        if let Some(win) = w.remove(&id) {
+                            let _ = win.pipeline.set_state(gst::State::Null);
+                            win.window.destroy();
+                            srcs.remove(&id);
+                        }
+                    }
+                }
+            }
             // Cursor: (1) the native OS cursor over the video takes the remote's shape
             // (rebuilt from CursorShape on change), hidden only in pointer-lock; (2) the
             // synthetic overlay is drawn on top ONLY while the remote agent drives the
