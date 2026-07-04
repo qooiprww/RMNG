@@ -28,9 +28,6 @@ pub struct App {
     /// surfaces its own daemon-connection failure, so the server still boots the wizard
     /// even when Docker is down.
     pub docker: Arc<DockerCtl>,
-    /// Automatic hash-based binary hot-swap engine state (worker channel + expected
-    /// hashes + per-host swap guards). Empty until [`crate::binswap::spawn`] warms it.
-    pub swap: Arc<crate::binswap::SwapState>,
     /// Volatile per-host CPU/RAM usage bus. The monitor poller publishes a stats map each
     /// tick; `/events` fans it out as a named `stats` SSE event. SSE-only — never persisted
     /// to `state.json` (see [`crate::monitor::StatsBus`]).
@@ -61,7 +58,6 @@ impl App {
             chat: Arc::new(ChatState::default()),
             media: Arc::new(crate::mediaplane::MediaHandle::default()),
             docker,
-            swap: Arc::new(crate::binswap::SwapState::default()),
             stats: Arc::new(crate::monitor::StatsBus::new()),
             forwards: Arc::new(crate::forward::ForwardBus::new()),
         }

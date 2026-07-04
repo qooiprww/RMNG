@@ -610,7 +610,7 @@ impl DockerCtl {
     /// control-server and force-removed after — a crashed earlier run is reclaimed by the
     /// pre-clean, so it never leaves host-side junk. Deliberately NOT `rmng.managed`-
     /// labeled: it's ephemeral infra, not a fleet member (keeps it out of the managed
-    /// sweeps in `binswap`/`web`). We do our own removal (not `auto_remove`) so the exit
+    /// listings in `web`/`homes`). We do our own removal (not `auto_remove`) so the exit
     /// code can be read without racing the daemon's autoremoval of a sub-second container.
     async fn lxcfs_container_probe(&self, self_id: &str) -> Result<bool> {
         let docker = self.daemon()?;
@@ -1582,37 +1582,6 @@ impl DockerCtl {
     }
 
     // --- exec -------------------------------------------------------------------------
-
-    /// Exec a command and capture combined stdout+stderr as a single string, plus the
-    /// exit code. For short probes (`id -u rmng`, `test -e …`) — no streaming. Non-zero
-    /// exit is NOT an error here; the caller inspects `code`.
-    pub async fn exec_capture(&self, container: &str, cmd: &[&str]) -> Result<(i64, String)> {
-        let exec = self
-            .daemon()?
-            .create_exec(
-                container,
-                CreateExecOptions {
-                    cmd: Some(cmd.iter().map(|s| s.to_string()).collect()),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .with_context(|| format!("creating exec in {container}"))?;
-
-        let mut out = String::new();
-        if let StartExecResults::Attached { mut output, .. } =
-            self.daemon()?.start_exec(&exec.id, None).await?
-        {
-            while let Some(chunk) = output.next().await {
-                let chunk = chunk?;
-                out.push_str(&String::from_utf8_lossy(chunk.as_ref()));
-            }
-        }
-        let code = self.daemon()?.inspect_exec(&exec.id).await?.exit_code.unwrap_or(-1);
-        Ok((code, out))
-    }
 
     /// Feed a shell script over exec stdin to `bash -s` (optionally with extra env +
     /// positional args), streaming stdout/stderr through **separate per-stream line

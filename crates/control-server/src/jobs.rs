@@ -339,13 +339,8 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // Best-effort: log the outcome but never fail an already-completed clone op over it — the
     // operator can always re-apply from Settings.
     //
-    // Ordering is load-bearing: this runs — awaited inline, NOT spawned off — before the
-    // `request_check` below. `apply-monitors.sh` and `redeploy_clone` both stop/start the
-    // SAME `rmng-clone-daemon.service` in this container via uncoordinated docker execs;
-    // running them concurrently races two systemd restarts of one unit and can abort
-    // whichever loses (a systemd job-conflict error). Staying inline (rather than spawning)
-    // also means the agent kickoff further down this tail observes the FINAL configured
-    // layout rather than racing this apply.
+    // Awaited inline (NOT spawned off) so the agent kickoff further down this tail observes
+    // the FINAL configured layout rather than racing this apply.
     if !app.config().monitors.is_empty() {
         match provision::apply_monitors(&app, &spec.new_hostname, |_step, _msg| {}).await {
             Ok(()) => patch_op(&app, &op_id, |op| {
@@ -362,18 +357,6 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
         }
     }
 
-    // The clone-daemon's first `Hello` typically races this store update — it lands during
-    // wait-ready, before the host row above exists, so the Hello-triggered `request_check`
-    // finds no managed host and skips. Re-request now that the row is in place so swap-at-
-    // create coverage doesn't have to wait for the next sweep.
-    //
-    // Deliberately AFTER the `apply_monitors` block above, not before: `request_check` only
-    // enqueues, but the swap worker drains its queue near-immediately (it isn't gated by the
-    // 5-minute sweep), so a stale-template clone can have `redeploy_clone` bouncing
-    // `rmng-clone-daemon.service` within seconds of this call — the same unit
-    // `apply-monitors.sh` bounces above. Sequencing the enqueue after the awaited apply
-    // deterministically serializes these two automatic actors on that shared unit.
-    app.swap.request_check(&spec.new_hostname);
     schedule_prune(app.clone(), op_id.clone(), PRUNE_DONE_MS);
 
     // Assign a Claude account/group (or explicitly none): record the operator's

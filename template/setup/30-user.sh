@@ -29,8 +29,9 @@ fi
 
 # Service binaries live in /opt/rmng/bin (root-owned, 755) — NOT the user's home, so they
 # don't clutter the Files/Nautilus Home view. The systemd --user units exec them from here;
-# the binaries themselves land via `COPY --from` after this script (a daemon rebuild busts
-# only those cheap layers).
+# the binaries themselves are NOT baked into the template — the control-server installs its own
+# current copies before each clone boots (provision.rs CLONE_BINARIES). This script just creates
+# the (empty) dir with the intended perms.
 BINDIR=/opt/rmng/bin
 
 log "create user $USERNAME + groups + linger"
@@ -128,8 +129,9 @@ printf 'login' > "$KRDIR/default"
 chown "$USERNAME:$USERNAME" "$KRDIR/login.keyring" "$KRDIR/default"
 chmod 600 "$KRDIR/login.keyring" "$KRDIR/default"
 
-# /opt/rmng/bin (the COPY --from lands the binaries here after this script; create it now so
-# the perms are the intended 0755 root:root).
+# /opt/rmng/bin: created EMPTY here with the intended 0755 root:root perms. The clone-daemon +
+# agent-wrapper binaries are installed by the control-server at clone-create time (pre-boot),
+# not baked into the template — see provision.rs CLONE_BINARIES.
 install -d -m0755 "$BINDIR"
 
 # Claude Code installs standalone (self-contained binary, no system node) → ~/.local/bin/claude.

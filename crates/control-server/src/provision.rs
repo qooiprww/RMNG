@@ -9,10 +9,9 @@
 //!
 //! Caller-facing division of responsibility (as with `orchestrate.rs`): `jobs.rs` owns the
 //! `Operation` record + the progress→op-log plumbing and calls the flows here; `claude.rs`
-//! drives credential ops via [`run_clone_op`]; `web.rs` calls [`apply_monitors`]; the
-//! `binswap` engine is the sole caller of [`redeploy_clone`]. These functions address a
-//! clone by its container *name*, which equals the host id (`Host.managed` rows) — no
-//! container id is stored anywhere.
+//! drives credential ops via [`run_clone_op`]; `web.rs` calls [`apply_monitors`]. These
+//! functions address a clone by its container *name*, which equals the host id (`Host.managed`
+//! rows) — no container id is stored anywhere.
 //!
 //! Guest scripts are embedded (`include_str!`) and streamed over `docker exec bash -s`:
 //! [`crate::docker::DockerCtl::exec_script`]. Binaries (clone-daemon, agent-wrapper) are
@@ -325,20 +324,20 @@ async fn clone_container_after_create(
 ) -> Result<()> {
     let docker = &app.docker;
 
-    // Pre-boot binary injection (while the container is still STOPPED): overwrite the
-    // template's baked clone-daemon/agent-wrapper with the control-server's CURRENT payloads
-    // so the daemon's `systemd --user` unit comes up already matching what binswap expects.
-    // That turns the first `Hello` check into a no-op instead of a hot-swap — no unit bounce,
-    // no Mutter-session re-setup churn, clean boot. The binswap engine (Hello re-check +
-    // periodic sweep) is deliberately untouched, so already-running clones still auto-update
-    // on a control-server upgrade; this only fixes the create path. `payload` is None in a
-    // dev checkout with no staged binaries → skip (the template's binaries stand and the
-    // post-boot hot-swap still reconciles them). upload_tar works on a stopped container.
-    let bins: Vec<TarEntry> = REDEPLOY_UNITS
+    // Install the clone binaries while the container is still STOPPED, into the
+    // `/opt/rmng/bin` dir the template pre-creates (30-user.sh) but leaves EMPTY — the template
+    // no longer carries clone-daemon/agent-wrapper. This is the SOLE delivery path: the
+    // control-server always copies its own current payloads in before boot, so a fresh clone's
+    // `systemd --user` units always exec binaries that match THIS server (no runtime
+    // hash-check / hot-swap engine, and none of its create-time churn). `payload` is None only
+    // in a dev checkout with nothing staged under `embedded-bin/` — then the clone boots with
+    // no daemon (WARN), matching the pre-existing dev caveat. upload_tar works on a stopped
+    // container.
+    let bins: Vec<TarEntry> = CLONE_BINARIES
         .iter()
-        .filter_map(|u| {
-            crate::assets::payload(u.payload).map(|data| TarEntry {
-                path: format!("opt/rmng/bin/{}", u.bin),
+        .filter_map(|b| {
+            crate::assets::payload(b.payload).map(|data| TarEntry {
+                path: format!("opt/rmng/bin/{}", b.bin),
                 data,
                 mode: 0o755,
                 uid: 0,
@@ -346,8 +345,13 @@ async fn clone_container_after_create(
             })
         })
         .collect();
-    if !bins.is_empty() {
-        on_progress("inject", "injecting current clone binaries (pre-boot)");
+    if bins.is_empty() {
+        tracing::warn!(
+            "clone {hostname}: no clone binaries staged (assets::payload empty) — it will boot \
+             without clone-daemon/agent-wrapper; stage crates/control-server/embedded-bin/ for dev"
+        );
+    } else {
+        on_progress("inject", "installing clone binaries (pre-boot)");
         docker.upload_tar(container, bins).await?;
     }
 
@@ -717,102 +721,26 @@ pub async fn delete_clone(
     Ok(())
 }
 
-// --- redeploy -------------------------------------------------------------------------
+// --- clone binaries -------------------------------------------------------------------
 
-/// One clone `systemd --user` unit in the hot-swap plan: the [`crate::assets::payload`]
-/// name to resolve bytes for, the user unit to bounce, and the on-disk binary name under
-/// `/opt/rmng/bin` (set up by `template/setup/30-user.sh` at template build). This folds in the
-/// payload-name → bin-name match that used to live inline in the redeploy loop; the
-/// automatic swap engine (`binswap`) is the sole consumer of this table.
-pub struct RedeployUnit {
+/// One binary the control-server installs into every clone before boot: the
+/// [`crate::assets::payload`] name to resolve its bytes, and the on-disk name under
+/// `/opt/rmng/bin` the `systemd --user` unit execs. The dir is pre-created 0755 root:root by
+/// `template/setup/30-user.sh`; the template itself no longer carries these binaries — the
+/// control-server is their sole source, installed at create time (see
+/// [`clone_container_after_create`]). That replaces the retired hash-check / hot-swap engine.
+pub struct CloneBinary {
     /// Asset name passed to [`crate::assets::payload`] (`clone-daemon`, `agent-wrapper`).
     pub payload: &'static str,
-    /// The `systemd --user` unit to stop/start around the swap.
-    pub unit: &'static str,
     /// The installed binary name under `/opt/rmng/bin` (what the unit execs).
     pub bin: &'static str,
 }
 
-/// The clone user's `systemd --user` units, in the order redeploy touches them.
-pub const REDEPLOY_UNITS: &[RedeployUnit] = &[
-    RedeployUnit { payload: "clone-daemon", unit: "rmng-clone-daemon.service", bin: "rmng-clone-daemon" },
-    RedeployUnit { payload: "agent-wrapper", unit: "agent-wrapper.service", bin: "agent-wrapper" },
+/// The binaries injected into every clone at create time.
+pub const CLONE_BINARIES: &[CloneBinary] = &[
+    CloneBinary { payload: "clone-daemon", bin: "rmng-clone-daemon" },
+    CloneBinary { payload: "agent-wrapper", bin: "agent-wrapper" },
 ];
-
-/// Hot-swap a running clone's binaries WITHOUT reprovisioning. The caller (the `binswap`
-/// hash-guarded engine) resolves the `(unit, payload-bytes)` pairs; this drives the systemd
-/// dance. Per unit: `systemctl --user stop` (exec'd as the clone user with its
-/// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` — linger guarantees the user manager is up)
-/// → `upload_tar` the binary to **`/opt/rmng/bin/<bin>`** (the units exec from there; the
-/// old `redeploy.sh` pushed to `$HOME`, a latent path bug this fixes) → `reset-failed` +
-/// `start`. No username arg — the clone user (`CLONE_USER`) is compiled in (fixes mcp.rs's
-/// stray `"pega"`).
-pub async fn redeploy_clone(
-    app: &App,
-    container: &str,
-    units: &[(&'static RedeployUnit, Vec<u8>)],
-    mut on_progress: impl FnMut(&str, &str),
-) -> Result<()> {
-    let docker = &app.docker;
-
-    // Resolve the clone user's uid inside the container for the XDG/DBUS env.
-    let (uid_code, uid_out) = docker.exec_capture(container, &["id", "-u", CLONE_USER]).await?;
-    let uid = uid_out.trim().to_string();
-    if uid_code != 0 || uid.is_empty() {
-        bail!("could not resolve uid of '{CLONE_USER}' in {container}: {}", uid_out.trim());
-    }
-
-    for (unit, bytes) in units {
-        on_progress("stop", &format!("stopping {}", unit.unit));
-        run_user_systemctl(app, container, &uid, &["stop", unit.unit]).await.ok();
-
-        on_progress("push", &format!("pushing {} → /opt/rmng/bin", unit.bin));
-        docker
-            .upload_tar(
-                container,
-                vec![TarEntry {
-                    path: format!("opt/rmng/bin/{}", unit.bin),
-                    data: bytes.clone(),
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                }],
-            )
-            .await?;
-
-        on_progress("start", &format!("starting {}", unit.unit));
-        run_user_systemctl(app, container, &uid, &["reset-failed", unit.unit]).await.ok();
-        run_user_systemctl(app, container, &uid, &["start", unit.unit]).await?;
-    }
-
-    on_progress("done", "redeploy complete");
-    Ok(())
-}
-
-/// Run `systemctl --user <args>` inside a clone as [`CLONE_USER`] with the user-manager env
-/// (linger guarantees the manager is up). Uses `runuser` + the `XDG_RUNTIME_DIR`/session-bus
-/// address, matching `apply-monitors.sh`'s `uctl`.
-async fn run_user_systemctl(app: &App, container: &str, uid: &str, args: &[&str]) -> Result<()> {
-    let mut cmd: Vec<&str> = vec![
-        "runuser",
-        "-u",
-        CLONE_USER,
-        "--",
-        "env",
-    ];
-    let xdg = format!("XDG_RUNTIME_DIR=/run/user/{uid}");
-    let dbus = format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus");
-    cmd.push(&xdg);
-    cmd.push(&dbus);
-    cmd.push("systemctl");
-    cmd.push("--user");
-    cmd.extend_from_slice(args);
-    let (code, out) = app.docker.exec_capture(container, &cmd).await?;
-    if code != 0 {
-        bail!("systemctl --user {} failed (exit {code}): {}", args.join(" "), out.trim());
-    }
-    Ok(())
-}
 
 // --- monitors -------------------------------------------------------------------------
 

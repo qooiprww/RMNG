@@ -62,6 +62,16 @@ ln -sf /etc/machine-id /var/lib/dbus/machine-id
 log "mask ModemManager (D-Bus activation otherwise hangs Settings)"
 systemctl mask ModemManager.service >/dev/null 2>&1 || true
 
+# Mask RealtimeKit (rtkit-daemon). Same failure class as ModemManager above: in a container it
+# can't create its RT-priority threads (RLIMIT_RTPRIO=0) and comes up wedged during the boot
+# storm — the daemon keeps running but stops answering D-Bus. xdg-desktop-portal reads a
+# RealtimeKit property at startup; against the wedged daemon that call blocks ~25s, so the
+# portal blows its 90s start timeout and lands FAILED — after which every GTK4 app eats ~25s of
+# portal timeouts at launch (file manager >1 min, found live). Headless clones don't need RT
+# audio scheduling, so mask it: the property read fast-fails and the portal starts clean.
+log "mask rtkit-daemon (wedges xdg-desktop-portal → slow GTK app launches; RT unused headless)"
+systemctl mask rtkit-daemon.service >/dev/null 2>&1 || true
+
 # Mask the udev units. In a privileged container systemd-udevd sees the HOST's uevents (it
 # should never manage the host's devices from inside a guest).
 log "mask systemd-udevd + udev-trigger (host uevents)"

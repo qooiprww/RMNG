@@ -512,10 +512,6 @@ fn serve_clone(
             Ok((DaemonMsg::Hello(h), _)) => {
                 tracing::info!("clone-daemon '{}' connected", h.clone_id);
                 handle.conns.lock().unwrap().insert(h.clone_id.clone(), conn.clone());
-                // Every Hello (clone create, daemon restart, control-server boot, or the
-                // unit bounce after a hot-swap) is exactly when a re-check belongs: it's
-                // also the post-swap success verification (re-Hello finds matching hashes).
-                app.swap.request_check(&h.clone_id);
                 clone_id = Some(h.clone_id);
             }
             Ok((DaemonMsg::Frame(f), fds)) => {

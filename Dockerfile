@@ -100,10 +100,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # port dials the local daemon over a unix socket — no SSH anywhere. Clone homes are instead
 # served over SMB by samba's smbd (see smb.rs), so `samba` is added here — it provides smbd +
 # smbpasswd and the vfs_fruit/catia modules smb.conf loads. vah264enc/vapostproc live in the
-# `va` plugin shipped by gstreamer1.0-plugins-bad; pngenc (screenshots) in -good.
+# `va` plugin shipped by gstreamer1.0-plugins-bad; pngenc (screenshots) in -good. The
+# zero-copy GL→VA AVC444 encode bridge needs `glupload` (+ the rest of the GL elements) from
+# libgstopengl.so, which ships in the SEPARATE gstreamer1.0-gl package — omit it and the
+# encoder dies at init with `no element "glupload"` and every viewer hangs on "connected,
+# waiting for video". (The mesa EGL/GBM/gallium userspace the GL context links is already
+# pulled in by va-driver-all, so the plugin package is the only missing piece.)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+      gstreamer1.0-gl \
       libva2 libva-drm2 va-driver-all libdrm2 \
       ca-certificates samba \
  && rm -rf /var/lib/apt/lists/*

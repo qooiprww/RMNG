@@ -14,7 +14,7 @@ One central encoder feeds both the viewer and the agents' screenshots; raw H.264
 
 **Remote Desktop**
 
-- Zero-copy full-chroma 4:4:4 hardware H.264 video pipeline end to end
+- Zero-copy full-chroma 4:4:4 hardware H.264 video pipeline end to end (even on hardware that only support 4:2:0!)
 - Native hardware accelerated viewer on Linux and macOS
 - Full 60fps in local network
 - Multi-monitor
@@ -47,6 +47,8 @@ One central encoder feeds both the viewer and the agents' screenshots; raw H.264
 - Named account groups with sticky rotation
 - Auto-assign (usage + load) at clone creation, auto-swap on exhaustion
 - Pin, or bind a clone to auto / a group / none
+
+
 
 ## Quick start
 

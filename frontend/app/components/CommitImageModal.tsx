@@ -1,6 +1,6 @@
 // Commit a running clone to a new clone-source image (`docker commit` → tagged
-// `rmng/template:<name>`; the name is a bare DNS label, the server prepends the
-// repo). Opened from the camera action on a managed host row. The name prefills
+// `<name>:latest`; the name is a bare DNS label used as the full image repository,
+// no `rmng/template` prefix). Opened from the camera action on a managed host row. The name prefills
 // to the host id (already a DNS label) and is validated to one (mirrors the
 // server's `is_dns_label`). Note: committing bakes the clone's on-disk
 // credentials into the image; the server logs a warning line — surfaced here too.
@@ -47,8 +47,8 @@ export function CommitImageModal({
           Commit <span className="text-emerald-700 dark:text-emerald-400">{hostId}</span> to an image
         </h3>
         <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-          Snapshots this clone's filesystem to a new clone-source image (tagged under{" "}
-          <code>rmng/template</code>). Other clones can then be created from it.
+          Snapshots this clone's filesystem to a new clone-source image (tagged{" "}
+          <code>{trimmed || "…"}:latest</code>). Other clones can then be created from it.
         </p>
 
         <label className="mt-4 block text-xs font-medium text-slate-600 dark:text-slate-300">
@@ -70,7 +70,7 @@ export function CommitImageModal({
             </p>
           ) : (
             <p className="mt-1 text-[11px] font-normal text-slate-400 dark:text-slate-500">
-              → <code>rmng/template:{trimmed || "…"}</code>
+              → <code>{trimmed || "…"}:latest</code>
             </p>
           )}
         </label>
