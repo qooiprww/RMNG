@@ -766,6 +766,9 @@ fn serve_clone(
                     }
                 }
             }
+            // Forward-compat: an unrecognized message from a newer daemon is ignored
+            // rather than dropping the session (a genuine disconnect surfaces as `Err`).
+            Ok((DaemonMsg::Unknown, _)) => {}
             Err(e) => {
                 if let Some(id) = &clone_id {
                     teardown_if_current(&handle.conns, &handle.latest, id, &conn);

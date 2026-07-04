@@ -159,6 +159,12 @@ pub enum DaemonMsg {
     ClipboardRequest(ClipboardRequest),
     /// Bytes for an earlier request (the daemon `SelectionRead` its clone clipboard).
     ClipboardData(ClipboardData),
+    /// An unrecognized message (a `t` tag this build doesn't know). Kept for **forward
+    /// compatibility**: a peer that predates a newer variant deserializes it to `Unknown`
+    /// and ignores it, instead of treating the decode as a fatal error and dropping the
+    /// connection. Never constructed/sent by us — only produced by deserialization.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Clipboard message on the **viewer** protocol (port-1 tag 1), both directions.
@@ -179,12 +185,20 @@ pub enum ServerMsg {
     FrameRequest(FrameRequest),
     Ack(Ack),
     Input(InputMsg),
-    /// Apply a new monitor layout live (no session restart). The daemon diffs against
-    /// its current virtual monitors and adds/stops/recreates only the changed ones.
+    /// Apply a new monitor layout live (no session restart, apps stay open). The daemon
+    /// rebuilds a fresh Mutter session with this set, switches capture + input to it, then
+    /// stops the old session (make-before-break). Sent on the daemon's `Hello` and on every
+    /// `POST /api/layout/activate`.
     SetMonitors { monitors: Vec<crate::control::MonitorSpec> },
     ClipboardOffer(ClipboardOffer),
     ClipboardRequest(ClipboardRequest),
     ClipboardData(ClipboardData),
+    /// An unrecognized message (a `t` tag this build doesn't know). Kept for **forward
+    /// compatibility**: an old daemon deserializes a future server→daemon variant to
+    /// `Unknown` and ignores it, instead of a fatal decode error that would crash-loop it
+    /// (its reader `exit(1)`s on a recv error). Never constructed/sent by us.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Base64 (de)serialization for binary blobs in JSON framing. Swap for raw bytes
@@ -287,5 +301,27 @@ mod tests {
         assert_eq!(v["monitors"][0]["width"], 1920);
         let back: ServerMsg = serde_json::from_value(v).unwrap();
         assert_eq!(back, m);
+    }
+
+    // Forward compatibility: an unknown `t` tag must deserialize to `Unknown` (Ok), NOT an
+    // Err — so an old peer ignores a newer variant instead of treating the decode as a
+    // fatal socket error and dropping the connection.
+    #[test]
+    fn server_msg_unknown_variant_is_ok_not_err() {
+        let back: ServerMsg =
+            serde_json::from_str(r#"{"t":"some_future_variant","foo":42}"#).expect("unknown tag → Ok");
+        assert_eq!(back, ServerMsg::Unknown);
+        // A known variant still round-trips.
+        let ack: ServerMsg = serde_json::from_str(r#"{"t":"ack","monitor_id":1,"seq":7}"#).unwrap();
+        assert!(matches!(ack, ServerMsg::Ack(_)));
+    }
+
+    #[test]
+    fn daemon_msg_unknown_variant_is_ok_not_err() {
+        let back: DaemonMsg =
+            serde_json::from_str(r#"{"t":"some_future_variant","foo":42}"#).expect("unknown tag → Ok");
+        assert_eq!(back, DaemonMsg::Unknown);
+        let hello: DaemonMsg = serde_json::from_str(r#"{"t":"hello","clone_id":"c1"}"#).unwrap();
+        assert!(matches!(hello, DaemonMsg::Hello(_)));
     }
 }
