@@ -128,6 +128,17 @@ pub fn read_upload(data_dir: &str, name: &str) -> Result<(Vec<u8>, &'static str)
 
 // --- detector feedback -----------------------------------------------------
 
+/// The detector-feedback records directory name (`<data_dir>/detector-feedback`): where
+/// `save_detector_feedback` writes and the `feedback` SMB share (`smb.rs`) reads. Single-sourced
+/// here so the writer and the share path can never diverge — mirrors `homes::hosts_root`.
+pub const DETECTOR_FEEDBACK_DIR: &str = "detector-feedback";
+
+/// Lexical root of the detector-feedback records under `data_dir`. Pure (no symlink resolution),
+/// so it's unit-testable; `smb.rs` wraps it with `std::path::absolute` for the share `path`.
+pub fn detector_feedback_root(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join(DETECTOR_FEEDBACK_DIR)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectorFeedback {
@@ -151,7 +162,7 @@ pub fn save_detector_feedback(
     screenshot: Option<&[u8]>,
 ) -> Result<String> {
     let id = rand_hex();
-    let dir = Path::new(data_dir).join("detector-feedback");
+    let dir = detector_feedback_root(data_dir);
     std::fs::create_dir_all(&dir)?;
 
     let mut image = String::new();
@@ -207,5 +218,20 @@ mod tests {
         assert!(read_upload(d, name).is_ok());
         assert!(read_upload(d, "../../etc/passwd").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detector_feedback_root_joins_the_shared_dir_name() {
+        // The on-disk folder name is wire-visible — docs and the `feedback` SMB share path
+        // depend on it — so pin it: a rename must be deliberate, not accidental.
+        assert_eq!(DETECTOR_FEEDBACK_DIR, "detector-feedback");
+        assert_eq!(
+            detector_feedback_root("data"),
+            std::path::Path::new("data/detector-feedback")
+        );
+        assert_eq!(
+            detector_feedback_root("/srv/rmng/data"),
+            std::path::Path::new("/srv/rmng/data/detector-feedback")
+        );
     }
 }
