@@ -30,15 +30,20 @@ use wire::socket::{
 
 use crate::mutter::Session;
 
-/// The session-bound state the input/clipboard tasks need, swapped atomically by the
+/// The session-bound state the input/clipboard/MCP tasks need, swapped atomically by the
 /// reconfigure controller. `rd` injects input; `streams` maps monitor_id → stream path
-/// for absolute-pointer motion (`notify_pointer_motion_absolute(stream, x, y)`).
+/// for absolute-pointer motion (`notify_pointer_motion_absolute(stream, x, y)`); `conn` is
+/// the session bus (shared with Mutter) the MCP window tools eval against.
 ///
-/// Input reads this per event and clipboard reads it per selection op, so a
-/// make-before-break swap (see `reconfigure`) re-points both at the new session by
-/// mutating this one handle. `pub(crate)` so `clipboard::run` can hold the same handle.
+/// Input reads this per event, clipboard reads it per selection op, and the MCP snapshots
+/// it per request, so a make-before-break swap (see `reconfigure`) re-points them all at
+/// the new session by mutating this one handle. Because this handle is the ONLY long-lived
+/// owner of the old `conn`, replacing it on a swap drops the old connection (which unblocks
+/// the clipboard signal-stream re-subscribe). `pub(crate)` so `clipboard::run` + `mcp`
+/// share the same handle.
 pub(crate) struct SessionRuntime {
     pub(crate) rd: mutter::RemoteDesktopSessionProxy<'static>,
+    pub(crate) conn: zbus::Connection,
     pub(crate) streams: std::collections::HashMap<u32, String>,
 }
 pub(crate) type ActiveSession = std::sync::Arc<tokio::sync::Mutex<SessionRuntime>>;
@@ -418,10 +423,11 @@ async fn run_shipping(
     // mutating this one handle (see `reconfigure`).
     let active: ActiveSession = Arc::new(tokio::sync::Mutex::new(SessionRuntime {
         rd: session.rd.clone(),
+        conn: session.conn.clone(),
         streams: session.monitors.iter().map(|m| (m.monitor_id, m.stream_path.clone())).collect(),
     }));
-    // The live monitor set for the MCP task, refreshed by `reconfigure`. Task 3.5 points
-    // `mcp::serve` at this; for now MCP still receives a startup snapshot below.
+    // The live monitor set for the MCP task, refreshed by `reconfigure`. `mcp::serve` reads
+    // this (plus `active`) per request so screenshots/geometry follow a live layout swap.
     let live_monitors: Arc<std::sync::Mutex<Vec<mutter::VirtualMonitor>>> =
         Arc::new(std::sync::Mutex::new(session.monitors.clone()));
 
@@ -536,15 +542,16 @@ async fn run_shipping(
     }
 
     // Per-node computer-use MCP over HTTP: the in-clone agent connects directly and the
-    // control-server's fleet MCP proxies to it. Shares the live Mutter session + frames.
-    // (Task 3.5 re-points this at `live_monitors`; for now it takes a startup snapshot.)
+    // control-server's fleet MCP proxies to it. Reads the CURRENT session (`active`) + live
+    // monitor set per request, so input/screenshots follow a live layout swap AND the old
+    // session's D-Bus conn drops once `active` is repointed (it's the sole long-lived owner).
     {
         let port: u16 =
             std::env::var("RMNG_DAEMON_MCP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(9004);
-        let (rd, conn, mons, latest_mcp, transport_mcp) =
-            (session.rd.clone(), session.conn.clone(), session.monitors.clone(), latest.clone(), transport.clone());
+        let (active_mcp, live_mons_mcp, latest_mcp, transport_mcp) =
+            (active.clone(), live_monitors.clone(), latest.clone(), transport.clone());
         tokio::spawn(async move {
-            if let Err(e) = mcp::serve(rd, conn, &mons, latest_mcp, transport_mcp, port).await {
+            if let Err(e) = mcp::serve(active_mcp, live_mons_mcp, latest_mcp, transport_mcp, port).await {
                 tracing::error!("clone-daemon MCP exited: {e:#}");
             }
         });
@@ -666,10 +673,13 @@ async fn reconfigure(
         );
     }
 
-    // 3. Point input + clipboard at the new session BEFORE dropping the old.
+    // 3. Point input + clipboard + MCP at the new session BEFORE dropping the old. Setting
+    //    `conn` here makes this handle the sole long-lived owner of the old conn, so the old
+    //    connection drops when this scope replaces it (unblocking the clipboard re-subscribe).
     {
         let mut rt = active.lock().await;
         rt.rd = new.rd.clone();
+        rt.conn = new.conn.clone();
         rt.streams = new.monitors.iter().map(|m| (m.monitor_id, m.stream_path.clone())).collect();
     }
 
@@ -694,10 +704,18 @@ async fn reconfigure(
         *m = new_flags;
     }
 
-    // 6. Swap in the new session/capture + refresh the MCP monitor snapshot.
+    // 6. Swap in the new session/capture + refresh the MCP monitor set. Prune `latest`
+    //    frames for monitors that no longer exist (a shrink), so stale dmabuf fds for
+    //    removed monitors don't linger (the MCP also only surfaces `live_monitors`, but this
+    //    frees the fds promptly).
     *session = new;
     *capture = new_capture;
     *live_monitors.lock().unwrap() = session.monitors.clone();
+    {
+        let live: std::collections::HashSet<u32> =
+            session.monitors.iter().map(|m| m.monitor_id).collect();
+        latest.lock().unwrap().retain(|id, _| live.contains(id));
+    }
 
     // 7. Report the applied layout (id == slot) so the viewer re-routes cross-window drags.
     let layout: Vec<MonitorPlacement> = desired
