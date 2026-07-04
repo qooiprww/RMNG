@@ -73,7 +73,7 @@ What each piece is for:
 | `-v rmng-sock:/srv/rmng-sock` | the shared clone **media socket** dir. Load-bearing: this exact **named** volume is mounted into every clone at `/srv/rmng-sock` so clone-daemons reach the media plane. Must be a named volume (not a bind) so clones can share it |
 | `-p 9000-9003:9000-9003` | the web API, video, per-clone MCP, and fleet MCP ports |
 | `-p 9005:9005` | the port-forward data plane (viewer↔clone TCP splice) |
-| `-p 445:445` | the SMB clone-home share (`clones`) — browse every running clone's `/home/rmng` from `smb://<host>/clones` (below) |
+| `-p 445:445` | the SMB shares — `clones` (browse every running clone's `/home/rmng`) and `feedback` (the detector-feedback records) — from `smb://<host>/clones` and `smb://<host>/feedback` (below) |
 
 **There are zero `-e` configuration flags, by design.** `config.json` (edited via the
 wizard / Settings, `PUT /api/config`) is the single source of truth — subnet, hostname
@@ -271,6 +271,11 @@ clone restarts (the PID changes) and prunes stopped/deleted clones. Reach it thr
   Fixed credential → user `rmng`, password `rmng`. **Prerequisite: host port 445 must be free**
   (the `-p 445:445` publish fails clearly if something already holds it). Files you create over
   SMB land owned by the clone's own `rmng` user (uid **1000**).
+- **The `feedback` share** — the same `smbd` also serves the control-server's detector-feedback
+  records (`data/detector-feedback`) as `smb://<host>/feedback`, read-write, same `rmng`/`rmng`
+  credential. Browse or prune the JSON records + screenshots while tuning the detector. Scoped to
+  that folder only (not the whole `data_dir`, which holds the `claude-accounts.json` secret store).
+  Unlike `clones`, it does not need `--pid host`.
 - **From the Docker host** (the same symlink path resolves there, since `/proc/<pid>/root` is
   the clone's rootfs): `/var/lib/docker/volumes/rmng-data/_data/data/hosts/<id>`.
 - **`docker exec`** into the control-server container and browse `data/hosts/`.

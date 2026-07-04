@@ -2,7 +2,8 @@
 //!
 //! One tokio service binding five listen ports — port 1 (video), port 2 (web API + SSE +
 //! static frontend), port 3 (per-clone MCP), port 4 (fleet MCP), and the forward data plane
-//! (9005) — plus an smbd `clones` share on 445 that surfaces every clone's home. All live.
+//! (9005) — plus an smbd serving `clones` (every clone's home) and `feedback` (detector-feedback
+//! records) shares on 445. All live.
 
 mod app;
 mod assets;

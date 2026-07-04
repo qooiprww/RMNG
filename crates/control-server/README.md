@@ -2,7 +2,7 @@
 
 The backend binary — one tokio service that is the **control plane**, the **media plane**,
 and the **fleet-automation plane**. It exposes **five listen ports** (9000 web, 9001 video,
-9002 per-clone MCP, 9003 fleet MCP, 9005 forward) plus an SMB clone-home share on 445, and
+9002 per-clone MCP, 9003 fleet MCP, 9005 forward) plus SMB shares (clones + feedback) on 445, and
 ships as a Docker image; the
 frontend and the `clone-daemon`/`agent-wrapper` binaries are plain on-disk payloads under
 `/usr/local/share/rmng/` (read at runtime, hot-swapped into running clones) — nothing is
@@ -19,7 +19,7 @@ control-server payload at all. Full references: [API](../../docs/API.md) ·
 | **3 — per-clone MCP** | 9002 | HTTP JSON-RPC (header-routed) | the in-clone agent's `set_state` (clone self-identifies via the `x-rmng-clone` header) |
 | **4 — fleet MCP** | 9003 | HTTP JSON-RPC | operator/fleet: web actions (local) + desktop/window tools (proxied to the clone's daemon MCP) |
 | **5 — forward** | 9005 | framed TCP over TCP | the viewer's port-forward data plane: one TCP conn per accepted local socket, spliced to the clone |
-| **SMB** | 445 | SMB (smbd) | the `clones` share — browse every running clone's `/home/rmng` from `smb://<host>/clones` (fixed cred `rmng`/`rmng`) |
+| **SMB** | 445 | SMB (smbd) | two shares (fixed cred `rmng`/`rmng`): `clones` — browse every running clone's `/home/rmng` from `smb://<host>/clones`; `feedback` — the detector-feedback records (`data/detector-feedback`) at `smb://<host>/feedback` |
 
 ## Modules
 
@@ -33,7 +33,7 @@ the local daemon) · `provision` (clone/pull/commit/delete flows over those prim
 hot-swap: hash-check on daemon `Hello` + a periodic sweep) · `linear` · `claude` (usage poll
 + token refresh/push + assign/swap) · `chat` (agent-wrapper proxy + per-host SSE) · `monitor`
 (host poller) · `homes` (clone-home symlinks under `data/hosts/`) · `smb` (smbd supervisor +
-read-write `clones` share over `data/hosts`) · `files`
+read-write `clones` share over `data/hosts` and `feedback` share over `data/detector-feedback`) · `files`
 (notes/uploads/detector-feedback) · `assets` (on-disk clone-daemon/agent-wrapper payloads + the
 served frontend).
 
