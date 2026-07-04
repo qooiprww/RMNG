@@ -252,6 +252,10 @@ pub struct CodexConfig {
     /// fetch — an escape hatch if the unofficial `/wham/usage` shape drifts.
     #[serde(default = "default_true")]
     pub usage_polling: bool,
+    /// When true, auto-spend one banked reset credit once every managed Codex account
+    /// is over the weekly cap with no 7d reset within 24h (see `codex.rs` fleet gate).
+    #[serde(default)]
+    pub auto_reset: bool,
 }
 
 fn default_true() -> bool {
@@ -260,7 +264,7 @@ fn default_true() -> bool {
 
 impl Default for CodexConfig {
     fn default() -> Self {
-        Self { poll_secs: 600, pinned_email: None, usage_polling: true }
+        Self { poll_secs: 600, pinned_email: None, usage_polling: true, auto_reset: false }
     }
 }
 
@@ -599,6 +603,7 @@ mod tests {
         assert_eq!(c.codex.poll_secs, 600);
         assert!(c.codex.pinned_email.is_none());
         assert!(c.codex.usage_polling, "usage_polling defaults to true");
+        assert!(!c.codex.auto_reset, "auto_reset defaults to false");
         assert!(c.codex_groups.is_empty());
         // Missing keys fall back to defaults (older config.json stays valid).
         let d: AppConfig = serde_json::from_str("{}").unwrap();
@@ -607,9 +612,10 @@ mod tests {
         assert!(d.codex_groups.is_empty());
         // usage_polling can be turned off from JSON (camelCase).
         let off: AppConfig =
-            serde_json::from_str(r#"{ "codex": { "pollSecs": 300, "usagePolling": false } }"#).unwrap();
+            serde_json::from_str(r#"{ "codex": { "pollSecs": 300, "usagePolling": false, "autoReset": true } }"#).unwrap();
         assert_eq!(off.codex.poll_secs, 300);
         assert!(!off.codex.usage_polling);
+        assert!(off.codex.auto_reset, "autoReset parses from camelCase JSON");
         // Redaction passes codex + codex_groups through (non-secret).
         let r = AppConfig {
             codex: CodexConfig { poll_secs: 120, usage_polling: false, ..Default::default() },

@@ -14,4 +14,9 @@ pinnedEmail: string | null,
  * tokens and publishes base views (with an explanatory `error`), but skips the usage
  * fetch — an escape hatch if the unofficial `/wham/usage` shape drifts.
  */
-usagePolling: boolean, };
+usagePolling: boolean, 
+/**
+ * When true, auto-spend one banked reset credit once every managed Codex account
+ * is over the weekly cap with no 7d reset within 24h (see `codex.rs` fleet gate).
+ */
+autoReset: boolean, };
