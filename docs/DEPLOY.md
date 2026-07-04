@@ -5,8 +5,8 @@ is itself a container; it drives sibling clone containers through the Docker soc
 unix socket only — no SSH, no Proxmox). Deployment is: run the control-server container →
 open the browser → the first-run **setup wizard** pulls the clone template and finishes setup.
 Everything after that (images, clones, monitor layouts) is driven from the running server's
-dashboard/API — clone binaries stay current on their own, with no manual redeploy step (see
-[Upgrades](#upgrades)).
+dashboard/API/`rmng` CLI — clone binaries are injected at clone-create time by the running
+server, with no manual redeploy step (see [Upgrades](#upgrades)).
 
 > **The clone template's base OS is `ubuntu:26.04`.** 24.04's older mesa negotiates a different
 > DRM modifier than the capture path expects → `no more input formats`. The base OS is fixed in
@@ -21,7 +21,7 @@ dashboard/API — clone binaries stay current on their own, with no manual redep
   control-server VA-API-**encodes** every clone's frames and each clone **captures** its own
   desktop — both need the render node. Validated on the AMD Radeon Pro **W6800**.
 - Ports **9000–9003**, **9005** (port-forward), and **445** (SMB) free (web/API, video,
-  per-clone MCP, fleet MCP, port-forward data plane, clone-home share).
+  per-clone MCP, global MCP, port-forward data plane, clone-home share).
 
 ## 1. Get the image
 
@@ -71,7 +71,7 @@ What each piece is for:
 | `-v /var/run/docker.sock:…` | the daemon the server drives via bollard |
 | `-v rmng-data:/data` | `config.json` + `data/` (WORKDIR is `/data`) — persists setup + state across restarts |
 | `-v rmng-sock:/srv/rmng-sock` | the shared clone **media socket** dir. Load-bearing: this exact **named** volume is mounted into every clone at `/srv/rmng-sock` so clone-daemons reach the media plane. Must be a named volume (not a bind) so clones can share it |
-| `-p 9000-9003:9000-9003` | the web API, video, per-clone MCP, and fleet MCP ports |
+| `-p 9000-9003:9000-9003` | the web API, video, per-clone MCP, and global MCP ports |
 | `-p 9005:9005` | the port-forward data plane (viewer↔clone TCP splice) |
 | `-p 445:445` | the SMB shares — `clones` (browse every running clone's `/home/rmng`) and `feedback` (the detector-feedback records) — from `smb://<host>/clones` and `smb://<host>/feedback` (below) |
 
@@ -213,24 +213,19 @@ The `rmng-data` / `rmng-sock` volumes and every running clone container persist 
 swap. The control-server keeps its static `.2` address, so URLs baked into clones still
 resolve.
 
-**Clone binaries hot-swap themselves — there is no redeploy button, endpoint, or MCP tool.**
-At startup the new control-server hashes the `clone-daemon` + `agent-wrapper` payloads it
-ships (once) and compares that against each clone's on-disk `/opt/rmng/bin/*` two ways:
-immediately when a clone's daemon (re)connects (`Hello`), and on a periodic sweep — first pass
-60 s after boot, then every 5 min (this is what catches a clone whose *stale* daemon is too
-broken to even reconnect). A mismatch bounces just the affected `systemd --user` unit(s)
-(`rmng-clone-daemon.service` / `agent-wrapper.service`) — stop, push the new binary, start —
-never the container or the desktop session (~10 s). A swap that fails is retried with backoff
-(`30s · 2^failures`, capped at 30 min) instead of hammered.
+**Clone binaries are installed at create time — there is no redeploy button, endpoint, or
+hot-swap engine.** The control-server copies its own current payloads (`clone-daemon` +
+`agent-wrapper` → `/opt/rmng/bin`, the `rmng` fleet CLI → `/usr/local/bin/rmng` — see
+[`provision.rs`](../crates/control-server/src/provision.rs) `CLONE_BINARIES`) into every
+clone **before it boots**. That is the **sole delivery path** (the binswap hot-swap engine is
+retired): the template carries none of them, and a fresh clone always runs binaries matching
+the server that created it. **Existing clones keep the binaries they were created with**
+across a control-server upgrade — recreate a clone to move it onto the new binaries (which
+also means clones created before a server that ships the `rmng` CLI don't have it).
 
-Two things worth knowing:
-- **Bouncing `agent-wrapper` drops an in-flight Claude session** — it's swapped immediately,
-  even mid-turn (a deliberate simplicity-over-continuity call; see `binswap.rs`'s module doc
-  for the alternative it declined).
-- **Dev caveat**: the expected hashes are pinned once, at server start. If you restage
-  `crates/control-server/embedded-bin/` while a `cargo run` dev server is already up, it
-  refuses to swap from the drifted bytes (a WARN names the payload) rather than risk a swap
-  loop — restart the dev server after restaging.
+**Dev caveat**: in a `cargo run` dev checkout the payloads come from
+`crates/control-server/embedded-bin/` — with nothing staged there, a clone boots without
+clone-daemon/agent-wrapper (a WARN says so at create time).
 
 ### In-product restart & update (Docker deployment)
 
@@ -372,12 +367,12 @@ AMD-encoded streams).
 Two options for exercising the full clone/capture/encode path against a local Docker daemon:
 
 - **Image loop**: `docker build -t rmng:latest .` then `docker compose up -d` on the GPU
-  host. The new image's `clone-daemon`/`agent-wrapper` reach existing clones on their own —
-  no manual redeploy step; see [Upgrades](#upgrades).
+  host. The new image's `clone-daemon`/`agent-wrapper`/`rmng` CLI reach clones created
+  after the swap (binaries are injected at create time); see [Upgrades](#upgrades).
 - **`cargo run` loop** (fast rebuilds, no image): run `cargo run -p control-server` from the
   checkout on the GPU host. It runs in **dev mode** — no self-container, so it uses the `rmng`
   bridge **gateway `.1`** as its control IP and talks to the local daemon at
-  `/var/run/docker.sock`. For provisioning + hot-swap to work, stage the two payloads into
+  `/var/run/docker.sock`. For clone provisioning to work, stage the payloads into
   `crates/control-server/embedded-bin/` (gitignored) and either `bun run build` the frontend
   (so `frontend/build/client` resolves) or run `bun run dev`. `config.json` + `data/` are
   CWD-relative. The expected hashes are pinned once at server start (see the dev caveat in
@@ -415,7 +410,7 @@ inherits it (there's no per-install control-server payload any more; see
 [Publishing the template](#publishing-the-template)). Details + verification:
 [gnome-patch/README.md](../gnome-patch/README.md).
 
-## Day-2 operations (from the dashboard / API / fleet MCP)
+## Day-2 operations (from the dashboard / API / `rmng` CLI)
 
 - **Clone**: `POST /api/clone` — Linear ticket / new ticket / plain, from a chosen image. The
   new clone is always brought to `config.effective_monitors()` (the active layout preset, or
@@ -435,8 +430,9 @@ inherits it (there's no per-install control-server payload any more; see
 - **Delete**: `POST /api/delete {id}` (stops + removes the container and its
   `rmng-dind-<id>` volume; an unmanaged row is just unregistered).
 
-Clone binaries (`clone-daemon`/`agent-wrapper`) are **not** a manual day-2 op — the
-control-server keeps every running clone in sync on its own; see [Upgrades](#upgrades).
+Most of these are also scriptable from any clone via the `rmng` CLI ([CLI.md](CLI.md)).
+Clone binaries (`clone-daemon`/`agent-wrapper`/the `rmng` CLI) are **not** a day-2 op — the
+control-server installs them at clone-create time; see [Upgrades](#upgrades).
 
 ## Gotchas
 

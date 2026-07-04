@@ -1,28 +1,33 @@
 # control-client
 
-A small reusable Rust client for the control-server's port-2 HTTP/SSE API: a reqwest-based
-client plus an SSE frame reader, typed against [`wire`](../wire/README.md). Used by
-**integration tests** (and any future Rust consumer of `/events`).
-
-> The operator **CLI** that this crate used to back is **replaced by the global MCP
-> (port 4)** — an operator agent or scripts drive everything through MCP tools instead of a
-> bespoke CLI (`control-server-ctl` is retired at cutover). This crate stays as a thin,
-> optional test client; it is **not** on any hot path and can land late.
+The typed HTTP + SSE client for the control-server's **port-2 web API**, shared by the
+[`rmng` fleet CLI](../cli/README.md) and integration tests. Response shapes are the
+[`wire`](../wire/README.md) types verbatim — this crate adds transport + error surfacing,
+never its own schema.
 
 ## What it offers
 
-- `Client` with `get_json`/`post_json`/`open_events()` over plain HTTP (**no TLS feature**,
-  to keep one crypto provider process-wide).
-- A typed SSE stream of `ControlState` from `/events`.
-- The SSE frame parser worth reusing (the clean pieces from the old `control-server-ctl`):
-  `data:`-line accumulation, blank-line frame terminators, `:`-comment/heartbeat handling.
+- `Client::state()` — single-shot `ControlState` via `GET /api/state`, falling back to the
+  first default `/events` frame against a server that predates the endpoint (the fallback
+  triggers on any non-JSON reply, not just 404 — an old server answers unknown routes with
+  the SPA's `index.html`).
+- `Client::events()` — `/events` as a typed `Stream<Item = Result<ControlState>>`: default
+  (unnamed) frames only; named `stats`/`forwards` events and keep-alive comments are skipped.
+- Typed wrappers for the fleet actions: `activate`, `clone_host` (the raw-hostname
+  `POST /api/clone` mode), `delete`, `images`/`image_pull`/`image_commit`/`image_delete`,
+  `claude_swap`/`codex_swap`, `config` (redacted).
+- `SseParser` — incremental SSE frame parser (`event:`/`data:` fields, `:` comment
+  keep-alives, blank-line terminators, chunk-split reassembly incl. multi-byte UTF-8).
+
+Errors: a non-2xx reply surfaces as an `anyhow` error carrying the API's message (handlers
+return either a plain-string body or `{error}` — both are accepted).
 
 ## Dependencies
 
-`reqwest` (async), `wire`, `serde_json`, `anyhow`. (No `clap` — no CLI binary here anymore.)
+`reqwest` (async), `wire`, `futures`, `tokio`, `serde`/`serde_json`, `anyhow`. No CLI here —
+the binary lives in [`crates/cli`](../cli/README.md).
 
 ## Tests
 
-- SSE frame parser unit tests (split frames, comments, heartbeats).
-- Against a running control-server: `/events` decodes to `ControlState`; a `POST
-  /api/activate` round-trips.
+`cargo test -p control-client`: the SSE parser (named vs. default events, comment
+keep-alives, CRLF, frames + multi-byte UTF-8 split across chunks).

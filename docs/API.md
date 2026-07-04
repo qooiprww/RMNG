@@ -19,10 +19,11 @@ disk), the JSON control API, and two SSE streams. It binds `0.0.0.0:{listen.web}
 | Method | Path | Purpose | Success |
 |---|---|---|---|
 | GET | `/events` | Global state SSE (snapshot + diffs) + named `stats` + `forwards` events | 200 SSE `ControlState` |
+| GET | `/api/state` | Single-shot `ControlState` snapshot (no SSE) | 200 `ControlState` |
 | POST | `/api/activate` | Select the host shown in the viewer | 200 `ControlState` |
 | POST | `/api/reorder` | Reorder the host list | 200 `ControlState` |
 | PUT | `/api/hosts/:id/forwards` | Replace a host's port-forward rules | 200 `ControlState` |
-| POST | `/api/clone` | Start a clone from an image (Linear ticket / new ticket / plain) | 200 `{ok, op}` |
+| POST | `/api/clone` | Start a clone from an image (Linear ticket / new ticket / plain / raw hostname) | 200 `{ok, op}` |
 | POST | `/api/layout/activate` | Make a layout preset active and live-apply it to all running clones | 200 `{ok,applied,errors}` |
 | POST | `/api/delete` | Destroy a clone / unregister a plain host | 200 `Operation` |
 | GET | `/api/setup/env` | Setup wizard environment preflight rows | 200 `SetupEnv` |
@@ -66,6 +67,11 @@ are a plain string or `{error}`.
 Subscribe to all control-state changes. Emits a full `ControlState` JSON snapshot
 immediately, then a fresh snapshot on every `store.mutate()`; a `ping` comment every 20 s
 keeps the connection alive. This is what the dashboard subscribes to.
+
+### `GET /api/state`
+The current `ControlState` as a single-shot JSON snapshot — the same document as the first
+default `/events` frame, without opening an SSE stream. For one-off readers (the `rmng` CLI's
+`ps`/`ops`/`account ls`, scripts).
 
 `ControlState` ([control.rs](../crates/wire/src/control.rs)):
 
@@ -131,20 +137,23 @@ Start a clone container from a clone-source image. Runs async — returns an `Op
 immediately; progress flows over `/events`. After the clone is up the server kicks off the
 agent's first message ([chat::kickoff_agent](../crates/control-server/src/chat.rs)).
 
-Body (one of three task modes + optional account/instructions):
+Body (one of four modes + optional account/instructions):
 ```jsonc
 {
   "image": "pegasis0/rmng-template:latest", // required: clone-source image reference (from GET /api/images)
-  // -- pick ONE task mode --
+  // -- pick ONE mode --
   "ticket": "DEV-123",              // existing Linear ticket, OR
   "create": { "team": "dev", "title": "...", "description": "..." },      // new ticket, OR
-  "plain":  { "title": "quick task", "message": "do X" },                 // no ticket
+  "plain":  { "title": "quick task", "message": "do X" },                 // no ticket, OR
+  "hostname": "w-cp-claude",        // raw clone under this exact hostname (fleet CLI mode)
   // -- optional --
   "preset": "<name>" | "auto",      // clone preset (env + Linear key). Ticket mode:
                                     //   absent/"auto" auto-selects by the ticket's labels
                                     //   (400 listing them if nothing matches). Plain mode:
                                     //   REQUIRED while any presets exist. Create mode:
                                     //   REQUIRED (the preset's key creates the ticket).
+                                    //   Hostname mode: OPTIONAL (fleet workers usually
+                                    //   need none; a named preset still applies its env).
   "claudeAccount": "user@anthropic.com" | "auto" | "group:<name>" | "none",
   "codexAccount":  "user@openai.com"  | "auto" | "group:<name>" | "none",
   "agentInstructions": "...",       // extra context for the agent-wrapper
@@ -159,10 +168,15 @@ key>` (auths the clone's `linear` MCP). Hostname is derived (`pega-{ticket}` or 
 plain title, with a numeric suffix on collision). Returns `{ "ok": true, "op": Operation }` or
 `400 {error}`.
 
-> There is no `/api/clone/redeploy` endpoint (and no fleet MCP `redeploy` tool) any more.
-> Clone binaries (`clone-daemon`/`agent-wrapper`) hot-swap themselves automatically — a hash
-> check on the daemon's `Hello` plus a periodic sweep — see
-> [DEPLOY.md#upgrades](DEPLOY.md#upgrades).
+**Hostname mode** (what `rmng clone` sends): the caller owns the exact hostname — a DNS
+label, uniqueness enforced (`400` on a taken name) — with no ticket, no derived display name,
+and no kickoff first message. `claudeAccount`/`codexAccount`/`agentInstructions`/
+`claudeInstructions` still apply.
+
+> There is no `/api/clone/redeploy` endpoint any more. Clone binaries (`clone-daemon`,
+> `agent-wrapper`, the `rmng` CLI) are installed by the control-server at create time, before
+> the container boots — the sole delivery path; a running clone keeps the binaries it was
+> created with — see [DEPLOY.md#upgrades](DEPLOY.md#upgrades).
 
 ### `POST /api/layout/activate` — body `{ "name": string }`
 Make the named layout preset the active one and live-apply it to every running clone — no

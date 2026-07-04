@@ -13,11 +13,11 @@ crate's public Rust API. Sources: [crates/wire/src/socket.rs](../crates/wire/src
 | Name | Default | Override | Listener | Connected by | Transport |
 |---|---|---|---|---|---|
 | video | `9001` | `listen.video` | control-server mediaplane | native viewer | framed H.264/JSON over TCP |
-| web | `9000` | `listen.web` | control-server web | browser / control-client | HTTP + SSE |
+| web | `9000` | `listen.web` | control-server web | browser / `rmng` CLI / control-client | HTTP + SSE |
 | per-clone MCP | `9002` | `listen.clone_mcp` | control-server mcp | in-clone agent-wrapper | HTTP JSON-RPC (header-routed) |
-| fleet MCP | `9003` | `listen.global_mcp` | control-server mcp | operator / fleet agents | HTTP JSON-RPC |
+| global MCP | `9003` | `listen.global_mcp` | control-server mcp | operator / fleet agents (desktop tools) | HTTP JSON-RPC |
 | forward | `9005` | `listen.forward` | control-server mediaplane | native viewer | framed TCP over TCP (one conn per forwarded local socket, spliced to the clone) |
-| daemon MCP | `9004` | `RMNG_DAEMON_MCP_PORT` | clone-daemon | agent-wrapper + fleet MCP proxy | HTTP JSON-RPC |
+| daemon MCP | `9004` | `RMNG_DAEMON_MCP_PORT` | clone-daemon | agent-wrapper + global MCP proxy | HTTP JSON-RPC |
 | agent-wrapper | `4096` | `agent_port` (config) / `AGENT_PORT` | agent-wrapper (in clone) | control-server chat proxy | HTTP + SSE |
 | clone socket | `/srv/rmng-sock/clones.sock` | `cloneSocket` config (server) / `RMNG_SOCKET` (daemon) | control-server mediaplane | clone-daemon | unix `SOCK_SEQPACKET` + `SCM_RIGHTS` |
 

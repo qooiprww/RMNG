@@ -335,7 +335,7 @@ async fn clone_container_after_create(
         .iter()
         .filter_map(|b| {
             crate::assets::payload(b.payload).map(|data| TarEntry {
-                path: format!("opt/rmng/bin/{}", b.bin),
+                path: format!("{}/{}", b.dir, b.bin),
                 data,
                 mode: 0o755,
                 uid: 0,
@@ -722,22 +722,30 @@ pub async fn delete_clone(
 // --- clone binaries -------------------------------------------------------------------
 
 /// One binary the control-server installs into every clone before boot: the
-/// [`crate::assets::payload`] name to resolve its bytes, and the on-disk name under
-/// `/opt/rmng/bin` the `systemd --user` unit execs. The dir is pre-created 0755 root:root by
-/// `template/setup/30-user.sh`; the template itself no longer carries these binaries — the
-/// control-server is their sole source, installed at create time (see
-/// [`clone_container_after_create`]). That replaces the retired hash-check / hot-swap engine.
+/// [`crate::assets::payload`] name to resolve its bytes, and where it lands on the clone
+/// filesystem. The service binaries go under `/opt/rmng/bin` (pre-created 0755 root:root by
+/// `template/setup/30-user.sh`; the `systemd --user` units exec them by absolute path); the
+/// `rmng` CLI goes to `/usr/local/bin` so it's on every shell's PATH (`/opt/rmng/bin` is
+/// not). The template itself no longer carries any of these — the control-server is their
+/// sole source, installed at create time (see [`clone_container_after_create`]). That
+/// replaces the retired hash-check / hot-swap engine.
 pub struct CloneBinary {
-    /// Asset name passed to [`crate::assets::payload`] (`clone-daemon`, `agent-wrapper`).
+    /// Asset name passed to [`crate::assets::payload`] (`clone-daemon`, `agent-wrapper`,
+    /// `rmng-cli`).
     pub payload: &'static str,
-    /// The installed binary name under `/opt/rmng/bin` (what the unit execs).
+    /// The installed binary name (what the unit execs / the shell resolves).
     pub bin: &'static str,
+    /// Install dir, tar-archive relative (no leading slash).
+    pub dir: &'static str,
 }
 
 /// The binaries injected into every clone at create time.
 pub const CLONE_BINARIES: &[CloneBinary] = &[
-    CloneBinary { payload: "clone-daemon", bin: "rmng-clone-daemon" },
-    CloneBinary { payload: "agent-wrapper", bin: "agent-wrapper" },
+    CloneBinary { payload: "clone-daemon", bin: "rmng-clone-daemon", dir: "opt/rmng/bin" },
+    CloneBinary { payload: "agent-wrapper", bin: "agent-wrapper", dir: "opt/rmng/bin" },
+    // The fleet CLI: talks to this control-server via RMNG_CONTROL_URL (preset into every
+    // clone's session env), so in-clone agents can manage the fleet with plain commands.
+    CloneBinary { payload: "rmng-cli", bin: "rmng", dir: "usr/local/bin" },
 ];
 
 // --- claude-import backend ------------------------------------------------------------

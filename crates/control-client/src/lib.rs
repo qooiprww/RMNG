@@ -1,11 +1,11 @@
-//! Thin HTTP + SSE client for the control-server port-2 API, typed against
-//! [`wire`]. Used by integration tests (the operator CLI is replaced by port 4).
-//!
-//! Fleshed out alongside Phase 2; for now it exposes a minimal typed `/events`
-//! reader and JSON helpers.
+//! Typed HTTP + SSE client for the control-server port-2 web API, shared by the
+//! `rmng` fleet CLI and integration tests. Response shapes are the [`wire`] types
+//! verbatim — this crate adds transport + error surfacing, never its own schema.
 
-use anyhow::Result;
-use wire::ControlState;
+use anyhow::{Result, anyhow, bail};
+use futures::{Stream, StreamExt};
+use serde_json::{Value, json};
+use wire::{AppConfigRedacted, ControlState, ImageInfo, Operation};
 
 /// A connected control-server client.
 #[derive(Clone)]
@@ -15,25 +15,336 @@ pub struct Client {
 }
 
 impl Client {
+    /// `base` is the web-API origin, e.g. `http://rmng-control:9000` (no trailing slash).
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: reqwest::Client::new() }
+        let base = base.into().trim_end_matches('/').to_string();
+        Self {
+            base,
+            http: reqwest::Client::new(),
+        }
     }
 
-    /// Fetch the current state by reading the first `/events` frame.
-    pub async fn state_once(&self) -> Result<ControlState> {
-        let body = self
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Surface a non-2xx response as an error carrying the API's message. Handlers
+    /// return either a plain-string body or `{ "error": … }` — accept both.
+    async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or(body);
+        bail!("{status}: {}", msg.trim())
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let resp = self.http.get(format!("{}{path}", self.base)).send().await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
+    async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .json(body)
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
+    /// Current fleet state, single-shot. `GET /api/state`; falls back to reading the
+    /// first default `/events` frame against a server predating the endpoint. That
+    /// fallback triggers on a non-JSON reply, not just 404 — an old server serves the
+    /// frontend's index.html (200, text/html) for any unknown route via the SPA
+    /// fallback.
+    pub async fn state(&self) -> Result<ControlState> {
+        let resp = self
+            .http
+            .get(format!("{}/api/state", self.base))
+            .send()
+            .await?;
+        let json_ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.starts_with("application/json"))
+            .unwrap_or(false);
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || (resp.status().is_success() && !json_ct)
+        {
+            let mut events = self.events().await?;
+            return events
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("event stream ended before a state frame"))?;
+        }
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
+    /// The `/events` SSE stream, filtered to the default (unnamed) frames = full
+    /// [`ControlState`] snapshots: one on connect, then one per change. Named events
+    /// (`stats`, `forwards`) and keep-alive comments are skipped.
+    pub async fn events(&self) -> Result<impl Stream<Item = Result<ControlState>> + Unpin> {
+        let resp = self
             .http
             .get(format!("{}/events", self.base))
             .header("accept", "text/event-stream")
             .send()
-            .await?
-            .text()
             .await?;
-        // First `data:` line is the initial full-state frame.
-        let line = body
-            .lines()
-            .find_map(|l| l.strip_prefix("data:"))
-            .ok_or_else(|| anyhow::anyhow!("no data frame"))?;
-        Ok(serde_json::from_str(line.trim())?)
+        let resp = Self::check(resp).await?;
+        let bytes = resp.bytes_stream();
+        let stream = futures::stream::unfold(
+            (
+                bytes,
+                SseParser::default(),
+                std::collections::VecDeque::new(),
+            ),
+            |(mut bytes, mut parser, mut queue)| async move {
+                loop {
+                    if let Some(item) = queue.pop_front() {
+                        return Some((item, (bytes, parser, queue)));
+                    }
+                    match bytes.next().await {
+                        Some(Ok(chunk)) => {
+                            for ev in parser.push(&chunk) {
+                                if ev.event.is_none() {
+                                    queue.push_back(
+                                        serde_json::from_str::<ControlState>(&ev.data)
+                                            .map_err(|e| anyhow!("bad state frame: {e}")),
+                                    );
+                                }
+                            }
+                        }
+                        Some(Err(e)) => return Some((Err(e.into()), (bytes, parser, queue))),
+                        None => return None,
+                    }
+                }
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+
+    /// Select the host shown in the viewer (`None` clears the selection).
+    pub async fn activate(&self, id: Option<&str>) -> Result<ControlState> {
+        self.post_json("/api/activate", &json!({ "id": id })).await
+    }
+
+    /// Raw hostname clone (`POST /api/clone` hostname mode). Optional Claude/Codex
+    /// account selections (`email` / `"auto"` / `"group:<name>"` / `"none"`) and preset.
+    pub async fn clone_host(
+        &self,
+        image: &str,
+        hostname: &str,
+        claude: Option<&str>,
+        codex: Option<&str>,
+        preset: Option<&str>,
+    ) -> Result<Operation> {
+        let mut body = json!({ "image": image, "hostname": hostname });
+        let obj = body.as_object_mut().unwrap();
+        if let Some(a) = claude {
+            obj.insert("claudeAccount".into(), json!(a));
+        }
+        if let Some(a) = codex {
+            obj.insert("codexAccount".into(), json!(a));
+        }
+        if let Some(p) = preset {
+            obj.insert("preset".into(), json!(p));
+        }
+        let v: Value = self.post_json("/api/clone", &body).await?;
+        Ok(serde_json::from_value(
+            v.get("op")
+                .cloned()
+                .ok_or_else(|| anyhow!("clone reply missing op"))?,
+        )?)
+    }
+
+    /// Destroy a managed clone (or unregister a plain host).
+    pub async fn delete(&self, id: &str) -> Result<Operation> {
+        self.post_json("/api/delete", &json!({ "id": id })).await
+    }
+
+    /// The clone-source images.
+    pub async fn images(&self) -> Result<Vec<ImageInfo>> {
+        self.get_json("/api/images").await
+    }
+
+    /// Pull the clone template (`None` = the configured default reference).
+    pub async fn image_pull(&self, reference: Option<&str>) -> Result<Operation> {
+        self.post_json("/api/images/pull", &json!({ "reference": reference }))
+            .await
+    }
+
+    /// Commit a running clone to a new clone-source image `<name>:latest`.
+    pub async fn image_commit(&self, host: &str, name: &str) -> Result<Operation> {
+        self.post_json("/api/images/commit", &json!({ "host": host, "name": name }))
+            .await
+    }
+
+    /// Remove a clone-source image (409 when in use).
+    pub async fn image_delete(&self, reference: &str) -> Result<()> {
+        let _: Value = self
+            .post_json("/api/images/delete", &json!({ "reference": reference }))
+            .await?;
+        Ok(())
+    }
+
+    /// Hot-swap a clone's Claude account. Returns the API's `{ ok, account, group, selection }`.
+    pub async fn claude_swap(&self, host: &str, account: &str) -> Result<Value> {
+        self.post_json(
+            "/api/claude/swap",
+            &json!({ "host": host, "account": account }),
+        )
+        .await
+    }
+
+    /// Hot-swap a clone's Codex account.
+    pub async fn codex_swap(&self, host: &str, account: &str) -> Result<Value> {
+        self.post_json(
+            "/api/codex/swap",
+            &json!({ "host": host, "account": account }),
+        )
+        .await
+    }
+
+    /// The redacted server config (presets, account groups, docker settings — no secrets).
+    pub async fn config(&self) -> Result<AppConfigRedacted> {
+        self.get_json("/api/config").await
+    }
+}
+
+/// One parsed SSE event: optional `event:` name + the joined `data:` payload.
+#[derive(Debug, PartialEq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// Incremental server-sent-events parser. Feed raw chunks; complete events come out.
+/// Handles the subset the control-server emits: `event:`/`data:` fields, comment
+/// keep-alives (`: ping`), events terminated by a blank line. Buffers bytes so a
+/// UTF-8 code point or line split across chunks reassembles correctly (`\n` is
+/// single-byte in UTF-8, so splitting on it never lands inside a code point).
+#[derive(Default)]
+pub struct SseParser {
+    buf: Vec<u8>,
+    event: Option<String>,
+    data: Vec<String>,
+}
+
+impl SseParser {
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        // Consume complete lines; keep the trailing partial line buffered.
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                // Blank line = event boundary.
+                if !self.data.is_empty() {
+                    out.push(SseEvent {
+                        event: self.event.take(),
+                        data: self.data.join("\n"),
+                    });
+                    self.data.clear();
+                } else {
+                    self.event = None;
+                }
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                self.data
+                    .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            } else if let Some(rest) = line.strip_prefix("event:") {
+                self.event = Some(rest.trim().to_string());
+            }
+            // Comments (leading ':') and unknown fields are ignored per the SSE spec.
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+
+    fn parse_all(chunks: &[&str]) -> Vec<SseEvent> {
+        let mut p = SseParser::default();
+        chunks.iter().flat_map(|c| p.push(c.as_bytes())).collect()
+    }
+
+    #[test]
+    fn parses_default_event() {
+        let evs = parse_all(&["data: {\"hosts\":[]}\n\n"]);
+        assert_eq!(
+            evs,
+            vec![SseEvent {
+                event: None,
+                data: "{\"hosts\":[]}".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_named_event_and_keeps_name() {
+        let evs = parse_all(&["event: stats\ndata: {}\n\n"]);
+        assert_eq!(
+            evs,
+            vec![SseEvent {
+                event: Some("stats".into()),
+                data: "{}".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn skips_keepalive_comments() {
+        let evs = parse_all(&[": ping\n\n", "data: 1\n\n"]);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "1");
+    }
+
+    #[test]
+    fn reassembles_events_split_across_chunks() {
+        let evs = parse_all(&["data: {\"sel", "ected\":null}", "\n", "\n"]);
+        assert_eq!(
+            evs,
+            vec![SseEvent {
+                event: None,
+                data: "{\"selected\":null}".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn name_does_not_leak_into_next_event() {
+        let evs = parse_all(&["event: stats\ndata: a\n\ndata: b\n\n"]);
+        assert_eq!(evs[0].event.as_deref(), Some("stats"));
+        assert_eq!(evs[1].event, None);
+    }
+
+    #[test]
+    fn handles_crlf_lines() {
+        let evs = parse_all(&["data: x\r\n\r\n"]);
+        assert_eq!(evs[0].data, "x");
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_chunks_survives() {
+        let s = "data: {\"note\":\"éclair\"}\n\n".as_bytes();
+        let (a, b) = s.split_at(13); // splits inside the two-byte 'é'
+        let mut p = SseParser::default();
+        let mut evs = p.push(a);
+        evs.extend(p.push(b));
+        assert_eq!(evs[0].data, "{\"note\":\"éclair\"}");
     }
 }
