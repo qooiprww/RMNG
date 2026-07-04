@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Multipart, Path as AxPath, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxPath, State},
     http::{StatusCode, header},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
@@ -107,7 +107,13 @@ pub fn router(app: App) -> Router {
         }
     };
 
-    routes.layer(TraceLayer::new_for_http()).with_state(app)
+    // 64MB body cap (axum defaults to 2MB): the multipart routes carry full-resolution
+    // clone screenshots — detector feedback evidence (~6MB PNG at 2560x1440) and note
+    // uploads. LAN-only service; JSON routes are unaffected in practice.
+    routes
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http())
+        .with_state(app)
 }
 
 pub async fn serve(app: App) -> anyhow::Result<()> {
