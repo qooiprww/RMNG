@@ -23,6 +23,7 @@ mod mediaplane;
 mod monitor;
 mod provision;
 mod smb;
+mod ssh;
 mod state;
 mod update;
 mod web;
@@ -165,6 +166,7 @@ async fn main() -> Result<()> {
     tokio::spawn(monitor::run(app.clone()));
     tokio::spawn(homes::run(app.clone()));
     tokio::spawn(smb::run(app.clone()));
+    tokio::spawn(ssh::run(app.clone()));
 
     // Port 1 (video) — ingest clone dmabufs, VA-API encode, serve the viewer.
     mediaplane::spawn(app.clone());

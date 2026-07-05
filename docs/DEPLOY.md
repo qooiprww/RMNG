@@ -20,8 +20,9 @@ server, with no manual redeploy step (see [Upgrades](#upgrades)).
 - A **GPU render node** `/dev/dri/renderD128` on the host (AMD radeonsi/Mesa VA-API). The
   control-server VA-API-**encodes** every clone's frames and each clone **captures** its own
   desktop — both need the render node. Validated on the AMD Radeon Pro **W6800**.
-- Ports **9000–9003**, **9005** (port-forward), and **445** (SMB) free (web/API, video,
-  per-clone MCP, global MCP, port-forward data plane, clone-home share).
+- Ports **9000–9003**, **9005** (port-forward), **445** (SMB), and **2222** (SSH bastion) free
+  (web/API, video, per-clone MCP, global MCP, port-forward data plane, clone-home share, jump
+  into clones).
 
 ## 1. Get the image
 
@@ -58,7 +59,7 @@ and run `docker compose up -d` (no `--build`). The equivalent one-liner off the 
 docker run -d --name rmng --privileged --init --pid host --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v rmng-data:/data -v rmng-sock:/srv/rmng-sock \
-  -p 9000-9003:9000-9003 -p 9005:9005 -p 445:445 pegasis0/rmng
+  -p 9000-9003:9000-9003 -p 9005:9005 -p 445:445 -p 2222:2222 pegasis0/rmng
 ```
 
 What each piece is for:
@@ -74,6 +75,7 @@ What each piece is for:
 | `-p 9000-9003:9000-9003` | the web API, video, per-clone MCP, and global MCP ports |
 | `-p 9005:9005` | the port-forward data plane (viewer↔clone TCP splice) |
 | `-p 445:445` | the SMB shares — `clones` (browse every running clone's `/home/rmng`) and `feedback` (the detector-feedback records) — from `smb://<host>/clones` and `smb://<host>/feedback` (below) |
+| `-p 2222:2222` | the SSH bastion — jump host for `ssh`/`scp`/`rsync`/VSCode Remote-SSH into any clone's own `sshd` (see [SSH into clones](#ssh-into-clones)) |
 
 **There are zero `-e` configuration flags, by design.** `config.json` (edited via the
 wizard / Settings, `PUT /api/config`) is the single source of truth — subnet, hostname
@@ -277,6 +279,80 @@ clone restarts (the PID changes) and prunes stopped/deleted clones. Reach it thr
 
 Omit `--pid host` and this feature is simply off (the server logs a one-time hint per clone);
 nothing else is affected.
+
+## SSH into clones
+
+Every clone runs a real `sshd` on `:22` (internal `rmng` network only — never host-published).
+The control-server runs a locked-down, jump-only bastion `sshd` on host port **2222**
+(`listen.bastion`, see [PROTOCOL.md](PROTOCOL.md)), reusing the existing `rmng` account, that
+forwards only to live clones' `:22`. There is no separate SSH login/account model to manage —
+one public key list, installed on both the bastion and every clone.
+
+**Setup (one time per key):**
+
+1. **Settings → SSH Access** — paste a public key (or several, one per line) and save.
+2. The key is installed on the bastion's `authorized_keys` and pushed to every managed clone.
+   This propagates to already-**running** clones within **~10 s** (the periodic reconciler), or
+   **immediately** on save (an explicit apply is triggered by the config write) — no clone
+   restart needed.
+
+**Connecting:**
+
+- **From a clone's row in the UI**: click **Copy SSH command**, then paste into a terminal and
+  hit enter.
+- **From the CLI**: `rmng ssh <clone-id>` prints the same ready-to-paste command (see
+  [CLI.md](CLI.md)).
+- Either way the command is:
+
+  ```sh
+  ssh -J rmng@<control-host>:2222 -o StrictHostKeyChecking=accept-new rmng@<clone-id>
+  ```
+
+  `<control-host>` is the control-server's inferred public address (`ssh.publicHost`, override
+  in Settings if the auto-detected host/IP is wrong); `<clone-id>` is the clone's host id (its
+  Docker DNS name on the `rmng` network). `-J` jumps through the bastion on `:2222` and
+  terminates at the clone's own `sshd` on `:22` — a real end-to-end SSH session, not a shell
+  inside the bastion.
+
+**It's just SSH**, so anything that takes an `ssh` command string works unchanged:
+
+- `scp -J rmng@<control-host>:2222 <file> rmng@<clone-id>:~/` / `rsync -e 'ssh -J
+  rmng@<control-host>:2222' <src> rmng@<clone-id>:~/dst`
+- `GIT_SSH_COMMAND='ssh -J rmng@<control-host>:2222' git clone rmng@<clone-id>:~/repo.git`
+- VS Code **Remote-SSH: Add New SSH Host…** → paste the same one-liner → connect.
+
+**Host keys are stable** (control-server-generated and persisted, both the bastion's and each
+clone's), so there is no risk of silently trusting a rotated key — neither the bastion's nor a
+clone's changes under normal operation. `-o StrictHostKeyChecking=accept-new` silences the
+prompt for the **clone's** key (the final hop, which the command-line option governs). OpenSSH's
+`-J` does **not** apply that option to the **jump host** (the bastion), so on the very first
+connection your ssh client asks you to confirm the bastion's key once (`Are you sure you want to
+continue connecting?` → `yes`); every connection after that is silent. To skip even that one
+prompt, pre-seed it with `ssh-keyscan -p 2222 <control-host> >> ~/.ssh/known_hosts`.
+
+**Gotcha: clones created before the template rebuilt with `sshd` have no `sshd` to jump to.**
+`ssh -J` will connect to the bastion fine but the clone hop will fail (connection refused on
+`:22`) — recreate the clone from the current template to pick up `sshd`.
+
+### Verify (manual)
+
+This flow's real end-to-end behavior — a laptop actually reaching a clone's shell through the
+bastion — needs a laptop with a matching private key and the W6800 box (CT 106) running the
+rebuilt template, so it isn't exercised in CI or in this dev environment. To confirm it after a
+deploy:
+
+```bash
+# 1. paste a pubkey in Settings → SSH Access, save.
+# 2. create/recreate a clone from the rebuilt template.
+# 3. from a laptop whose private key matches:
+ssh -J rmng@<control-host>:2222 -o StrictHostKeyChecking=accept-new rmng@<clone-id> 'hostname; id'
+scp -J rmng@<control-host>:2222 /etc/hostname rmng@<clone-id>:~/from-laptop
+# 4. VSCode: Remote-SSH: Add New SSH Host… → paste the ssh command → connect.
+# 5. add a second key in the UI; confirm `ssh` works within ~10s WITHOUT recreating the clone.
+```
+
+Expected: command 3 runs with no host-key prompt; the `scp` lands the file; VSCode connects; the
+key added in step 5 works against the already-running clone without recreating it.
 
 ## Clone `/proc` limits (lxcfs)
 

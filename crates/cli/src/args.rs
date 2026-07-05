@@ -78,6 +78,11 @@ pub enum Cmd {
         #[arg(long, default_value_t = 600)]
         timeout: u64,
     },
+    /// Print the ready-to-paste `ssh` command for a clone (jump via the control-server bastion)
+    Ssh {
+        /// Host id of the clone
+        host: String,
+    },
 }
 
 /// `--wait [--timeout N]` shared by the operation-starting commands.

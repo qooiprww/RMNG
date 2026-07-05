@@ -34,6 +34,9 @@ log "headless GNOME + Mutter + VA-API + PipeWire (NO gdm/g-r-d)"
 # the tool fails with `no element "vapostproc"` and the agent can't see the screen.
 # `sudo` is explicit: the ubuntu:26.04 DOCKER image ships without it (the old LXC template
 # had it), and the rmng sudoers drop-in (phase 30) needs /etc/sudoers.d to exist.
+# `openssh-server` here (not a new phase): this is the load-bearing base-system apt install,
+# the same rarest-changing layer sshd belongs to; its hardening + host-key strip live in the
+# Dockerfile tail (host keys must not be baked — the control-server injects one per clone).
 apt-get install -y -qq \
   sudo \
   gnome-session gnome-shell mutter ptyxis nautilus gnome-text-editor loupe \
@@ -41,7 +44,8 @@ apt-get install -y -qq \
   mesa-va-drivers libva2 va-driver-all vainfo \
   pipewire wireplumber gstreamer1.0-pipewire \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  fonts-cantarell adwaita-icon-theme jq
+  fonts-cantarell adwaita-icon-theme jq \
+  openssh-server
 
 # Default terminal → Ptyxis (installed above in place of gnome-console; gnome-shell doesn't
 # Recommend Console, so dropping it from the list is enough — nothing pulls it back).

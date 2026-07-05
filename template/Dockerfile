@@ -99,12 +99,35 @@ RUN /setup/20-toolbox.sh
 COPY template/setup/30-user.sh /setup/30-user.sh
 RUN USERNAME="$USERNAME" MONITORS="$MONITORS" CLONE_SOCKET="$CLONE_SOCKET" /setup/30-user.sh
 
+# Clone sshd: pubkey-only, no root, no passwords. Host keys are NOT baked — the
+# control-server injects a unique persisted key per clone at provision (like machine-id).
+# `systemctl enable ssh` resolves to ssh.service; Ubuntu 26.04's openssh-server postinst
+# already enables ssh.socket (socket activation) by default, so both end up enabled — this
+# is the standard dual-enable (verified live: systemd hands ssh.service the socket's
+# already-bound fd, no port-22 conflict) and works whichever unit the clone ends up starting
+# from. `systemctl enable` here is a pure unit-file symlink op (no running systemd/bus needed
+# at build time — same category as the `systemctl mask` calls in 10-desktop.sh), so it
+# doesn't require SYSTEMD_OFFLINE.
+RUN mkdir -p /etc/ssh/sshd_config.d \
+ && printf '%s\n' \
+      'PasswordAuthentication no' \
+      'PermitRootLogin no' \
+      'KbdInteractiveAuthentication no' \
+      'PubkeyAuthentication yes' \
+      'AllowUsers rmng' \
+      'X11Forwarding no' \
+      > /etc/ssh/sshd_config.d/10-rmng.conf \
+ && systemctl enable ssh
+
 # Tail: drop apt caches, blank /etc/machine-id (a fresh id is regenerated per clone on first
-# boot — a baked id would give the whole fleet one identity), and assert the clone user is
-# uid 1000 (the tar owner mapping for home/<user>/** depends on it).
+# boot — a baked id would give the whole fleet one identity), strip baked ssh host keys (the
+# control-server injects a unique persisted key per clone at provision — a shared baked key
+# would give the whole fleet one identity, exactly like machine-id), and assert the clone
+# user is uid 1000 (the tar owner mapping for home/<user>/** depends on it).
 RUN apt-get clean \
  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
  && : > /etc/machine-id \
+ && rm -f /etc/ssh/ssh_host_* \
  && [ "$(id -u "$USERNAME")" = 1000 ]
 
 # Image config (matches DockerCtl::commit's set_boot_config + the rmng.image/rmng.base
