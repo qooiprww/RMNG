@@ -874,6 +874,10 @@ async fn config_put(
         }
     }
     *app.cfg.write().unwrap() = merged.clone();
+    // Propagate any SSH key change to the bastion + running clones immediately.
+    if old.ssh.authorized_keys != merged.ssh.authorized_keys {
+        crate::ssh::apply_now(&app).await;
+    }
     // Keep the sidebar's live layout list/active marker in sync with the just-saved presets.
     mirror_layout_to_state(&app);
     let resp = ConfigPutResponse { restart_required, config: merged.redacted() };

@@ -257,6 +257,16 @@ async fn push_keys_to_clones(app: &App, data_dir: &str, pushed: &mut HashMap<Str
     }
 }
 
+/// One-shot apply used by the config PUT path so a key add/remove propagates immediately
+/// rather than waiting for the reconcile tick. Rewrites the bastion `authorized_keys`
+/// (read fresh by sshd per connection — no reload needed) and pushes to running clones.
+pub async fn apply_now(app: &App) {
+    let data_dir = app.config().data_dir.clone();
+    render_bastion_files(app, &data_dir);
+    let mut once = std::collections::HashMap::new();
+    push_keys_to_clones(app, &data_dir, &mut once).await;
+}
+
 fn spawn_sshd() -> std::io::Result<Child> {
     // `-D` foreground, `-e` log to stderr so the supervisor's pipe sees failures.
     Command::new("/usr/sbin/sshd")
@@ -481,6 +491,14 @@ mod tests {
         assert_eq!(backoff(4).as_secs(), 240);
         assert_eq!(backoff(10).as_secs(), 300); // capped
         assert_eq!(backoff(u32::MAX).as_secs(), 300); // saturating
+    }
+
+    #[test]
+    fn changing_keys_changes_rendered_authorized_keys() {
+        assert_ne!(
+            render_authorized_keys(&["ssh-ed25519 A a".into()]),
+            render_authorized_keys(&["ssh-ed25519 B b".into()])
+        );
     }
 
     #[test]
