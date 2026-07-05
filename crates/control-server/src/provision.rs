@@ -321,6 +321,7 @@ async fn clone_container_after_create(
     on_progress: &mut impl FnMut(&str, &str),
 ) -> Result<()> {
     let docker = &app.docker;
+    let cfg = app.config();
 
     // Install the clone binaries while the container is still STOPPED, into the
     // `/opt/rmng/bin` dir the template pre-creates (30-user.sh) but leaves EMPTY — the template
@@ -405,6 +406,16 @@ async fn clone_container_after_create(
             gid: 0,
         });
     }
+    // SSH: the clone's stable host key + the current authorized_keys, so `ssh -J … rmng@<id>`
+    // works the moment the clone is up. The template pre-created ~rmng/.ssh (700) and ships
+    // no host keys, so these land with the right owner/perms. Best-effort: a keygen failure
+    // must not fail the whole clone — log and continue (SSH just won't work until the next
+    // reconcile push).
+    match crate::ssh::clone_ssh_tar_entries(&cfg.data_dir, hostname, &cfg.ssh.authorized_keys) {
+        Ok(mut ssh_entries) => entries.append(&mut ssh_entries),
+        Err(e) => tracing::warn!("clone {hostname}: ssh material skipped: {e}"),
+    }
+
     on_progress("inject", "injecting machine-id + preset env + PATH rc");
     docker.upload_tar(container, entries).await?;
 
@@ -847,6 +858,21 @@ mod tests {
         assert_eq!(resolve_reference(&images, ""), None);
         // Empty image list → None.
         assert_eq!(resolve_reference(&[], "rmng/template:base"), None);
+    }
+
+    #[test]
+    fn provision_uses_ssh_clone_entries_contract() {
+        // Guards that provision's SSH injection targets the clone-user .ssh path (the template
+        // pre-creates it 700). If this path ever changes, StrictModes will reject the key.
+        if std::process::Command::new("ssh-keygen").arg("-?").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rmng-prov-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = crate::ssh::clone_ssh_tar_entries(dir.to_str().unwrap(), "c1", &["ssh-ed25519 A a".into()])
+            .unwrap();
+        assert!(e.iter().any(|t| t.path == "home/rmng/.ssh/authorized_keys" && t.mode == 0o600 && t.uid == 1000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
