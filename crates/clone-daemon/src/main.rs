@@ -37,10 +37,10 @@ use crate::mutter::Session;
 ///
 /// Input reads this per event, clipboard reads it per selection op, and the MCP snapshots
 /// it per request, so a make-before-break swap (see `reconfigure`) re-points them all at
-/// the new session by mutating this one handle. Because this handle is the ONLY long-lived
-/// owner of the old `conn`, replacing it on a swap drops the old connection (which unblocks
-/// the clipboard signal-stream re-subscribe). `pub(crate)` so `clipboard::run` + `mcp`
-/// share the same handle.
+/// the new session by mutating this one handle. NB: replacing `conn` here does NOT close
+/// the old connection — the clipboard signal tasks hold proxy clones of it while parked in
+/// `sig.next()` — so `reconfigure` close()es it explicitly to end those streams and trigger
+/// their re-subscribe. `pub(crate)` so `clipboard::run` + `mcp` share the same handle.
 pub(crate) struct SessionRuntime {
     pub(crate) rd: mutter::RemoteDesktopSessionProxy<'static>,
     pub(crate) conn: zbus::Connection,
@@ -798,6 +798,15 @@ async fn reconfigure(
     //    connectors crashed gnome-shell live), then position the new monitors. Only
     //    after settle do just the new connectors exist, making the match unambiguous.
     let _ = session.stop().await;
+    // Explicitly CLOSE the old session's bus connection. Refcount-drop can never close
+    //    it: the clipboard signal tasks are parked in `sig.next()` holding proxy clones
+    //    of this very connection, so without close() their streams never end, they never
+    //    re-subscribe against the NEW session in `active`, and both signal-driven flows
+    //    (clone copy → offer, clone paste → transfer) stay wired to the dead session's
+    //    object path forever (found live: bus match rules pinned to .../Session/u1 while
+    //    the current session was u2). close() ends those streams (→ `None`) and reclaims
+    //    the old fd + bus match rules.
+    let _ = session.conn.clone().close().await;
     wait_monitors_settle(desired.len()).await;
     apply_layout(desired).await;
 

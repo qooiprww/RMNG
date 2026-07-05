@@ -44,6 +44,10 @@ pub enum FromServer {
 /// signal streams when they end), so it follows the make-before-break session swap: after
 /// a swap the old session's rd is stopped, and all ops must target the new one. The new
 /// session's clipboard is enabled by `reconfigure` (`EnableClipboard` on the new rd).
+///
+/// The signal streams (flows 1 & 4) only end because `reconfigure` explicitly close()es
+/// the old session's bus connection — these tasks hold proxy clones of it, so it can never
+/// die by refcount while they're parked in `sig.next()`.
 pub async fn run(
     active: ActiveSession,
     transport: Arc<Transport>,
