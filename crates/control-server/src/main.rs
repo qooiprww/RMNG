@@ -186,6 +186,7 @@ async fn main() -> Result<()> {
     tokio::spawn(codex::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
     tokio::spawn(homes::run(app.clone()));
+    tokio::spawn(buildinfra::run(app.clone()));
     tokio::spawn(smb::run(app.clone()));
 
     // Port 1 (video) — ingest clone dmabufs, VA-API encode, serve the viewer.
