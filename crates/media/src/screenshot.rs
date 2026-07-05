@@ -14,6 +14,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
 
+use crate::encode::meta_layout;
+
 fn fourcc_str(fourcc: u32) -> String {
     String::from_utf8_lossy(&fourcc.to_le_bytes()).trim_end_matches('\0').to_string()
 }
@@ -22,8 +24,16 @@ fn fourcc_str(fourcc: u32) -> String {
 /// for the vision model while staying far smaller than a lossless PNG.
 const JPEG_QUALITY: i32 = 90;
 
-/// Encode one captured dmabuf frame to JPEG bytes. `fd` is consumed.
-pub fn screenshot_jpeg(fd: OwnedFd, fourcc: u32, modifier: u64, w: u32, h: u32) -> Result<Vec<u8>> {
+/// Encode one captured dmabuf frame to JPEG bytes. `fd` is consumed. `planes` is the
+/// daemon-reported per-plane (offset, stride) of the dmabuf.
+pub fn screenshot_jpeg(
+    fd: OwnedFd,
+    fourcc: u32,
+    modifier: u64,
+    w: u32,
+    h: u32,
+    planes: &[wire::socket::PlaneLayout],
+) -> Result<Vec<u8>> {
     let desc = format!(
         "appsrc name=src ! vapostproc ! videoconvert ! jpegenc quality={JPEG_QUALITY} ! \
          appsink name=out max-buffers=1 sync=false"
@@ -55,7 +65,28 @@ pub fn screenshot_jpeg(fd: OwnedFd, fourcc: u32, modifier: u64, w: u32, h: u32) 
     // SAFETY: unique owned dmabuf fd; the GstMemory takes ownership.
     let mem = unsafe { allocator.alloc(fd, size) }.map_err(|e| anyhow!("dmabuf alloc: {e}"))?;
     let mut buffer = gst::Buffer::new();
-    buffer.get_mut().unwrap().append_memory(mem);
+    {
+        let b = buffer.get_mut().unwrap();
+        b.append_memory(mem);
+        // Attach the real plane layout: the GPU pads pitches for widths whose pitch isn't
+        // 16-aligned (real stride ≠ width·4), and importing the dmabuf with a fabricated
+        // width·4 stride reads the frame skewed / rejects the import outright, so the
+        // screenshot fails. Mirrors the encoder's VideoMeta fix (`Encoder::push`).
+        let vfmt = match fourcc_str(fourcc).as_str() {
+            "AB24" | "XB24" => gstreamer_video::VideoFormat::Rgba,
+            _ => gstreamer_video::VideoFormat::Bgra, // AR24/XR24 (ARGB/xRGB) and default
+        };
+        let (offsets, strides) = meta_layout(w, planes);
+        let _ = gstreamer_video::VideoMeta::add_full(
+            b,
+            gstreamer_video::VideoFrameFlags::empty(),
+            vfmt,
+            w,
+            h,
+            &offsets,
+            &strides,
+        );
+    }
     appsrc.push_buffer(buffer).map_err(|e| anyhow!("push_buffer: {e:?}"))?;
     let _ = appsrc.end_of_stream();
 

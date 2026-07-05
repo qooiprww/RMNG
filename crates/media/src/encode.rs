@@ -193,7 +193,7 @@ impl Encoder {
 /// VideoMeta plane layout for a pushed dmabuf: the daemon-reported per-plane
 /// (offset, stride) when present, else the packed single-plane fallback
 /// (stride = width·4) for callers with no plane info.
-fn meta_layout(w: u32, planes: &[wire::socket::PlaneLayout]) -> (Vec<usize>, Vec<i32>) {
+pub(crate) fn meta_layout(w: u32, planes: &[wire::socket::PlaneLayout]) -> (Vec<usize>, Vec<i32>) {
     if planes.is_empty() {
         (vec![0], vec![(w * 4) as i32])
     } else {

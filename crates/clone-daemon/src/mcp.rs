@@ -47,6 +47,10 @@ pub struct LatestFrame {
     pub modifier: u64,
     pub width: u32,
     pub height: u32,
+    /// Real per-plane (offset, stride) of the dmabuf, so the on-demand screenshot
+    /// encoder imports it with the GPU-padded pitch (widths whose pitch isn't
+    /// 16-aligned have stride ≠ width·4) instead of a fabricated one.
+    pub planes: Vec<wire::socket::PlaneLayout>,
 }
 pub type LatestFrames = Arc<Mutex<HashMap<u32, LatestFrame>>>;
 
@@ -293,12 +297,12 @@ fn clamp(m: &Mon, x: f64, y: f64) -> (f64, f64) {
 
 /// Encode the latest captured frame for `m` to JPEG (GPU VPP → JPEG via `media`).
 fn screenshot_jpeg(st: &McpState, m: &Mon) -> Result<Vec<u8>, String> {
-    let (fd, fourcc, modifier, w, h) = {
+    let (fd, fourcc, modifier, w, h, planes) = {
         let latest = st.latest.lock().unwrap();
         let f = latest.get(&m.id).ok_or_else(|| format!("no frame captured yet for monitor {}", m.id))?;
-        (dup(&f.fd).ok_or("dup failed")?, f.fourcc, f.modifier, f.width, f.height)
+        (dup(&f.fd).ok_or("dup failed")?, f.fourcc, f.modifier, f.width, f.height, f.planes.clone())
     };
-    media::screenshot_jpeg(fd, fourcc, modifier, w, h).map_err(|e| e.to_string())
+    media::screenshot_jpeg(fd, fourcc, modifier, w, h, &planes).map_err(|e| e.to_string())
 }
 
 /// Let the desktop repaint, then return a screenshot (best-effort → text on failure).

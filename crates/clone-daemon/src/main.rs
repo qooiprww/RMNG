@@ -722,7 +722,7 @@ fn spawn_capture_for(
             }
             let n = seq.fetch_add(1, Ordering::Relaxed);
             ship_frame(&transport, mid, mw, mh, n, frame.fourcc, frame.modifier, frame.width, frame.height, &frame.planes, &frame.fds);
-            store_latest(&latest, mid, frame.fourcc, frame.modifier, frame.width.min(mw), frame.height.min(mh), &frame.fds);
+            store_latest(&latest, mid, frame.fourcc, frame.modifier, frame.width.min(mw), frame.height.min(mh), &frame.planes, &frame.fds);
         })?;
         Ok(CaptureHandle::Gst(p))
     } else {
@@ -890,11 +890,22 @@ fn ship_frame(
 
 /// Remember the latest captured dmabuf for a monitor (dup the first plane's fd) so the
 /// MCP `screenshot` tool can GPU-encode it on demand. Replaces (and closes) the prior fd.
-fn store_latest(latest: &mcp::LatestFrames, mid: u32, fourcc: u32, modifier: u64, w: u32, h: u32, fds: &[OwnedFd]) {
+#[allow(clippy::too_many_arguments)]
+fn store_latest(
+    latest: &mcp::LatestFrames,
+    mid: u32,
+    fourcc: u32,
+    modifier: u64,
+    w: u32,
+    h: u32,
+    planes: &[(u32, u32)],
+    fds: &[OwnedFd],
+) {
     let Some(fd0) = fds.first() else { return };
     let Ok(raw) = nix::unistd::dup(fd0.as_raw_fd()) else { return };
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    latest.lock().unwrap().insert(mid, mcp::LatestFrame { fd, fourcc, modifier, width: w, height: h });
+    let planes = planes.iter().map(|&(offset, stride)| PlaneLayout { offset, stride }).collect();
+    latest.lock().unwrap().insert(mid, mcp::LatestFrame { fd, fourcc, modifier, width: w, height: h, planes });
 }
 
 /// Spawn the raw-PipeWire capture for one monitor on its own thread (the pw
@@ -933,7 +944,7 @@ fn spawn_pw_monitor(
                     tracing::debug!("pw monitor {mid}: first frame {}x{} fourcc={:#010x} modifier={:#018x}", frame.width, frame.height, frame.fourcc, frame.modifier);
                 }
                 ship_frame(&ship, mid, mw, mh, seq, frame.fourcc, frame.modifier, frame.width, frame.height, &frame.planes, &frame.fds);
-                store_latest(&latest, mid, frame.fourcc, frame.modifier, frame.width.min(mw), frame.height.min(mh), &frame.fds);
+                store_latest(&latest, mid, frame.fourcc, frame.modifier, frame.width.min(mw), frame.height.min(mh), &frame.planes, &frame.fds);
             };
             let on_cursor = move |c: capture_pw::PwCursor| {
                 let shape = c.shape.map(|(width, height, hotspot_x, hotspot_y, rgba)| CursorShape {
