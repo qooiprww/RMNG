@@ -876,7 +876,17 @@ async fn config_put(
     *app.cfg.write().unwrap() = merged.clone();
     // Propagate any SSH key change to the bastion + running clones immediately.
     if old.ssh.authorized_keys != merged.ssh.authorized_keys {
-        crate::ssh::apply_now(&app).await;
+        // Bound the immediate push: apply_now does Docker calls to running clones; a wedged
+        // daemon must not hang this PUT. The reconcile loop retries within ~10s regardless.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ssh::apply_now(&app),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("ssh apply_now timed out; reconcile loop will retry");
+        }
     }
     // Keep the sidebar's live layout list/active marker in sync with the just-saved presets.
     mirror_layout_to_state(&app);
