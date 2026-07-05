@@ -211,7 +211,12 @@ fn render_bastion_files(app: &App, data_dir: &str) -> bool {
     let _ = std::fs::write(BASTION_AUTHORIZED_KEYS, keys);
 
     let ids = managed_clone_ids(&app.store.get().hosts);
-    let key_path = bastion_hostkey_path(data_dir);
+    // Absolute HostKey path: on SIGHUP sshd re-execs and re-resolves relative paths from
+    // its CWD, so a relative HostKey makes a reload die with "no hostkeys available --
+    // exiting" (found in live E2E). `std::path::absolute` is lexical (no I/O), mirroring
+    // smb.rs's `absolute_hosts_root`.
+    let key_path = std::path::absolute(bastion_hostkey_path(data_dir))
+        .unwrap_or_else(|_| bastion_hostkey_path(data_dir));
     let want = render_bastion_sshd_config(
         cfg.listen.bastion,
         key_path.to_str().unwrap_or_default(),
@@ -324,14 +329,31 @@ async fn run_sshd(mut child: Child, app: &App, data_dir: &str, pushed: &mut Hash
     }
 }
 
-/// Ensure the host key, render the initial config, then supervise `sshd` forever with
-/// capped backoff. Never returns. Disabled clones/keys are fine — the bastion just runs
+/// Ensure the bastion login account (`rmng`, reused from the SMB share) can authenticate
+/// by public key. `useradd`/`smbpasswd` leave its Unix password field `!` (locked), and
+/// the bastion runs `sshd` with `UsePAM no`, which refuses a locked account outright
+/// ("User rmng not allowed because account is locked" — found in live E2E) even for pubkey
+/// auth. Setting the field to `*` (disabled, not locked) lets sshd accept it for pubkey
+/// while still permitting no password login. Idempotent + best-effort: a dev box without
+/// the account or without root just no-ops (its child output is discarded).
+async fn ensure_bastion_account() {
+    let _ = Command::new("usermod")
+        .args(["-p", "*", "rmng"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+/// Ensure the host key + login account, render the initial config, then supervise `sshd`
+/// forever with capped backoff. Never returns. Empty keys are fine — the bastion just runs
 /// with an empty `authorized_keys` (no one can auth) and `PermitOpen none`.
 pub async fn run(app: App) {
     let data_dir = app.config().data_dir.clone();
     if let Err(e) = ensure_hostkey(&bastion_hostkey_path(&data_dir)) {
         tracing::error!(target: "ssh", "bastion host key generation failed: {e}");
     }
+    ensure_bastion_account().await;
     let mut pushed: HashMap<String, u64> = HashMap::new();
     let mut failures: u32 = 0;
     let mut spawn_error_logged = false;

@@ -322,9 +322,13 @@ one public key list, installed on both the bastion and every clone.
 - VS Code **Remote-SSH: Add New SSH Host…** → paste the same one-liner → connect.
 
 **Host keys are stable** (control-server-generated and persisted, both the bastion's and each
-clone's), so the first connection is prompt-free with `-o StrictHostKeyChecking=accept-new` —
-no "unknown host key" interruption, and no risk of silently trusting a rotated key either, since
-it never rotates under normal operation.
+clone's), so there is no risk of silently trusting a rotated key — neither the bastion's nor a
+clone's changes under normal operation. `-o StrictHostKeyChecking=accept-new` silences the
+prompt for the **clone's** key (the final hop, which the command-line option governs). OpenSSH's
+`-J` does **not** apply that option to the **jump host** (the bastion), so on the very first
+connection your ssh client asks you to confirm the bastion's key once (`Are you sure you want to
+continue connecting?` → `yes`); every connection after that is silent. To skip even that one
+prompt, pre-seed it with `ssh-keyscan -p 2222 <control-host> >> ~/.ssh/known_hosts`.
 
 **Gotcha: clones created before the template rebuilt with `sshd` have no `sshd` to jump to.**
 `ssh -J` will connect to the bastion fine but the clone hop will fail (connection refused on
