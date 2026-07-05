@@ -8,6 +8,8 @@
 //! `<clone>:22`; the session terminates end-to-end at the clone's own `sshd`.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
 
 /// Absolute path the bastion `sshd` reads authorized keys from. Outside any home (the
 /// `rmng` account has none), root-owned — so `StrictModes` is satisfied.
@@ -78,6 +80,41 @@ Match User rmng
     )
 }
 
+/// The persisted bastion host key path (stable across control-server restarts).
+pub fn bastion_hostkey_path(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join("ssh/bastion/ssh_host_ed25519_key")
+}
+
+/// The persisted per-clone host key path (stable across clone rebuilds of the same id).
+pub fn clone_hostkey_path(data_dir: &str, clone_id: &str) -> PathBuf {
+    Path::new(data_dir).join("ssh/clones").join(clone_id).join("ssh_host_ed25519_key")
+}
+
+/// Generate an ed25519 host key at `key_path` (+ `.pub`) if it doesn't already exist.
+/// Idempotent: an existing key is left byte-for-byte untouched (so identity is stable).
+/// Parent dirs are created 0700.
+pub fn ensure_hostkey(key_path: &Path) -> Result<()> {
+    if key_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        // 0700 so private keys aren't world/group-readable (sshd StrictModes).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "rmng", "-f"])
+        .arg(key_path)
+        .status()
+        .context("running ssh-keygen (is openssh installed?)")?;
+    anyhow::ensure!(status.success(), "ssh-keygen failed for {}", key_path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +171,39 @@ mod tests {
         // is the clone id — so entries must be exactly `<id>:22`, no resolution.
         let out = render_bastion_sshd_config(2222, "/k", BASTION_AUTHORIZED_KEYS, &["w-cp-claude".into()]);
         assert!(out.contains("PermitOpen w-cp-claude:22"), "{out}");
+    }
+
+    #[test]
+    fn hostkey_paths_are_under_data_dir() {
+        assert_eq!(
+            bastion_hostkey_path("/data").to_str().unwrap(),
+            "/data/ssh/bastion/ssh_host_ed25519_key"
+        );
+        assert_eq!(
+            clone_hostkey_path("/data", "clone-a").to_str().unwrap(),
+            "/data/ssh/clones/clone-a/ssh_host_ed25519_key"
+        );
+    }
+
+    #[test]
+    fn ensure_hostkey_generates_once_and_is_idempotent() {
+        // Needs openssh-client for ssh-keygen; skip cleanly where it's absent (minimal CI).
+        if std::process::Command::new("ssh-keygen").arg("-?").output().is_err() {
+            eprintln!("skipping: ssh-keygen not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rmng-ssh-test-{}", std::process::id()));
+        let key = dir.join("ssh_host_ed25519_key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ensure_hostkey(&key).unwrap();
+        assert!(key.exists(), "private key created");
+        assert!(key.with_extension("pub").exists(), "public key created");
+        let first = std::fs::read(&key).unwrap();
+
+        ensure_hostkey(&key).unwrap(); // idempotent: must NOT regenerate
+        assert_eq!(std::fs::read(&key).unwrap(), first, "second call regenerated the key");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
