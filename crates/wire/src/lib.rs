@@ -27,7 +27,7 @@ pub mod viewer;
 pub use config::{
     AppConfig, AppConfigRedacted, ChromaMode, ClaudeConfig, CloneGroup, CodexConfig,
     ConfigPutResponse, DockerConfig, EnvCheckRow, EnvVar, ImageInfo, ListenConfig, Preset,
-    PresetRedacted, SetupEnv,
+    PresetRedacted, SetupEnv, SshConfig,
 };
 pub use control::{
     AgentReport, Chat, ChatMessage, ChatRole, ClaudeSpend, ClaudeUsage, ClaudeUsageWindow,
