@@ -7,7 +7,7 @@ pub mod screenshot;
 pub mod sock;
 
 pub use encode::Encoder;
-pub use screenshot::screenshot_png;
+pub use screenshot::screenshot_jpeg;
 pub use sock::{Conn, Listener};
 
 /// Initialize GStreamer (call once before constructing an [`Encoder`]).

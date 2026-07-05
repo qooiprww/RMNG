@@ -40,7 +40,7 @@ const SCROLL_STEP_MS: u64 = 25;
 const SETTLE_MS: u64 = 350;
 
 /// One captured dmabuf per monitor, refreshed by the capture callbacks; the
-/// `screenshot` tool dups the fd and GPU-encodes it to PNG via `media`.
+/// `screenshot` tool dups the fd and GPU-encodes it to JPEG via `media`.
 pub struct LatestFrame {
     pub fd: OwnedFd,
     pub fourcc: u32,
@@ -152,7 +152,7 @@ fn tools_list() -> Value {
     let xy = json!({ "x": { "type": "number" }, "y": { "type": "number" }, "monitor": { "type": "integer" } });
     let mut t = vec![
         tool("list_monitors", "List the clone's virtual monitors (id, size)", json!({}), json!([])),
-        tool("screenshot", "Capture a PNG screenshot of a monitor", mon.clone(), json!([])),
+        tool("screenshot", "Capture a JPEG screenshot of a monitor", mon.clone(), json!([])),
         tool("mouse_move", "Move the pointer to (x,y) with a smooth glide", xy.clone(), json!(["x", "y"])),
         tool("left_click", "Left-click (optionally glide to x,y first)", xy.clone(), json!([])),
         tool("right_click", "Right-click (optionally glide to x,y first)", xy.clone(), json!([])),
@@ -181,7 +181,7 @@ async fn call_tool(st: &McpState, name: &str, args: Value) -> Result<Value, Stri
         }
         "screenshot" => {
             let m = resolve_mon(&mons_snapshot(st), &args)?;
-            Ok(image_content(&screenshot_png(st, &m)?))
+            Ok(image_content(&screenshot_jpeg(st, &m)?))
         }
         "mouse_move" => {
             let m = resolve_mon(&mons_snapshot(st), &args)?;
@@ -291,21 +291,21 @@ fn clamp(m: &Mon, x: f64, y: f64) -> (f64, f64) {
     (x.clamp(0.0, (m.width.saturating_sub(1)) as f64), y.clamp(0.0, (m.height.saturating_sub(1)) as f64))
 }
 
-/// Encode the latest captured frame for `m` to PNG (GPU VPP → PNG via `media`).
-fn screenshot_png(st: &McpState, m: &Mon) -> Result<Vec<u8>, String> {
+/// Encode the latest captured frame for `m` to JPEG (GPU VPP → JPEG via `media`).
+fn screenshot_jpeg(st: &McpState, m: &Mon) -> Result<Vec<u8>, String> {
     let (fd, fourcc, modifier, w, h) = {
         let latest = st.latest.lock().unwrap();
         let f = latest.get(&m.id).ok_or_else(|| format!("no frame captured yet for monitor {}", m.id))?;
         (dup(&f.fd).ok_or("dup failed")?, f.fourcc, f.modifier, f.width, f.height)
     };
-    media::screenshot_png(fd, fourcc, modifier, w, h).map_err(|e| e.to_string())
+    media::screenshot_jpeg(fd, fourcc, modifier, w, h).map_err(|e| e.to_string())
 }
 
 /// Let the desktop repaint, then return a screenshot (best-effort → text on failure).
 async fn settle_shot(st: &McpState, m: &Mon) -> Value {
     sleep(SETTLE_MS).await;
-    match screenshot_png(st, m) {
-        Ok(png) => image_content(&png),
+    match screenshot_jpeg(st, m) {
+        Ok(jpeg) => image_content(&jpeg),
         Err(_) => text("ok"),
     }
 }
@@ -333,8 +333,8 @@ fn dup(fd: &OwnedFd) -> Option<OwnedFd> {
 fn text(s: impl Into<String>) -> Value {
     json!([{ "type": "text", "text": s.into() }])
 }
-fn image_content(png: &[u8]) -> Value {
-    json!([{ "type": "image", "mimeType": "image/png", "data": base64(png) }])
+fn image_content(jpeg: &[u8]) -> Value {
+    json!([{ "type": "image", "mimeType": "image/jpeg", "data": base64(jpeg) }])
 }
 
 /// Minimal standard base64 encode (screenshot image content).

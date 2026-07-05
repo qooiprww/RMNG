@@ -11,7 +11,7 @@ into a hardware-decode client (no WebRTC).
 ```
                          ┌─ continuous (selected clone) → VA-API H.264/monitor ─┐
 clone-daemon ──dmabuf────┤                                                       ├─▶ port 1 (viewer)
- (SCM_RIGHTS, per mon)   └─ on demand  (any clone)      → VA-API → PNG/JPEG ─────┴─▶ ports 3/4 (screenshot)
+ (SCM_RIGHTS, per mon)   └─ on demand  (any clone)      → VA-API → JPEG ─────────┴─▶ ports 3/4 (screenshot)
         ▲                                                                            │
         └────────── input (InputMsg) ◀── route from viewer / port-3 agent / port-4 ─┘
                      → clone-daemon socket → Mutter RemoteDesktop
@@ -35,7 +35,7 @@ clone-daemon ──dmabuf────┤                                        
    - Carry forward Phase-0 tuning: `constrained-baseline` isn't required without browsers,
      but keep `aud=true`, `key-int-max` short for fast reconnect, and ample decoder/encoder
      surface headroom (the large-window 60fps cap was decoder surface starvation).
-3. **Encode (screenshot)** — import an on-demand dmabuf → VA download/VPP → PNG or JPEG for
+3. **Encode (screenshot)** — import an on-demand dmabuf → VA download/VPP → JPEG for
    the MCP `Screenshot` tool. Infrequent and request-driven; proven by PoC R3 (cross-
    container dmabuf → JPEG). Optional fallback: have the daemon ship RGB for screenshots if
    GPU readback latency disappoints.
@@ -69,7 +69,7 @@ which also removes the crypto-provider clash the old plan worried about.
 
 - **dmabuf → encode**: import a daemon-shipped dmabuf and dump a valid `.h264` (verify with
   ffprobe/decode) — the foundational check.
-- **dmabuf → PNG**: a single on-demand frame round-trips to a correct screenshot.
+- **dmabuf → JPEG**: a single on-demand frame round-trips to a correct screenshot.
 - **sync**: sustained capture+encode with no tearing under back-pressure + explicit-sync.
 - **viewer protocol**: frame the multiplexed stream to a stub client; `RequestKeyframe`
   forces an IDR; one connection only.

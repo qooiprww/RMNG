@@ -102,7 +102,7 @@ fn tools_for(scope: Scope) -> Value {
     if scope == Scope::Global {
         // Desktop + window tools — proxied to the target clone-daemon's MCP.
         let xy = || json!({ "x": { "type": "number" }, "y": { "type": "number" }, "monitor": { "type": "integer" } });
-        tools.push(dtool("screenshot", "Screenshot a monitor as PNG", json!({ "monitor": { "type": "integer" } }), &[]));
+        tools.push(dtool("screenshot", "Screenshot a monitor as JPEG", json!({ "monitor": { "type": "integer" } }), &[]));
         tools.push(dtool("list_monitors", "List the clone's monitors", json!({}), &[]));
         tools.push(dtool("mouse_move", "Move the pointer to (x,y) with a glide", xy(), &["x", "y"]));
         tools.push(dtool("left_click", "Left-click (optionally move to x,y first)", xy(), &[]));

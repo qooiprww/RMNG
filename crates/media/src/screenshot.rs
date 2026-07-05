@@ -1,6 +1,10 @@
-//! On-demand screenshot: import a clone's latest dmabuf and encode it to PNG via
-//! `vapostproc → videoconvert → pngenc` (the desktop-MCP `screenshot` tool, port 3/4).
+//! On-demand screenshot: import a clone's latest dmabuf and encode it to JPEG via
+//! `vapostproc → videoconvert → jpegenc` (the desktop-MCP `screenshot` tool, port 3/4).
 //! Infrequent + request-driven, so a one-shot pipeline per call is fine.
+//!
+//! JPEG (not PNG): a full-desktop PNG is multi-MB, and the MCP client caches every
+//! returned screenshot to a temp file — those pile up fast. A high-quality JPEG is
+//! ~8-10× smaller with no loss the vision model cares about.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
@@ -14,12 +18,18 @@ fn fourcc_str(fourcc: u32) -> String {
     String::from_utf8_lossy(&fourcc.to_le_bytes()).trim_end_matches('\0').to_string()
 }
 
-/// Encode one captured dmabuf frame to PNG bytes. `fd` is consumed.
-pub fn screenshot_png(fd: OwnedFd, fourcc: u32, modifier: u64, w: u32, h: u32) -> Result<Vec<u8>> {
-    let desc = "appsrc name=src ! vapostproc ! videoconvert ! pngenc ! \
-         appsink name=out max-buffers=1 sync=false";
+/// JPEG quality for on-demand screenshots (0-100). 90 keeps small UI text crisp
+/// for the vision model while staying far smaller than a lossless PNG.
+const JPEG_QUALITY: i32 = 90;
+
+/// Encode one captured dmabuf frame to JPEG bytes. `fd` is consumed.
+pub fn screenshot_jpeg(fd: OwnedFd, fourcc: u32, modifier: u64, w: u32, h: u32) -> Result<Vec<u8>> {
+    let desc = format!(
+        "appsrc name=src ! vapostproc ! videoconvert ! jpegenc quality={JPEG_QUALITY} ! \
+         appsink name=out max-buffers=1 sync=false"
+    );
     let pipeline =
-        gst::parse::launch(desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
+        gst::parse::launch(&desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
     let appsrc =
         pipeline.by_name("src").context("appsrc")?.downcast::<AppSrc>().map_err(|_| anyhow!("not appsrc"))?;
     let appsink =
@@ -38,7 +48,7 @@ pub fn screenshot_png(fd: OwnedFd, fourcc: u32, modifier: u64, w: u32, h: u32) -
 
     pipeline.set_state(gst::State::Playing).context("screenshot pipeline PLAYING")?;
 
-    // Wrap the dmabuf, push it, then EOS so pngenc emits the single frame.
+    // Wrap the dmabuf, push it, then EOS so jpegenc emits the single frame.
     let raw = fd.as_raw_fd();
     let size = nix::unistd::lseek(raw, 0, nix::unistd::Whence::SeekEnd).context("lseek")? as usize;
     let allocator = gstreamer_allocators::DmaBufAllocator::new();
@@ -52,14 +62,14 @@ pub fn screenshot_png(fd: OwnedFd, fourcc: u32, modifier: u64, w: u32, h: u32) -
     let sample = appsink
         .try_pull_sample(gst::ClockTime::from_seconds(5))
         .ok_or_else(|| anyhow!("screenshot timed out"))?;
-    let png = sample
+    let jpeg = sample
         .buffer()
         .and_then(|b| b.map_readable().ok())
         .map(|m| m.as_slice().to_vec())
-        .ok_or_else(|| anyhow!("no PNG buffer"))?;
+        .ok_or_else(|| anyhow!("no JPEG buffer"))?;
 
     let _ = pipeline.set_state(gst::State::Null);
     // Brief settle so the VA surfaces release cleanly between one-shot pipelines.
     std::thread::sleep(Duration::from_millis(1));
-    Ok(png)
+    Ok(jpeg)
 }

@@ -318,7 +318,7 @@ derive `ts_rs::TS` and export to `frontend/app/lib/wire/`.
 - `Encoder::new(on_au: FnMut(Vec<u8>, bool))` / `.push(fd, fourcc, modifier, w, h)` /
   `.force_idr()` — one VA-API H.264 encoder per monitor (`vapostproc ! vah264enc ! h264parse`,
   Annex-B AUs to the callback).
-- `screenshot_png(fd, fourcc, modifier, w, h) -> Vec<u8>` — one-shot dmabuf→PNG.
+- `screenshot_jpeg(fd, fourcc, modifier, w, h) -> Vec<u8>` — one-shot dmabuf→JPEG.
 - `Listener::bind(path)` / `.accept() -> Conn`; `Conn::recv() -> (DaemonMsg, Vec<OwnedFd>)` /
   `.send(&ServerMsg)` — the clone-socket transport (SCM_RIGHTS).
 

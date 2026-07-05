@@ -74,7 +74,7 @@ daemon → `"clone-daemon MCP unreachable at …"`.
 ## Daemon MCP (clone-daemon `:9004`)
 
 Runs inside each clone, sharing the daemon's live Mutter `RemoteDesktop` session (input),
-its per-monitor latest-dmabuf (screenshots via `media::screenshot_png`), and gnome-shell
+its per-monitor latest-dmabuf (screenshots via `media::screenshot_jpeg`), and gnome-shell
 `org.gnome.Shell.Eval` (window management). No `clone` argument — it *is* one clone.
 
 ### Input & capture tools
@@ -82,7 +82,7 @@ its per-monitor latest-dmabuf (screenshots via `media::screenshot_png`), and gno
 | Tool | Args | Behaviour |
 |---|---|---|
 | `list_monitors` | — | `[{id,width,height}]` |
-| `screenshot` | `monitor?`=0 | PNG of the monitor's latest captured frame (image). Errors if no frame buffered yet |
+| `screenshot` | `monitor?`=0 | JPEG of the monitor's latest captured frame (image). Errors if no frame buffered yet |
 | `mouse_move` | `x`, `y`, `monitor?`=0 | clamp to monitor bounds, eased glide (10 steps ≈100 ms); **emits a cursor-warp** to the viewer each step; settle + screenshot |
 | `left_click` / `right_click` / `middle_click` | `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then press (`0x110`/`0x111`/`0x112`) → 50 ms → release; settle + screenshot |
 | `left_double_click` | `x?`, `y?`, `monitor?`=0 | optional eased glide to x,y, then two left presses 80 ms apart; settle + screenshot |

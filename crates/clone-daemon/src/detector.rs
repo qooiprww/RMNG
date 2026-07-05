@@ -241,7 +241,7 @@ async fn mcp_call(client: &reqwest::Client, url: &str, name: &str, args: Value) 
     v.get("result").and_then(|r| r.get("content")).cloned().context("MCP result missing content")
 }
 
-/// Pull every monitor's screenshot (PNG) from the running daemon's MCP.
+/// Pull every monitor's screenshot (JPEG) from the running daemon's MCP.
 async fn screenshot_all(client: &reqwest::Client, mcp: &str) -> Result<Vec<RgbImage>> {
     let content = mcp_call(client, mcp, "list_monitors", json!({})).await.context("list_monitors")?;
     let listing = content.get(0).and_then(|c| c.get("text")).and_then(Value::as_str).context("list_monitors text")?;
@@ -256,8 +256,8 @@ async fn screenshot_all(client: &reqwest::Client, mcp: &str) -> Result<Vec<RgbIm
             .and_then(|c| c.get("data"))
             .and_then(Value::as_str)
             .context("screenshot content missing data")?;
-        let png = B64.decode(b64).context("decoding screenshot base64")?;
-        let mut img = image::load_from_memory(&png).context("decoding screenshot PNG")?;
+        let bytes = B64.decode(b64).context("decoding screenshot base64")?;
+        let mut img = image::load_from_memory(&bytes).context("decoding screenshot image")?;
         if img.height() > MODEL_MAX_H {
             let w = (u64::from(img.width()) * u64::from(MODEL_MAX_H) / u64::from(img.height().max(1))).max(1) as u32;
             img = img.resize_exact(w, MODEL_MAX_H, image::imageops::FilterType::Triangle);
