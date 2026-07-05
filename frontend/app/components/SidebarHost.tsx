@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 import chatgptLogo from "../assets/chatgpt.png";
 import claudeLogo from "../assets/claude.png";
+import { copyText } from "~/lib/clipboard";
 import { buildSshCommand } from "~/lib/ssh";
 import type { Host, Operation } from "~/lib/types";
 import type { ContainerStats } from "~/lib/wire/ContainerStats";
@@ -222,7 +223,10 @@ export interface SidebarHostProps {
  *  plain-text `item()` helper because it needs its own transient state + delayed
  *  close (the other items close immediately on click). */
 function CopySshMenuItem({ command, onDone }: { command: string; onDone: () => void }) {
-  const [copied, setCopied] = useState(false);
+  // `null` = idle, `true` = copied, `false` = copy failed (both clipboard paths refused,
+  // e.g. execCommand blocked). Only claim "Copied!" on a genuine success so the label
+  // never lies about what reached the clipboard.
+  const [result, setResult] = useState<boolean | null>(null);
   return (
     <button
       type="button"
@@ -230,20 +234,17 @@ function CopySshMenuItem({ command, onDone }: { command: string; onDone: () => v
       onPointerDown={(e) => e.stopPropagation()}
       onClick={async (e) => {
         e.stopPropagation();
-        try {
-          await navigator.clipboard.writeText(command);
-        } catch {
-          // Clipboard write failed (e.g. insecure context) — still close normally;
-          // the command is short enough to retype from the CLI (`rmng ssh <clone>`).
-        }
-        setCopied(true);
-        setTimeout(onDone, 900);
+        const ok = await copyText(command);
+        setResult(ok);
+        // On failure keep the menu open a beat longer so the user can select the
+        // command text (shown in the title) and copy it by hand.
+        setTimeout(onDone, ok ? 900 : 1600);
       }}
       title={command}
       className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-700"
     >
       <Terminal className="size-4 shrink-0" />
-      {copied ? "Copied!" : "Copy SSH command"}
+      {result === true ? "Copied!" : result === false ? "Copy failed — copy manually" : "Copy SSH command"}
     </button>
   );
 }
