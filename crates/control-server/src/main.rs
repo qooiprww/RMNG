@@ -7,6 +7,7 @@
 
 mod app;
 mod assets;
+mod buildinfra;
 mod chat;
 mod claude;
 mod clone_ops;
