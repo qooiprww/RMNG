@@ -56,5 +56,6 @@ async fn run(cli: &Cli, client: &Client) -> anyhow::Result<u8> {
         Cmd::Account(cmd) => commands::account(client, cmd, cli.json).await,
         Cmd::Ops => commands::ops(client, cli.json).await,
         Cmd::Wait { op_id, timeout } => commands::wait_cmd(client, op_id, *timeout, cli.json).await,
+        Cmd::Ssh { host } => commands::ssh_cmd(client, host).await,
     }
 }

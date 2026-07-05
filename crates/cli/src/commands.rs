@@ -391,6 +391,48 @@ async fn settle(client: &Client, op_id: &str, timeout: u64, json: bool) -> Resul
     }
 }
 
+/// The copy-paste one-liner: inline `-J` jump through the bastion, terminating at the
+/// clone's own sshd. `accept-new` makes the first connect prompt-free (host keys are stable).
+pub fn build_ssh_command(public_host: &str, bastion_port: u16, clone_id: &str) -> String {
+    format!(
+        "ssh -J rmng@{public_host}:{bastion_port} -o StrictHostKeyChecking=accept-new rmng@{clone_id}"
+    )
+}
+
+/// Best-effort host (no scheme, port, or path) from a server base URL — used as the ssh
+/// fallback when `ssh.publicHost` isn't configured. The CLI runs *inside* clones, so its
+/// own server base is the control-server's internal docker address, not necessarily the
+/// laptop-facing one; this is a best-effort guess, not a substitute for the real setting.
+fn host_from_base(base: &str) -> &str {
+    base.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or(base)
+}
+
+/// `rmng ssh <host>`: print the ready-to-paste `ssh` one-liner that jumps through the
+/// bastion into the clone. Fetches the redacted config for `ssh.publicHost` and
+/// `listen.bastion`; falls back to a best-effort host guess (with a stderr note) when
+/// `publicHost` isn't set, so the command on stdout stays copy-pasteable either way.
+pub async fn ssh_cmd(client: &Client, host: &str) -> Result<u8> {
+    let cfg = client.config().await?;
+    let public_host = if !cfg.ssh.public_host.trim().is_empty() {
+        cfg.ssh.public_host.clone()
+    } else {
+        let fallback = host_from_base(client.base()).to_string();
+        eprintln!(
+            "note: ssh.publicHost is not set; using {fallback} — set it in Settings → SSH Access for the correct laptop-facing address"
+        );
+        fallback
+    };
+    println!(
+        "{}",
+        build_ssh_command(&public_host, cfg.listen.bastion, host)
+    );
+    Ok(0)
+}
+
 /// Used by `main` for a friendlier connection-refused hint.
 pub fn connect_hint(base: &str, err: &anyhow::Error) -> String {
     format!("{err:#}\n(server: {base} — set --server or $RMNG_CONTROL_URL)")
@@ -399,4 +441,27 @@ pub fn connect_hint(base: &str, err: &anyhow::Error) -> String {
 #[allow(dead_code)]
 fn _assert_state_is_wire(st: ControlState) -> ControlState {
     st
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_command_is_the_inline_jump_one_liner() {
+        assert_eq!(
+            build_ssh_command("rmng.example.com", 2222, "w-cp-claude"),
+            "ssh -J rmng@rmng.example.com:2222 -o StrictHostKeyChecking=accept-new rmng@w-cp-claude"
+        );
+    }
+
+    #[test]
+    fn host_from_base_strips_scheme_port_and_path() {
+        assert_eq!(host_from_base("http://rmng-control:9000"), "rmng-control");
+        assert_eq!(
+            host_from_base("https://rmng.example.com/"),
+            "rmng.example.com"
+        );
+        assert_eq!(host_from_base("localhost:9000"), "localhost");
+    }
 }
