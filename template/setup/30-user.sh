@@ -42,6 +42,9 @@ if id ubuntu >/dev/null 2>&1 && [ "$USERNAME" != ubuntu ]; then
   userdel -r ubuntu 2>/dev/null || userdel ubuntu 2>/dev/null || warn "could not remove stock ubuntu user"
 fi
 id "$USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash -u 1000 "$USERNAME"
+# SSH: the control-server injects authorized_keys here at provision. Pre-create the dir
+# with the exact perms/owner sshd StrictModes requires (else it silently ignores the key).
+install -d -o "$USERNAME" -g "$USERNAME" -m700 "/home/$USERNAME/.ssh"
 usermod -aG sudo,render,video "$USERNAME"
 # docker group exists once docker-ce installed in the toolbox above; add the user so they can
 # run docker without sudo. Non-fatal if the group is absent (docker install failed).
