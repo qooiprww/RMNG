@@ -98,9 +98,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM ubuntu:26.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 # Runtime deps mined from scripts/cs-deploy-ct.sh. Still no openssh-client/sshfs: the Docker
-# port dials the local daemon over a unix socket — no SSH anywhere. Clone homes are instead
-# served over SMB by samba's smbd (see smb.rs), so `samba` is added here — it provides smbd +
-# smbpasswd and the vfs_fruit/catia modules smb.conf loads. vah264enc/vapostproc live in the
+# port dials the local daemon over a unix socket — no SSH anywhere for control-plane calls.
+# Clone homes are instead served over SMB by samba's smbd (see smb.rs), so `samba` is added
+# here — it provides smbd + smbpasswd and the vfs_fruit/catia modules smb.conf loads.
+# `openssh-server` IS added, though: it provides `/usr/sbin/sshd` + `ssh-keygen`, which the
+# bastion supervisor (see ssh.rs) needs to run its own jump-only `sshd` on :2222 and to mint
+# host keys for itself and every clone. vah264enc/vapostproc live in the
 # `va` plugin shipped by gstreamer1.0-plugins-bad; pngenc (screenshots) in -good. The
 # zero-copy GL→VA AVC444 encode bridge needs `glupload` (+ the rest of the GL elements) from
 # libgstopengl.so, which ships in the SEPARATE gstreamer1.0-gl package — omit it and the
@@ -112,7 +115,7 @@ RUN apt-get update \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
       gstreamer1.0-gl \
       libva2 libva-drm2 va-driver-all libdrm2 \
-      ca-certificates samba \
+      ca-certificates samba openssh-server \
  && rm -rf /var/lib/apt/lists/*
 
 # Local `rmng` account at uid/gid 1000 for the SMB share. `force user = rmng` in smb.conf

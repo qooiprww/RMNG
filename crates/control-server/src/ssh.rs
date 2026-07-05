@@ -7,9 +7,16 @@
 //! process's child `sshd`, reusing the uid-1000 `rmng` account) only TCP-forwards to
 //! `<clone>:22`; the session terminates end-to-end at the clone's own `sshd`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::{Child, Command};
+
+use crate::app::App;
 use crate::docker::TarEntry;
 
 /// Absolute path the bastion `sshd` reads authorized keys from. Outside any home (the
@@ -171,6 +178,178 @@ pub fn keys_hash(keys: &[String]) -> u64 {
     h.finish()
 }
 
+/// Restart backoff: first retry after `BASE_BACKOFF`, doubling per consecutive quick crash
+/// up to `MAX_BACKOFF`. A run that stays up past `STABLE_RUN` resets the counter (mirrors
+/// `smb::backoff`). Pure + saturating throughout, so a runaway crash loop can never
+/// overflow the multiply — it just pins at `MAX_BACKOFF`.
+const BASE_BACKOFF: Duration = Duration::from_secs(15);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const STABLE_RUN: Duration = Duration::from_secs(60);
+/// How often to re-render the bastion allowlist and push keys into clones.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+pub fn backoff(failures: u32) -> Duration {
+    BASE_BACKOFF.saturating_mul(2u32.saturating_pow(failures)).min(MAX_BACKOFF)
+}
+
+/// Sorted, deduped ids of managed clones — the `PermitOpen` allowlist source. A stopped
+/// clone stays listed (harmless: the dial just fails); membership tracks the fleet roster.
+pub fn managed_clone_ids(hosts: &[wire::Host]) -> Vec<String> {
+    let mut ids: Vec<String> =
+        hosts.iter().filter(|h| h.managed).map(|h| h.id.clone()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Write the bastion `authorized_keys` + `sshd_config` from current state. Returns whether
+/// the `sshd_config` content changed (⇒ caller should reload). Best-effort file writes.
+fn render_bastion_files(app: &App, data_dir: &str) -> bool {
+    let cfg = app.config();
+    let keys = render_authorized_keys(&cfg.ssh.authorized_keys);
+    let _ = std::fs::create_dir_all("/etc/rmng/ssh");
+    let _ = std::fs::write(BASTION_AUTHORIZED_KEYS, keys);
+
+    let ids = managed_clone_ids(&app.store.get().hosts);
+    let key_path = bastion_hostkey_path(data_dir);
+    let want = render_bastion_sshd_config(
+        cfg.listen.bastion,
+        key_path.to_str().unwrap_or_default(),
+        BASTION_AUTHORIZED_KEYS,
+        &ids,
+    );
+    let changed = std::fs::read_to_string(BASTION_SSHD_CONFIG).ok().as_deref() != Some(&want);
+    if changed {
+        let _ = std::fs::write(BASTION_SSHD_CONFIG, &want);
+    }
+    changed
+}
+
+/// Push the current `authorized_keys` into each running managed clone whose last-pushed
+/// hash differs. `pushed` tracks `clone_id → keys_hash` so a tar upload happens only on a
+/// real change or a newly-seen clone. Best-effort per clone.
+async fn push_keys_to_clones(app: &App, data_dir: &str, pushed: &mut HashMap<String, u64>) {
+    let cfg = app.config();
+    let hash = keys_hash(&cfg.ssh.authorized_keys);
+    for host in app.store.get().hosts.into_iter().filter(|h| h.managed) {
+        if pushed.get(&host.id) == Some(&hash) {
+            continue;
+        }
+        if !app.docker.is_running(&host.id).await.unwrap_or(false) {
+            continue; // stopped clones get keys at next provision/boot
+        }
+        match clone_ssh_tar_entries(data_dir, &host.id, &cfg.ssh.authorized_keys) {
+            // Only push authorized_keys live; the host key is provision-time only (changing
+            // it under a running sshd would need a restart), so filter to the .ssh file.
+            Ok(entries) => {
+                let ak: Vec<_> =
+                    entries.into_iter().filter(|e| e.path.starts_with("home/")).collect();
+                match app.docker.upload_tar(&host.id, ak).await {
+                    Ok(()) => {
+                        pushed.insert(host.id.clone(), hash);
+                        tracing::info!(target: "ssh", "pushed authorized_keys to {}", host.id);
+                    }
+                    Err(e) => tracing::warn!(target: "ssh", "push keys to {} failed: {e}", host.id),
+                }
+            }
+            Err(e) => tracing::warn!(target: "ssh", "key material for {} failed: {e}", host.id),
+        }
+    }
+}
+
+fn spawn_sshd() -> std::io::Result<Child> {
+    // `-D` foreground, `-e` log to stderr so the supervisor's pipe sees failures.
+    Command::new("/usr/sbin/sshd")
+        .args(["-D", "-e", "-f", BASTION_SSHD_CONFIG])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+}
+
+async fn log_lines<R: AsyncRead + Unpin>(reader: R) {
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => tracing::info!(target: "ssh", "{line}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Run one `sshd` to exit while concurrently (a) draining its logs and (b) reconciling the
+/// allowlist + clone keys every `RECONCILE_INTERVAL`, reloading `sshd` (SIGHUP) when the
+/// config changed. Returns when `sshd` exits.
+async fn run_sshd(mut child: Child, app: &App, data_dir: &str, pushed: &mut HashMap<String, u64>) {
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let pid = child.id();
+    let logs = async {
+        tokio::join!(
+            async { if let Some(r) = out { log_lines(r).await } },
+            async { if let Some(r) = err { log_lines(r).await } },
+        );
+    };
+    let reconcile = async {
+        loop {
+            tokio::time::sleep(RECONCILE_INTERVAL).await;
+            let changed = render_bastion_files(app, data_dir);
+            if changed {
+                if let Some(pid) = pid {
+                    // Reload PermitOpen without dropping live tunnels.
+                    let _ = Command::new("kill").args(["-HUP", &pid.to_string()]).status().await;
+                    tracing::info!(target: "ssh", "reloaded bastion sshd (fleet changed)");
+                }
+            }
+            push_keys_to_clones(app, data_dir, pushed).await;
+        }
+    };
+    tokio::select! {
+        status = child.wait() => match status {
+            Ok(s) => tracing::warn!(target: "ssh", "bastion sshd exited ({s}) — restarting"),
+            Err(e) => tracing::warn!(target: "ssh", "waiting on bastion sshd failed: {e}"),
+        },
+        _ = logs => {}
+        _ = reconcile => {}
+    }
+}
+
+/// Ensure the host key, render the initial config, then supervise `sshd` forever with
+/// capped backoff. Never returns. Disabled clones/keys are fine — the bastion just runs
+/// with an empty `authorized_keys` (no one can auth) and `PermitOpen none`.
+pub async fn run(app: App) {
+    let data_dir = app.config().data_dir.clone();
+    if let Err(e) = ensure_hostkey(&bastion_hostkey_path(&data_dir)) {
+        tracing::error!(target: "ssh", "bastion host key generation failed: {e}");
+    }
+    let mut pushed: HashMap<String, u64> = HashMap::new();
+    let mut failures: u32 = 0;
+    let mut spawn_error_logged = false;
+    loop {
+        render_bastion_files(&app, &data_dir);
+        push_keys_to_clones(&app, &data_dir, &mut pushed).await;
+        let started = Instant::now();
+        match spawn_sshd() {
+            Ok(child) => {
+                spawn_error_logged = false;
+                tracing::info!(target: "ssh", "bastion sshd listening on :{}", app.config().listen.bastion);
+                run_sshd(child, &app, &data_dir, &mut pushed).await;
+            }
+            Err(e) if !spawn_error_logged => {
+                tracing::error!(target: "ssh", "failed to spawn sshd (openssh-server installed?): {e}");
+                spawn_error_logged = true;
+            }
+            Err(e) => tracing::debug!(target: "ssh", "sshd spawn still failing: {e}"),
+        }
+        if started.elapsed() >= STABLE_RUN {
+            failures = 0;
+        }
+        let delay = backoff(failures);
+        failures = failures.saturating_add(1);
+        tokio::time::sleep(delay).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +473,28 @@ mod tests {
         assert_eq!(a, b, "order must not matter");
         let c = keys_hash(&["k1".into()]);
         assert_ne!(a, c, "a changed key set must change the hash");
+    }
+
+    #[test]
+    fn backoff_escalates_then_caps() {
+        assert_eq!(backoff(0), std::time::Duration::from_secs(15));
+        assert_eq!(backoff(4).as_secs(), 240);
+        assert_eq!(backoff(10).as_secs(), 300); // capped
+        assert_eq!(backoff(u32::MAX).as_secs(), 300); // saturating
+    }
+
+    #[test]
+    fn managed_clone_ids_filters_and_sorts() {
+        let mut h1 = wire::Host::default();
+        h1.id = "b-clone".into();
+        h1.managed = true;
+        let mut h2 = wire::Host::default();
+        h2.id = "a-clone".into();
+        h2.managed = true;
+        let mut unmanaged = wire::Host::default();
+        unmanaged.id = "legacy".into();
+        unmanaged.managed = false;
+        let ids = managed_clone_ids(&[h1, unmanaged, h2]);
+        assert_eq!(ids, vec!["a-clone".to_string(), "b-clone".to_string()]);
     }
 }
