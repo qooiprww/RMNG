@@ -122,7 +122,13 @@ async fn poll_once(app: &App) {
     // - probe and stats run concurrently (`join!`), not sequentially, so even a healthy
     //   tick's state application never waits on the daemon's ~1 s two-cycle sampling
     //   (`one_shot=false` collects two CPU cycles before answering).
-    let probes = futures::future::join_all(hosts.iter().map(|h| async move {
+    let docker_disk_fut = async {
+        tokio::time::timeout(FETCH_TIMEOUT, app.docker.docker_disk_used())
+            .await
+            .ok()
+            .flatten()
+    };
+    let probes_fut = futures::future::join_all(hosts.iter().map(|h| async move {
         let stats_fut = async {
             if !h.managed {
                 return None;
@@ -134,13 +140,16 @@ async fn poll_once(app: &App) {
         };
         let (state, stats) = tokio::join!(probe_host(app, h, agent_port), stats_fut);
         (h.id.clone(), state, stats)
-    }))
-    .await;
+    }));
+    let (docker_disk_used, probes) = tokio::join!(docker_disk_fut, probes_fut);
 
     let mut next: HashMap<String, MonitorState> = HashMap::with_capacity(probes.len());
     let mut stats_map: HashMap<String, ContainerStats> = HashMap::new();
     for (id, state, stats) in probes {
-        if let Some(s) = stats {
+        if let Some(mut s) = stats {
+            if let Some(disk) = docker_disk_used {
+                s.docker_disk_used = disk;
+            }
             stats_map.insert(id.clone(), s);
         }
         next.insert(id, state);
@@ -198,7 +207,12 @@ mod tests {
     use super::*;
 
     fn stat(cpu: f64) -> ContainerStats {
-        ContainerStats { cpu_pct: cpu, mem_used: 1 << 30, mem_limit: 8u64 << 30 }
+        ContainerStats {
+            cpu_pct: cpu,
+            mem_used: 1 << 30,
+            mem_limit: 8u64 << 30,
+            docker_disk_used: 0,
+        }
     }
 
     #[test]

@@ -131,21 +131,25 @@ export const stats: Record<string, ContainerStats> = {
     cpuPct: 640, // ÷ cloneCpus(16) → 40% of the clone's allowance
     memUsed: BigInt(Math.round(5.1 * GiB)),
     memLimit: BigInt(32 * GiB),
+    dockerDiskUsed: BigInt(Math.round(91.3 * GiB)),
   },
   [hostIdle.id]: {
     cpuPct: 12,
     memUsed: BigInt(Math.round(1.4 * GiB)),
     memLimit: BigInt(32 * GiB),
+    dockerDiskUsed: BigInt(Math.round(91.3 * GiB)),
   },
   [hostNoToken.id]: {
     cpuPct: 3,
     memUsed: BigInt(Math.round(0.6 * GiB)),
     memLimit: BigInt(32 * GiB),
+    dockerDiskUsed: BigInt(Math.round(91.3 * GiB)),
   },
   [hostDualProvider.id]: {
     cpuPct: 288, // ÷ cloneCpus(16) → 18% of the clone's allowance
     memUsed: BigInt(Math.round(3.2 * GiB)),
     memLimit: BigInt(32 * GiB),
+    dockerDiskUsed: BigInt(Math.round(91.3 * GiB)),
   },
 };
 

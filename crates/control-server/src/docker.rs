@@ -40,8 +40,9 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CommitContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-    ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder,
-    RemoveVolumeOptionsBuilder, StatsOptionsBuilder, StopContainerOptionsBuilder,
+    DataUsageOptions, ListImagesOptionsBuilder, RemoveContainerOptionsBuilder,
+    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder, StatsOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1631,6 +1632,14 @@ impl DockerCtl {
         }
     }
 
+    /// Total Docker daemon disk usage in bytes, matching the assumption that RMNG owns
+    /// this daemon. Uses Docker's `system df` accounting: image layer bytes once,
+    /// container writable layers, volumes, and build cache.
+    pub async fn docker_disk_used(&self) -> Option<u64> {
+        let df = self.daemon().ok()?.df(None::<DataUsageOptions>).await.ok()?;
+        Some(docker_disk_used_from_df(df))
+    }
+
     /// One-shot live resource sample for a container (`stream=false` so the daemon
     /// returns a single frame then disconnects; `one_shot=false` so it collects TWO CPU
     /// cycles and fills `precpu_stats`, which the CPU-delta math needs). Returns `None` —
@@ -1685,7 +1694,7 @@ impl DockerCtl {
             .unwrap_or(1);
         let cpu_pct = cpu_percent(cpu_total, precpu_total, system, presystem, online);
 
-        Some(ContainerStats { cpu_pct, mem_used, mem_limit })
+        Some(ContainerStats { cpu_pct, mem_used, mem_limit, docker_disk_used: 0 })
     }
 
     /// The container's host PID (`State.Pid`), or `None` when it isn't running (the daemon
@@ -2159,6 +2168,37 @@ fn cpu_percent(cpu_total: u64, precpu_total: u64, system: u64, presystem: u64, o
     (cpu_delta / system_delta) * online_cpus as f64 * 100.0
 }
 
+fn docker_disk_used_from_df(df: bollard::models::SystemDataUsageResponse) -> u64 {
+    let mut total = nonnegative_i64(df.layers_size).unwrap_or(0);
+    total = total.saturating_add(
+        df.containers
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| nonnegative_i64(c.size_rw))
+            .sum::<u64>(),
+    );
+    total = total.saturating_add(
+        df.volumes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.usage_data)
+            .filter_map(|u| nonnegative_i64(Some(u.size)))
+            .sum::<u64>(),
+    );
+    total = total.saturating_add(
+        df.build_cache
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| nonnegative_i64(c.size))
+            .sum::<u64>(),
+    );
+    total
+}
+
+fn nonnegative_i64(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| u64::try_from(v).ok())
+}
+
 /// A short (12-hex) form of a full container/image id for log lines. `sha256:` prefixes
 /// are stripped first.
 fn short_id(id: &str) -> String {
@@ -2389,6 +2429,38 @@ mod tests {
         assert_eq!(ctl.control_host().await.unwrap(), "10.99.0.1");
         ctl.set_subnet("10.98.0.0/24");
         assert_eq!(ctl.control_host().await.unwrap(), "10.98.0.1");
+    }
+
+    #[test]
+    fn docker_disk_used_sums_daemon_usage_categories_once() {
+        let df: bollard::models::SystemDataUsageResponse = serde_json::from_value(serde_json::json!({
+            "LayersSize": 10,
+            "Containers": [{ "SizeRw": 2 }, { "SizeRw": -1 }],
+            "Volumes": [
+                {
+                    "Name": "rmng-data",
+                    "Driver": "local",
+                    "Mountpoint": "/var/lib/docker/volumes/rmng-data/_data",
+                    "Labels": {},
+                    "Options": {},
+                    "Scope": "local",
+                    "UsageData": { "Size": 3, "RefCount": 1 }
+                },
+                {
+                    "Name": "unknown",
+                    "Driver": "local",
+                    "Mountpoint": "/var/lib/docker/volumes/unknown/_data",
+                    "Labels": {},
+                    "Options": {},
+                    "Scope": "local",
+                    "UsageData": { "Size": -1, "RefCount": -1 }
+                }
+            ],
+            "BuildCache": [{ "Size": 5 }]
+        }))
+        .unwrap();
+
+        assert_eq!(docker_disk_used_from_df(df), 20);
     }
 
     // --- cpu percent ------------------------------------------------------------------

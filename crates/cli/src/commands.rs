@@ -416,11 +416,21 @@ fn host_from_base(base: &str) -> &str {
         .unwrap_or(base)
 }
 
+fn validate_ssh_host(st: &ControlState, host: &str) -> Result<()> {
+    if st.hosts.iter().any(|h| h.id == host) {
+        Ok(())
+    } else {
+        bail!("unknown host '{host}' (see `rmng ps`)")
+    }
+}
+
 /// `rmng ssh <host>`: print the ready-to-paste `ssh` one-liner that jumps through the
 /// bastion into the clone. Fetches the redacted config for `ssh.publicHost` and
 /// `listen.bastion`; falls back to a best-effort host guess (with a stderr note) when
 /// `publicHost` isn't set, so the command on stdout stays copy-pasteable either way.
 pub async fn ssh_cmd(client: &Client, host: &str) -> Result<u8> {
+    let st = client.state().await?;
+    validate_ssh_host(&st, host)?;
     let cfg = client.config().await?;
     let public_host = if !cfg.ssh.public_host.trim().is_empty() {
         cfg.ssh.public_host.clone()
@@ -738,6 +748,22 @@ mod tests {
             build_ssh_command("rmng.example.com", 2222, "w-cp-claude"),
             "ssh -J rmng@rmng.example.com:2222 -o StrictHostKeyChecking=accept-new rmng@w-cp-claude"
         );
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_unknown_host() {
+        let st = ControlState {
+            hosts: vec![wire::Host {
+                id: "pega-herms".into(),
+                managed: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = validate_ssh_host(&st, "herms").expect_err("host suffix must not match");
+        assert_eq!(err.to_string(), "unknown host 'herms' (see `rmng ps`)");
+        validate_ssh_host(&st, "pega-herms").expect("exact host id should match");
     }
 
     #[test]

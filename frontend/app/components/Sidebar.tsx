@@ -18,6 +18,7 @@ import { Settings } from "lucide-react";
 import { ClaudeAccountsPanel } from "~/components/ClaudeAccountsPanel";
 import { OperationProgress } from "~/components/OperationProgress";
 import { SidebarHost } from "~/components/SidebarHost";
+import { formatBytes } from "~/lib/format";
 import type { ClaudeUsage, Host, Operation } from "~/lib/types";
 import type { ContainerStats } from "~/lib/wire/ContainerStats";
 import type { ForwardRuntime } from "~/lib/wire/ForwardRuntime";
@@ -26,9 +27,10 @@ export function formatHostsUsageSummary(
   hostIds: string[],
   stats: Record<string, ContainerStats>,
   cloneCpus: number,
-): { cpu: string; mem: string } | null {
+): { cpu: string; mem: string; disk?: string } | null {
   let cpuPctTotal = 0;
   let memUsedTotal = 0;
+  let dockerDiskUsed = 0;
   let sampleCount = 0;
 
   for (const id of hostIds) {
@@ -36,6 +38,7 @@ export function formatHostsUsageSummary(
     if (!sample || Number(sample.memLimit) <= 0) continue;
     cpuPctTotal += sample.cpuPct;
     memUsedTotal += Number(sample.memUsed);
+    dockerDiskUsed = Math.max(dockerDiskUsed, Number(sample.dockerDiskUsed ?? 0));
     sampleCount += 1;
   }
 
@@ -50,7 +53,11 @@ export function formatHostsUsageSummary(
           return `${pct < 1 ? pct.toFixed(1) : Math.round(pct)}%`;
         })()
       : `${(cpuPctTotal / 100).toFixed(1)}c`;
-  return { cpu, mem };
+  return {
+    cpu,
+    mem,
+    ...(dockerDiskUsed > 0 ? { disk: formatBytes(dockerDiskUsed).replace(" ", "") } : {}),
+  };
 }
 
 export interface SidebarProps {
@@ -219,9 +226,10 @@ export function Sidebar({
             {hostsUsage ? (
               <span
                 className="truncate text-[11px] font-semibold tabular-nums text-slate-500 dark:text-slate-400"
-                title="Total live container CPU and memory usage"
+                title="Total live container CPU and memory usage; Docker daemon disk usage"
               >
                 CPU {hostsUsage.cpu} · MEM {hostsUsage.mem}
+                {hostsUsage.disk ? <> · DISK {hostsUsage.disk}</> : null}
               </span>
             ) : null}
           </div>

@@ -256,6 +256,11 @@ pub struct ContainerStats {
     pub mem_used: u64,
     /// Memory limit in bytes; 0 when the daemon reports none.
     pub mem_limit: u64,
+    /// Total Docker daemon disk usage in bytes. This is daemon-wide, not per-container;
+    /// the monitor repeats it on each live stats sample so the frontend can show one
+    /// sidebar total without routing volatile data through `ControlState`.
+    #[serde(default)]
+    pub docker_disk_used: u64,
 }
 
 /// Version + update-available status for the control-server itself, served by
