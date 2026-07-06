@@ -5,7 +5,7 @@
 use anyhow::{Result, anyhow, bail};
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
-use wire::{AppConfigRedacted, ControlState, ImageInfo, Operation};
+use wire::{AppConfigRedacted, ControlState, ExecRequest, ExecResult, ImageInfo, Operation};
 
 /// A connected control-server client.
 #[derive(Clone)]
@@ -219,6 +219,25 @@ impl Client {
     /// The redacted server config (presets, account groups, docker settings — no secrets).
     pub async fn config(&self) -> Result<AppConfigRedacted> {
         self.get_json("/api/config").await
+    }
+
+    /// Proxy a desktop-automation tool call to a clone's daemon MCP
+    /// (`POST /api/hosts/:id/mcp`). Returns the daemon's `content` array verbatim (a
+    /// JSON array of `{type:"text",…}` / `{type:"image",…}` items). Unknown clone → the
+    /// server's 404, daemon error → its 502, both surfaced as errors by `check`.
+    pub async fn desktop(&self, host: &str, tool: &str, args: Value) -> Result<Value> {
+        self.post_json(
+            &format!("/api/hosts/{host}/mcp"),
+            &json!({ "tool": tool, "args": args }),
+        )
+        .await
+    }
+
+    /// Run a single non-interactive command inside a clone (`POST /api/hosts/:id/exec`).
+    /// Returns the command's exit code plus its captured stdout/stderr.
+    pub async fn exec(&self, host: &str, req: &ExecRequest) -> Result<ExecResult> {
+        self.post_json(&format!("/api/hosts/{host}/exec"), &serde_json::to_value(req)?)
+            .await
     }
 }
 

@@ -57,5 +57,24 @@ async fn run(cli: &Cli, client: &Client) -> anyhow::Result<u8> {
         Cmd::Ops => commands::ops(client, cli.json).await,
         Cmd::Wait { op_id, timeout } => commands::wait_cmd(client, op_id, *timeout, cli.json).await,
         Cmd::Ssh { host } => commands::ssh_cmd(client, host).await,
+        Cmd::Desktop { clone, cmd } => commands::desktop(client, clone, cmd, cli.json).await,
+        Cmd::Exec {
+            clone,
+            user,
+            workdir,
+            env,
+            cmd,
+        } => {
+            commands::exec(
+                client,
+                clone,
+                user.as_deref(),
+                workdir.as_deref(),
+                env,
+                cmd,
+                cli.json,
+            )
+            .await
+        }
     }
 }
