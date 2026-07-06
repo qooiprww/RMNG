@@ -6,6 +6,7 @@
 //!   dropped read self-heals.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
@@ -17,6 +18,8 @@ use crate::app::App;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const FETCH_TIMEOUT: Duration = Duration::from_millis(2500);
+const DISK_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const DISK_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Volatile per-host resource-usage bus. The monitor poller samples each running managed
 /// clone's CPU/RAM every tick and publishes the whole `{ hostId: ContainerStats }` map
@@ -30,6 +33,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_millis(2500);
 /// subscribers.
 pub struct StatsBus {
     tx: broadcast::Sender<String>,
+    docker_disk_used: AtomicU64,
     /// The latest published map + its serialization (the snapshot new subscribers get;
     /// `"{}"` until the first tick). The dedupe compares the MAP (`HashMap: PartialEq`),
     /// never the JSON bytes: `poll_once` builds a fresh `HashMap` each tick and
@@ -41,12 +45,24 @@ pub struct StatsBus {
 impl StatsBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(16);
-        Self { tx, latest: StdRwLock::new((HashMap::new(), "{}".to_string())) }
+        Self {
+            tx,
+            docker_disk_used: AtomicU64::new(0),
+            latest: StdRwLock::new((HashMap::new(), "{}".to_string())),
+        }
     }
 
     /// The latest published map (JSON) + a live receiver, for a new `/events` subscriber.
     pub fn subscribe(&self) -> (String, broadcast::Receiver<String>) {
         (self.latest.read().unwrap().1.clone(), self.tx.subscribe())
+    }
+
+    fn docker_disk_used(&self) -> u64 {
+        self.docker_disk_used.load(Ordering::Relaxed)
+    }
+
+    fn set_docker_disk_used(&self, bytes: u64) {
+        self.docker_disk_used.store(bytes, Ordering::Relaxed);
     }
 
     /// Publish a stats map, but only broadcast when it differs from the last one — an
@@ -122,12 +138,6 @@ async fn poll_once(app: &App) {
     // - probe and stats run concurrently (`join!`), not sequentially, so even a healthy
     //   tick's state application never waits on the daemon's ~1 s two-cycle sampling
     //   (`one_shot=false` collects two CPU cycles before answering).
-    let docker_disk_fut = async {
-        tokio::time::timeout(FETCH_TIMEOUT, app.docker.docker_disk_used())
-            .await
-            .ok()
-            .flatten()
-    };
     let probes_fut = futures::future::join_all(hosts.iter().map(|h| async move {
         let stats_fut = async {
             if !h.managed {
@@ -141,15 +151,14 @@ async fn poll_once(app: &App) {
         let (state, stats) = tokio::join!(probe_host(app, h, agent_port), stats_fut);
         (h.id.clone(), state, stats)
     }));
-    let (docker_disk_used, probes) = tokio::join!(docker_disk_fut, probes_fut);
+    let probes = probes_fut.await;
+    let docker_disk_used = app.stats.docker_disk_used();
 
     let mut next: HashMap<String, MonitorState> = HashMap::with_capacity(probes.len());
     let mut stats_map: HashMap<String, ContainerStats> = HashMap::new();
     for (id, state, stats) in probes {
         if let Some(mut s) = stats {
-            if let Some(disk) = docker_disk_used {
-                s.docker_disk_used = disk;
-            }
+            s.docker_disk_used = docker_disk_used;
             stats_map.insert(id.clone(), s);
         }
         next.insert(id, state);
@@ -193,9 +202,33 @@ async fn poll_once(app: &App) {
     });
 }
 
+async fn poll_docker_disk_once(app: &App) {
+    match tokio::time::timeout(DISK_FETCH_TIMEOUT, app.docker.docker_disk_used()).await {
+        Ok(Some(bytes)) => app.stats.set_docker_disk_used(bytes),
+        Ok(None) => tracing::debug!("docker disk usage unavailable this tick"),
+        Err(_) => tracing::warn!(
+            "docker disk usage sample timed out after {}s",
+            DISK_FETCH_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+async fn run_docker_disk_poller(app: App) {
+    tracing::info!(
+        "docker disk usage poller started (every {}s, timeout {}s)",
+        DISK_POLL_INTERVAL.as_secs(),
+        DISK_FETCH_TIMEOUT.as_secs()
+    );
+    loop {
+        poll_docker_disk_once(&app).await;
+        tokio::time::sleep(DISK_POLL_INTERVAL).await;
+    }
+}
+
 /// Background loop; spawned once at startup.
 pub async fn run(app: App) {
     tracing::info!("monitor poller started (every {}s)", POLL_INTERVAL.as_secs());
+    tokio::spawn(run_docker_disk_poller(app.clone()));
     loop {
         poll_once(&app).await;
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -220,6 +253,14 @@ mod tests {
         let bus = StatsBus::new();
         let (snap, _rx) = bus.subscribe();
         assert_eq!(snap, "{}");
+    }
+
+    #[test]
+    fn stats_bus_tracks_cached_docker_disk_usage() {
+        let bus = StatsBus::new();
+        assert_eq!(bus.docker_disk_used(), 0);
+        bus.set_docker_disk_used(42);
+        assert_eq!(bus.docker_disk_used(), 42);
     }
 
     #[test]
