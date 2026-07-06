@@ -236,6 +236,16 @@ echo "moved stale PATH-shadowing rmng CLI to $backup"
 "#
 }
 
+fn tmp_mount_mask_script() -> &'static str {
+    r#"set -e
+systemctl mask tmp.mount >/dev/null 2>&1 || {
+  mkdir -p /etc/systemd/system
+  ln -sf /dev/null /etc/systemd/system/tmp.mount
+}
+systemctl daemon-reload >/dev/null 2>&1 || true
+"#
+}
+
 fn etc_environment_sync_script(desired_env: &str) -> String {
     let desired_b64 = B64.encode(desired_env);
     format!(
@@ -530,6 +540,19 @@ async fn reconcile_once(app: &App, warned: &mut HashSet<String>) {
             }
         }
 
+        match exec_ok(app, id, tmp_mount_mask_script(), "mask tmp.mount").await {
+            Ok(()) => {
+                warned.remove(&format!("{id}:tmp-mount"));
+            }
+            Err(e) => {
+                if warned.insert(format!("{id}:tmp-mount")) {
+                    tracing::warn!(target: "clone_reconcile", "clone {id}: tmp.mount reconcile failed: {e:#}");
+                } else {
+                    tracing::debug!(target: "clone_reconcile", "clone {id}: tmp.mount reconcile still failing: {e:#}");
+                }
+            }
+        }
+
         match ensure_codex_cli(app, id).await {
             Ok(()) => {
                 warned.remove(&format!("{id}:codex-cli"));
@@ -690,6 +713,16 @@ mod tests {
         assert!(script.contains("sha256sum"));
         assert!(script.contains("mv -- \"$shadow\""));
         assert!(script.contains(".shadowed-by-rmng-update."));
+    }
+
+    #[test]
+    fn tmp_mount_mask_script_disables_future_tmpfs_without_unmounting_live_tmp() {
+        let script = tmp_mount_mask_script();
+        assert!(script.contains("systemctl mask tmp.mount"));
+        assert!(script.contains("/etc/systemd/system/tmp.mount"));
+        assert!(script.contains("daemon-reload"));
+        assert!(!script.contains("systemctl stop tmp.mount"));
+        assert!(!script.contains("umount"));
     }
 
     #[test]

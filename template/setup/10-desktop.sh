@@ -90,6 +90,13 @@ systemctl mask systemd-udevd.service systemd-udev-trigger.service >/dev/null 2>&
 log "mask tpm-udev (boot /dev churn trips its start limit; no TPM in a container)"
 systemctl mask tpm-udev.path tpm-udev.service >/dev/null 2>&1 || true
 
+# Ubuntu 26.04's basic.target wants tmp.mount, whose packaged unit mounts /tmp as tmpfs
+# (size=50%). Clones already have a disk-backed overlay rootfs and agents often use /tmp for
+# large build/download scratch space, so keep /tmp on regular container disk. /dev/shm stays
+# tmpfs and is sized separately by DockerCtl for Chromium/Electron.
+log "mask tmp.mount (/tmp should use regular container disk, not tmpfs)"
+systemctl mask tmp.mount >/dev/null 2>&1 || true
+
 # The header's "NO gdm3 / NO gnome-remote-desktop" isn't free: gnome-shell *Recommends*
 # gdm3 and the desktop pulls gnome-remote-desktop, so the recommends-on install above drags
 # both back in. Same story for NetworkManager (+ its ModemManager recommend): nothing here
