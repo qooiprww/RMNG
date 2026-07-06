@@ -188,11 +188,15 @@ pub enum DesktopCmd {
     Key {
         /// Key chord (e.g. `ctrl+c`, `Return`)
         keys: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Type literal text (→ `type`)
     Type {
         /// The text to type
         text: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Launch an app by id, e.g. `firefox.desktop` (→ `launch_app`)
     Launch {
@@ -366,6 +370,29 @@ mod tests {
             }
             other => panic!("wrong cmd: {other:?}"),
         }
+    }
+
+    #[test]
+    fn desktop_type_and_key_accept_out_flag() {
+        let cli = Cli::parse_from(["rmng", "desktop", "w-cp", "type", "hello", "--out", "/x.jpg"]);
+        match cli.cmd {
+            Cmd::Desktop {
+                cmd: DesktopCmd::Type { text, out },
+                ..
+            } => {
+                assert_eq!(text, "hello");
+                assert_eq!(out.as_deref(), Some(std::path::Path::new("/x.jpg")));
+            }
+            other => panic!("wrong cmd: {other:?}"),
+        }
+        let cli = Cli::parse_from(["rmng", "desktop", "w-cp", "key", "ctrl+c", "--out", "/k.jpg"]);
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Desktop {
+                cmd: DesktopCmd::Key { out: Some(_), .. },
+                ..
+            }
+        ));
     }
 
     #[test]

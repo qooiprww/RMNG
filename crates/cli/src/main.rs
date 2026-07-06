@@ -1,7 +1,8 @@
 //! `rmng` — fleet management for the RMNG control-server over the port-2 web API.
 //!
 //! Exit codes: 0 ok · 1 API/transport error · 2 usage (clap) · 3 operation ended in
-//! Error · 4 `--wait`/`wait` timeout.
+//! Error · 4 `--wait`/`wait` timeout. `exec` instead passes through the executed
+//! command's own exit code (125 when docker reports no code).
 
 mod args;
 mod commands;

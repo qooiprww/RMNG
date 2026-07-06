@@ -590,19 +590,19 @@ pub async fn desktop(client: &Client, clone: &str, cmd: &DesktopCmd, json: bool)
                 *monitor,
                 out.clone(),
             ),
-            DesktopCmd::Key { keys } => (
+            DesktopCmd::Key { keys, out } => (
                 "key",
                 args_obj(vec![("keys", keys.clone().into())]),
                 Kind::Action,
                 None,
-                None,
+                out.clone(),
             ),
-            DesktopCmd::Type { text } => (
+            DesktopCmd::Type { text, out } => (
                 "type",
                 args_obj(vec![("text", text.clone().into())]),
                 Kind::Action,
                 None,
-                None,
+                out.clone(),
             ),
             DesktopCmd::Launch { id } => (
                 "launch_app",
@@ -709,8 +709,13 @@ pub async fn exec(
         eprint!("{}", result.stderr);
         std::io::stderr().flush().ok();
     }
-    // Surface the command's own status; clamp into the process-exit range.
-    Ok(result.exit_code.clamp(0, 255) as u8)
+    // Surface the command's own status. A value outside 0..=255 means docker gave no
+    // exit code (server sentinel -1) — report 125 (docker's own "exec failure" code)
+    // rather than masking an unknown outcome as success.
+    Ok(match result.exit_code {
+        c @ 0..=255 => c as u8,
+        _ => 125,
+    })
 }
 
 /// Used by `main` for a friendlier connection-refused hint.
