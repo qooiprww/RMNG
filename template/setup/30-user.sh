@@ -191,6 +191,41 @@ CLAUDEMD
 chown "$USERNAME:$USERNAME" "$CLAUDE_DIR/CLAUDE.md"
 chmod 644 "$CLAUDE_DIR/CLAUDE.md"
 
+# Shared user Codex instructions + MCP config. Codex reads global guidance from
+# ~/.codex/AGENTS.md and MCP servers from ~/.codex/config.toml. The control-server
+# overwrites this at clone creation/reconcile with a clone-specific control-server MCP
+# header; the template carries the static guidance, desktop MCP, and Linear MCP defaults.
+log "shared user Codex AGENTS.md + MCP config"
+CODEX_DIR="/home/$USERNAME/.codex"
+install -d -o "$USERNAME" -g "$USERNAME" -m700 "$CODEX_DIR"
+cat > "$CODEX_DIR/AGENTS.md" <<'CODEXAGENTS'
+# Working in this clone
+
+This machine is a **disposable, single-purpose dev sandbox** that belongs to you,
+with **passwordless `sudo`**. Install packages, toolchains, and global CLIs freely
+and reconfigure the system as needed — the machine itself is throwaway and there is
+no other user to disturb. Optimize for getting the task done.
+
+## When you're blocked
+
+If you're genuinely stuck — missing access or credentials, an ambiguous
+requirement, or a call that's the human's to make — **stop and ask** rather than
+guessing or thrashing. A precise question beats a confident wrong turn.
+CODEXAGENTS
+cat > "$CODEX_DIR/config.toml" <<'CODEXCONFIG'
+# Managed by RMNG. Re-created by the control-server clone reconciler.
+
+[mcp_servers.desktop]
+url = "http://127.0.0.1:9004"
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+bearer_token_env_var = "LINEAR_API_KEY"
+CODEXCONFIG
+chown "$USERNAME:$USERNAME" "$CODEX_DIR/AGENTS.md" "$CODEX_DIR/config.toml"
+chmod 644 "$CODEX_DIR/AGENTS.md"
+chmod 600 "$CODEX_DIR/config.toml"
+
 # User-scope `linear` MCP for every `claude` on the clone (interactive shell, inner Cursor
 # agent; the agent-wrapper registers the same server programmatically). mcpServers lives in
 # ~/.claude.json — a top-level key; settings.json does NOT support it. ${LINEAR_API_KEY}

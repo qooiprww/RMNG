@@ -21,9 +21,16 @@ The control-server injects the CLI into **every clone at create time** as
 `/usr/local/bin/rmng` — on PATH in every shell (`/opt/rmng/bin`, where the service binaries
 go, is not). The Dockerfile builds `-p rmng-cli` and ships the payload at
 `/usr/local/share/rmng/rmng-cli`; [`provision.rs`](../crates/control-server/src/provision.rs)'s
-`CLONE_BINARIES` copies it in before the container boots. Create-time injection is the
-**sole delivery path** (the binswap hot-swap engine is retired), so clones created *before*
-a server update don't have it — only clones created after.
+`CLONE_BINARIES` copies it in before the container boots. The clone reconciler also refreshes
+this binary on already-running managed clones after a control-server update.
+
+Codex itself is template-installed under the clone user, and the control-server retries a
+missing standalone Codex CLI install at clone creation and from the clone reconciler for old
+running clones. RMNG gives Codex parity with Claude's shared clone context by managing
+`~/.codex/AGENTS.md` and `~/.codex/config.toml`: Codex gets the same disposable-sandbox
+guidance, plus MCP servers for the local desktop daemon (`desktop`), the per-clone
+control-server MCP (`control-server`), and Linear (`linear`, using `LINEAR_API_KEY`). The
+clone reconciler refreshes those files on old running clones.
 
 ## Server resolution
 

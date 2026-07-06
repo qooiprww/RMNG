@@ -66,10 +66,11 @@ a running clone's Codex account with no restart (the Codex CLI re-reads auth per
 
 > **Provisioning note:** the `codex` CLI is installed into the clone template by
 > `template/setup/30-user.sh` (warn-only — the install step does not fail the build if the
-> CLI is unavailable). Existing clone images built before this change **do not** have the
-> Codex CLI and need a template rebuild (`docker build`) followed by `POST /api/images/pull`
-> to pull the updated template. The control-server's create-time binary injection does
-> **not** install toolchain CLIs like `codex` — it only ships the RMNG binaries.
+> CLI is unavailable). The control-server also attempts a missing standalone Codex CLI
+> install at clone creation and from the clone reconciler for old running clones. A failed
+> download does not block the clone; the reconciler retries later. Codex guidance/MCP files
+> (`~/.codex/AGENTS.md`, `~/.codex/config.toml`) are written at clone creation and refreshed
+> on old running clones.
 
 ---
 
@@ -88,12 +89,13 @@ inside the script — never baked as image `ENV`, or it would leak into the boot
 | `10-desktop.sh` | Locale/tz, headless GNOME + Mutter + VA-API + PipeWire (no gdm3/g-r-d/flatpak), the Recommends strip, container masks |
 | `15-gnome-patch.sh` | `dpkg -i` the patched gnome-shell `.deb` (from the `gnome-build` stage) over stock |
 | `20-toolbox.sh` | Best-effort dev toolbox: CLI tools, Docker, cloud CLIs, browsers, Cursor/VS Code, HMCL/Mission Center/Monaspace, dconf defaults |
-| `30-user.sh` | The uid-1000 clone user (groups, linger, fish), preset-PATH rc, keyring, shared `CLAUDE.md` + linear MCP, `claude`/`uv`/`rustup`/`nvm` toolchains, and the three `systemd --user` units (`gnome-headless`, `rmng-clone-daemon`, `agent-wrapper`) + wants symlinks |
+| `30-user.sh` | The uid-1000 clone user (groups, linger, fish), preset-PATH rc, keyring, shared `CLAUDE.md`, Codex `AGENTS.md`/`config.toml`, Claude+Codex Linear MCP defaults, `claude`/`codex`/`uv`/`rustup`/`nvm` toolchains, and the three `systemd --user` units (`gnome-headless`, `rmng-clone-daemon`, `agent-wrapper`) + wants symlinks |
 
 `30-user.sh` creates `/opt/rmng/bin` (root:root, 0755) **empty** — the template no longer
 carries `clone-daemon`/`agent-wrapper`; the control-server installs its own current copies
 (plus the `rmng` CLI at `/usr/local/bin/rmng`) into each clone at create time, before boot
-([`provision.rs`](../crates/control-server/src/provision.rs) `CLONE_BINARIES`). Unlike the
+([`provision.rs`](../crates/control-server/src/provision.rs) `CLONE_BINARIES`) and refreshes
+them on running managed clones through the clone reconciler after server upgrades. Unlike the
 retired `provision-clone.sh`, these scripts never run
 inside a live container over `docker exec` — they're plain Dockerfile `RUN` steps executed
 once, at `template/Dockerfile` build time; see

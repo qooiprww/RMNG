@@ -171,12 +171,16 @@ plain title, with a numeric suffix on collision). Returns `{ "ok": true, "op": O
 **Hostname mode** (what `rmng clone` sends): the caller owns the exact hostname — a DNS
 label, uniqueness enforced (`400` on a taken name) — with no ticket, no derived display name,
 and no kickoff first message. `claudeAccount`/`codexAccount`/`agentInstructions`/
-`claudeInstructions` still apply.
+`claudeInstructions` still apply. Every clone also receives Codex parity files:
+`~/.codex/AGENTS.md` with the same disposable-sandbox guidance as Claude's shared
+`CLAUDE.md`, and `~/.codex/config.toml` with the local desktop MCP, per-clone control-server
+MCP, and Linear MCP.
 
 > There is no `/api/clone/redeploy` endpoint any more. Clone binaries (`clone-daemon`,
 > `agent-wrapper`, the `rmng` CLI) are installed by the control-server at create time, before
-> the container boots — the sole delivery path; a running clone keeps the binaries it was
-> created with — see [DEPLOY.md#upgrades](DEPLOY.md#upgrades).
+> the container boots, and refreshed on running managed clones by the clone reconciler after
+> server upgrades. The reconciler also refreshes the Codex parity files above on old running
+> clones. See [DEPLOY.md#upgrades](DEPLOY.md#upgrades).
 
 ### `POST /api/layout/activate` — body `{ "name": string }`
 Make the named layout preset the active one and live-apply it to every running clone — no

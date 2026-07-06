@@ -338,7 +338,7 @@ async fn clone_container_after_create(
     // in a dev checkout with nothing staged under `embedded-bin/` — then the clone boots with
     // no daemon (WARN), matching the pre-existing dev caveat. upload_tar works on a stopped
     // container.
-    let bins: Vec<TarEntry> = CLONE_BINARIES
+    let mut bins: Vec<TarEntry> = CLONE_BINARIES
         .iter()
         .filter_map(|b| {
             crate::assets::payload(b.payload).map(|data| TarEntry {
@@ -357,6 +357,9 @@ async fn clone_container_after_create(
         );
     } else {
         on_progress("inject", "installing clone binaries (pre-boot)");
+        if bins.len() == CLONE_BINARIES.len() {
+            bins.push(crate::clone_reconcile::payload_stamp_entry_for(&bins));
+        }
         docker.upload_tar(container, bins).await?;
     }
 
@@ -371,6 +374,27 @@ async fn clone_container_after_create(
     // — it exists so the guarantee doesn't hinge on the create-path constant alone. Autonomous
     // (`unless-stopped`) restarts back to 64 MB are the reconcile loop's job, not this hook's.
     crate::shm::ensure_now(app, container).await;
+
+    // Codex reads global guidance + MCP config from ~/.codex. Prepare the directory before the
+    // tar upload so ownership stays correct even for older templates where the Codex install
+    // did not create it.
+    on_progress("inject", "preparing Codex guidance + MCP config");
+    let code = docker
+        .exec_script(container, crate::clone_reconcile::codex_prepare_script(), &[], &[], |_stream, line| {
+            tracing::debug!(target: "provision", "codex-prepare: {line}");
+        })
+        .await?;
+    if code != 0 {
+        tracing::warn!("clone {hostname}: Codex config directory prepare exited {code} (reconciler will retry)");
+    }
+    let code = docker
+        .exec_script(container, crate::clone_reconcile::codex_cli_install_script(), &[], &[], |_stream, line| {
+            tracing::debug!(target: "provision", "codex-cli-install: {line}");
+        })
+        .await?;
+    if code != 0 {
+        tracing::warn!("clone {hostname}: Codex CLI install exited {code} (reconciler will retry)");
+    }
 
     // Build the single upload_tar: machine-id (always), preset env conf + PATH rc.
     let preset_conf = preset_env_conf(env);
@@ -403,6 +427,13 @@ async fn clone_container_after_create(
             gid: CLONE_GID,
         });
     }
+    let control_mcp_url = env
+        .iter()
+        .find(|v| v.key == "AGENT_CONTROL_MCP_URL")
+        .map(|v| v.value.as_str());
+    let mut codex_entries = crate::clone_reconcile::codex_parity_entries(hostname, control_mcp_url);
+    codex_entries.push(crate::clone_reconcile::codex_parity_stamp_entry_for(&codex_entries));
+    entries.append(&mut codex_entries);
     if let Some(rc) = &path_rc {
         entries.push(TarEntry {
             path: "etc/fish/conf.d/rmng-preset-path.fish".into(),
@@ -425,7 +456,10 @@ async fn clone_container_after_create(
     // must not fail the whole clone — log and continue (SSH just won't work until the next
     // reconcile push).
     match crate::ssh::clone_ssh_tar_entries(&cfg.data_dir, hostname, &cfg.ssh.authorized_keys) {
-        Ok(mut ssh_entries) => entries.append(&mut ssh_entries),
+        Ok(mut ssh_entries) => {
+            ssh_entries.push(crate::clone_reconcile::ssh_stamp_entry());
+            entries.append(&mut ssh_entries);
+        }
         Err(e) => tracing::warn!("clone {hostname}: ssh material skipped: {e}"),
     }
 

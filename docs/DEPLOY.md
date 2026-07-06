@@ -242,15 +242,23 @@ The `rmng-data` / `rmng-sock` volumes and every running clone container persist 
 swap. The control-server keeps its static `.2` address, so URLs baked into clones still
 resolve.
 
-**Clone binaries are installed at create time — there is no redeploy button, endpoint, or
-hot-swap engine.** The control-server copies its own current payloads (`clone-daemon` +
-`agent-wrapper` → `/opt/rmng/bin`, the `rmng` fleet CLI → `/usr/local/bin/rmng` — see
+**Clone binaries are installed at create time and reconciled after upgrades.** The
+control-server copies its own current payloads (`clone-daemon` + `agent-wrapper` →
+`/opt/rmng/bin`, the `rmng` fleet CLI → `/usr/local/bin/rmng` — see
 [`provision.rs`](../crates/control-server/src/provision.rs) `CLONE_BINARIES`) into every
-clone **before it boots**. That is the **sole delivery path** (the binswap hot-swap engine is
-retired): the template carries none of them, and a fresh clone always runs binaries matching
-the server that created it. **Existing clones keep the binaries they were created with**
-across a control-server upgrade — recreate a clone to move it onto the new binaries (which
-also means clones created before a server that ships the `rmng` CLI don't have it).
+clone **before it boots**. The template carries none of them. A background reconciler also
+refreshes those payloads on running managed clones after a control-server upgrade, then
+restarts only `rmng-clone-daemon`; `agent-wrapper` is refreshed on disk but not restarted, so
+active agent work is not interrupted.
+
+**Codex clone context is reconciled too.** New clones get `~/.codex/AGENTS.md` and
+`~/.codex/config.toml` at create time; old running clones get the same files from the
+background reconciler after a control-server update. The reconciler also attempts a missing
+standalone Codex CLI install on old clones and retries on later ticks if the download fails.
+The config gives Codex the local desktop MCP (`http://127.0.0.1:9004`), the per-clone
+control-server MCP with that clone's `x-rmng-clone` header, and Linear MCP using
+`LINEAR_API_KEY`. Existing Codex sessions may need a new Codex run to reload
+instructions/config, but the files are updated automatically.
 
 **Dev caveat**: in a `cargo run` dev checkout the payloads come from
 `crates/control-server/embedded-bin/` — with nothing staged there, a clone boots without
@@ -357,9 +365,9 @@ connection your ssh client asks you to confirm the bastion's key once (`Are you 
 continue connecting?` → `yes`); every connection after that is silent. To skip even that one
 prompt, pre-seed it with `ssh-keyscan -p 2222 <control-host> >> ~/.ssh/known_hosts`.
 
-**Gotcha: clones created before the template rebuilt with `sshd` have no `sshd` to jump to.**
-`ssh -J` will connect to the bastion fine but the clone hop will fail (connection refused on
-`:22`) — recreate the clone from the current template to pick up `sshd`.
+Existing clones created before the template rebuilt with `sshd` are migrated in place by the
+clone reconciler: it installs `openssh-server` if needed, writes the pubkey-only sshd config,
+installs clone host keys + `authorized_keys`, and enables/restarts `ssh`.
 
 ### Verify (manual)
 

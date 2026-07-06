@@ -10,6 +10,7 @@ mod assets;
 mod buildinfra;
 mod chat;
 mod claude;
+mod clone_reconcile;
 mod clone_ops;
 mod codex;
 mod config;
@@ -189,6 +190,7 @@ async fn main() -> Result<()> {
     tokio::spawn(codex::run_poller(app.clone()));
     tokio::spawn(codex::run_rotator(app.clone()));
     tokio::spawn(monitor::run(app.clone()));
+    tokio::spawn(clone_reconcile::run(app.clone()));
     tokio::spawn(homes::run(app.clone()));
     tokio::spawn(shm::run(app.clone()));
     tokio::spawn(buildinfra::run(app.clone()));

@@ -22,6 +22,37 @@ import type { ClaudeUsage, Host, Operation } from "~/lib/types";
 import type { ContainerStats } from "~/lib/wire/ContainerStats";
 import type { ForwardRuntime } from "~/lib/wire/ForwardRuntime";
 
+export function formatHostsUsageSummary(
+  hostIds: string[],
+  stats: Record<string, ContainerStats>,
+  cloneCpus: number,
+): { cpu: string; mem: string } | null {
+  let cpuPctTotal = 0;
+  let memUsedTotal = 0;
+  let sampleCount = 0;
+
+  for (const id of hostIds) {
+    const sample = stats[id];
+    if (!sample || Number(sample.memLimit) <= 0) continue;
+    cpuPctTotal += sample.cpuPct;
+    memUsedTotal += Number(sample.memUsed);
+    sampleCount += 1;
+  }
+
+  if (sampleCount === 0) return null;
+
+  const GiB = 1024 ** 3;
+  const mem = `${(memUsedTotal / GiB).toFixed(1)}GB`;
+  const cpu =
+    cloneCpus > 0
+      ? (() => {
+          const pct = cpuPctTotal / cloneCpus;
+          return `${pct < 1 ? pct.toFixed(1) : Math.round(pct)}%`;
+        })()
+      : `${(cpuPctTotal / 100).toFixed(1)}c`;
+  return { cpu, mem };
+}
+
 export interface SidebarProps {
   /** Off-canvas drawer state (< lg); the panel is static + always visible ≥ lg. */
   open?: boolean;
@@ -103,6 +134,11 @@ export function Sidebar({
   );
   const opForHost = (id: string) =>
     operations.find((o) => o.target === id && o.status === "running");
+  const hostsUsage = formatHostsUsageSummary(
+    hosts.map((h) => h.id),
+    stats,
+    cloneCpus,
+  );
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -176,9 +212,19 @@ export function Sidebar({
 
       <div>
         <div className="mb-1 flex items-center justify-between px-1">
-          <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
-            Hosts ({hosts.length})
-          </h2>
+          <div className="flex min-w-0 items-baseline gap-2">
+            <h2 className="shrink-0 text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
+              Hosts ({hosts.length})
+            </h2>
+            {hostsUsage ? (
+              <span
+                className="truncate text-[11px] font-semibold tabular-nums text-slate-500 dark:text-slate-400"
+                title="Total live container CPU and memory usage"
+              >
+                CPU {hostsUsage.cpu} · MEM {hostsUsage.mem}
+              </span>
+            ) : null}
+          </div>
           <button
             type="button"
             onClick={onOpenClone}

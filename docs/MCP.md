@@ -24,6 +24,10 @@ desktop control** both live in the **`rmng` CLI** over the port-2 web API — se
 - The **in-clone agent-wrapper** calls its clone's **daemon MCP** directly on
   `http://127.0.0.1:9004` for desktop actions, and the control-server's **per-clone MCP**
   (`:9002`) for `set_state`.
+- **Codex inside a clone** gets the same MCP surfaces through the managed
+  `~/.codex/config.toml`: `desktop` points at `http://127.0.0.1:9004`,
+  `control-server` points at the control-server's per-clone MCP with that clone's
+  `x-rmng-clone` header, and `linear` points at Linear's hosted MCP using `LINEAR_API_KEY`.
 - **Operators / fleet agents** drive any clone's desktop through the **`rmng desktop` CLI**
   ([CLI.md](CLI.md#rmng-desktop-clone-verb-alias-dt)); the control-server proxies each verb to that
   clone's daemon MCP at `http://{clone}:9004`. Everything else goes through the `rmng` CLI /
