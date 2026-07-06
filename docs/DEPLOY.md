@@ -271,8 +271,9 @@ Settings page has **Restart control-server** and **Update** buttons:
 
 - **Restart** does an in-place `docker restart` of the control-server container (applies
   changed port/socket/static-dir/chroma settings, re-read from config.json on boot). It does
-  NOT change the container's host-published port mapping — a `listen` port moved outside the
-  published `9000-9002` range still needs a host-level recreate.
+  NOT change the container's host-published port mapping — adding a newly required published
+  port such as the SSH bastion `2222`, or moving any `listen` port outside the published
+  range, still needs a host-level recreate with the updated `docker run`/compose port map.
 - **Update** pulls `docker.serverImage` (default `pegasis0/rmng:latest`) and swaps the
   running container onto it via a detached helper. Running clones and the data volumes
   survive.

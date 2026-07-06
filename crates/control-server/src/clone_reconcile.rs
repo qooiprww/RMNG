@@ -211,6 +211,29 @@ runuser -u rmng -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart r
 "#
 }
 
+fn rmng_cli_shadow_cleanup_script() -> &'static str {
+    r#"set -e
+managed=/usr/local/bin/rmng
+shadow=/home/rmng/.local/bin/rmng
+test -x "$managed" || exit 0
+resolved="$(runuser -u rmng -- bash -lc 'command -v rmng' 2>/dev/null || true)"
+test "$resolved" = "$shadow" || exit 0
+test -x "$shadow" || exit 0
+managed_sha="$(sha256sum "$managed" | awk '{print $1}')"
+shadow_sha="$(sha256sum "$shadow" | awk '{print $1}')"
+test "$managed_sha" != "$shadow_sha" || exit 0
+stamp="$(date +%Y%m%d%H%M%S)"
+backup="${shadow}.shadowed-by-rmng-update.${stamp}"
+i=0
+while [ -e "$backup" ]; do
+  i=$((i + 1))
+  backup="${shadow}.shadowed-by-rmng-update.${stamp}.${i}"
+done
+mv -- "$shadow" "$backup"
+echo "moved stale PATH-shadowing rmng CLI to $backup"
+"#
+}
+
 async fn exec_ok(app: &App, clone_id: &str, script: &str, label: &str) -> Result<()> {
     let code = app
         .docker
@@ -339,6 +362,13 @@ async fn ensure_payload_current(app: &App, clone_id: &str) -> Result<bool> {
         .as_deref()
         == Some(desired.as_str())
     {
+        exec_ok(
+            app,
+            clone_id,
+            rmng_cli_shadow_cleanup_script(),
+            "clean stale rmng CLI shadow",
+        )
+        .await?;
         return Ok(false);
     }
 
@@ -357,6 +387,13 @@ async fn ensure_payload_current(app: &App, clone_id: &str) -> Result<bool> {
         .upload_tar(clone_id, vec![payload_stamp_entry(&desired)])
         .await
         .with_context(|| format!("{clone_id}: writing payload stamp"))?;
+    exec_ok(
+        app,
+        clone_id,
+        rmng_cli_shadow_cleanup_script(),
+        "clean stale rmng CLI shadow",
+    )
+    .await?;
     Ok(true)
 }
 
@@ -536,6 +573,17 @@ mod tests {
         assert!(script.contains("CODEX_NON_INTERACTIVE=1"));
         assert!(script.contains("https://chatgpt.com/codex/install.sh"));
         assert!(script.contains("codex install failed"));
+    }
+
+    #[test]
+    fn rmng_cli_shadow_cleanup_moves_only_stale_user_local_binary() {
+        let script = rmng_cli_shadow_cleanup_script();
+        assert!(script.contains("command -v rmng"));
+        assert!(script.contains("/home/rmng/.local/bin/rmng"));
+        assert!(script.contains("/usr/local/bin/rmng"));
+        assert!(script.contains("sha256sum"));
+        assert!(script.contains("mv -- \"$shadow\""));
+        assert!(script.contains(".shadowed-by-rmng-update."));
     }
 
     #[test]
