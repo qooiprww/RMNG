@@ -234,6 +234,29 @@ echo "moved stale PATH-shadowing rmng CLI to $backup"
 "#
 }
 
+fn etc_environment_sync_script() -> &'static str {
+    r#"set -e
+envd=/home/rmng/.config/environment.d/30-rmng-preset.conf
+etc=/etc/environment
+test -f "$envd" || exit 0
+tmp="$(mktemp)"
+keys_file="$(mktemp)"
+trap 'rm -f "$tmp" "$keys_file"' EXIT
+grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$envd" | sed 's/=.*//' | sort -u > "$keys_file"
+if [ -f "$etc" ]; then
+  awk -F= 'NR==FNR { drop[$1]=1; next } !($1 in drop)' "$keys_file" "$etc" > "$tmp"
+fi
+if [ -s "$tmp" ] && [ "$(tail -c 1 "$tmp" | wc -l)" -eq 0 ]; then
+  printf '\n' >> "$tmp"
+fi
+awk '/^[A-Za-z_][A-Za-z0-9_]*=/' "$envd" >> "$tmp"
+if [ -f "$etc" ] && cmp -s "$tmp" "$etc"; then
+  exit 0
+fi
+install -m 0644 -o root -g root "$tmp" "$etc"
+"#
+}
+
 async fn exec_ok(app: &App, clone_id: &str, script: &str, label: &str) -> Result<()> {
     let code = app
         .docker
@@ -424,6 +447,26 @@ async fn reconcile_once(app: &App, warned: &mut HashSet<String>) {
         }
         warned.remove(&format!("{id}:ssh"));
 
+        match exec_ok(
+            app,
+            id,
+            etc_environment_sync_script(),
+            "sync environment.d to /etc/environment",
+        )
+        .await
+        {
+            Ok(()) => {
+                warned.remove(&format!("{id}:etc-env"));
+            }
+            Err(e) => {
+                if warned.insert(format!("{id}:etc-env")) {
+                    tracing::warn!(target: "clone_reconcile", "clone {id}: /etc/environment reconcile failed: {e:#}");
+                } else {
+                    tracing::debug!(target: "clone_reconcile", "clone {id}: /etc/environment reconcile still failing: {e:#}");
+                }
+            }
+        }
+
         match ensure_codex_cli(app, id).await {
             Ok(()) => {
                 warned.remove(&format!("{id}:codex-cli"));
@@ -584,6 +627,17 @@ mod tests {
         assert!(script.contains("sha256sum"));
         assert!(script.contains("mv -- \"$shadow\""));
         assert!(script.contains(".shadowed-by-rmng-update."));
+    }
+
+    #[test]
+    fn etc_environment_sync_mirrors_environment_d_without_clobbering_unmanaged_keys() {
+        let script = etc_environment_sync_script();
+        assert!(script.contains("/home/rmng/.config/environment.d/30-rmng-preset.conf"));
+        assert!(script.contains("/etc/environment"));
+        assert!(script.contains("drop[$1]=1"));
+        assert!(script.contains("awk '/^[A-Za-z_][A-Za-z0-9_]*=/' \"$envd\" >> \"$tmp\""));
+        assert!(script.contains("cmp -s \"$tmp\" \"$etc\""));
+        assert!(script.contains("install -m 0644"));
     }
 
     #[test]
