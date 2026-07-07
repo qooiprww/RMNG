@@ -31,26 +31,23 @@ One central encoder feeds both the viewer and the agents' screenshots; raw H.264
 - Web based control dashboard, note for each clone
 - Docker + lxcfs for clone sandboxing
 - Full gnome in each clone
-- every clone's home dir accessable in one central SMB share
+- Central SMB share for every clone's home dir
+- One command to SSH into every clone
 
-**Automation (CLI + MCP + agents)**
+**Agent Native**
 
-- `rmng` fleet management CLI in every clone (hosts, clones, images, accounts — over the control-server web API)
-- Computer use: fleet-wide via the `rmng desktop` CLI (per-`clone`), backed by each clone's daemon MCP on localhost:9004
+- `rmng` fleet management CLI in every clone
+- `rmng` CLI allows one agent to computer use the entire fleet
+- Inside each clone, computer use is available as MCP on localhost:9004
 - Chat with per-clone agent over web ui
 - Needs human detector
 
 **Accounts & integrations**
 
-- Both Claude and Codex/ChatGPT accounts, full parity
-- Import/harvest from a signed-in clone (server owns the token lifecycle after)
-- 5h + 7d usage bars, spend vs. limit, stale/rate-limited flags
-- Live hot-swap of a running clone's account, no restart
-- Named account groups with sticky rotation
-- Auto-assign at clone creation; "auto" rotates a clone across all imported accounts as they exhaust
-- Pin, or bind a clone to auto / a group / none
-
-
+- Import Claude and Codex accounts once, and use on every clone
+- 5h + 7d usage visualizer for all accounts
+- Live hot-swap of a running clone's account
+- Automated account rotation
 
 ## Quick start
 
