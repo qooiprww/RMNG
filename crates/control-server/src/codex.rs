@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use wire::{ClaudeUsage, ClaudeUsageWindow, CloneGroup, Host};
 
 use crate::app::App;
-use crate::clone_ops::{extract_json, jwt_claims, now_ms, rand_u64, run_clone_op, shuffle, snippet};
+use crate::clone_ops::{
+    extract_json, jwt_claims, now_ms, rand_u64, run_clone_op, shuffle, snippet,
+};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
@@ -32,6 +34,8 @@ const STAGGER: Duration = Duration::from_millis(400);
 // scoring knobs — copied from claude.rs (identical semantics).
 const SESSION_HEADROOM_PCT: f64 = 20.0;
 const SEVEN_DAY_CAP_PCT: f64 = 95.0;
+const RESET_STICKY_MARGIN_SECS: i64 = 15 * 60;
+const UTIL_STICKY_MARGIN_PCT: f64 = 5.0;
 const ROTATE_SECS: u64 = 600;
 /// Auto-reset only fires when every account's 7d window is at least this far from
 /// resetting (spec: "more than 24h from the next 7d reset").
@@ -97,9 +101,12 @@ impl CodexStore {
         if let Some(d) = self.path.parent() {
             std::fs::create_dir_all(d).ok();
         }
-        let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
-        let body =
-            serde_json::to_string_pretty(&AccountsFile { accounts: accounts.to_vec() })? + "\n";
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        let body = serde_json::to_string_pretty(&AccountsFile {
+            accounts: accounts.to_vec(),
+        })? + "\n";
         std::fs::write(&tmp, body)?;
         #[cfg(unix)]
         {
@@ -115,11 +122,21 @@ impl CodexStore {
     }
 
     fn get_by_email(&self, email: &str) -> Option<StoredCodexAccount> {
-        self.accounts.lock().unwrap().iter().find(|a| a.email == email).cloned()
+        self.accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.email == email)
+            .cloned()
     }
 
     fn emails(&self) -> Vec<String> {
-        self.accounts.lock().unwrap().iter().map(|a| a.email.clone()).collect()
+        self.accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.email.clone())
+            .collect()
     }
 
     fn update_account(&self, acct: &StoredCodexAccount) -> Result<()> {
@@ -181,10 +198,16 @@ pub struct ImportResult {
 fn parse_codex_auth(raw: &str) -> Result<CodexAuth> {
     let file: CodexAuthFile = serde_json::from_str(extract_json(raw))
         .map_err(|_| anyhow::anyhow!("couldn't parse ~/.codex/auth.json"))?;
-    if file.openai_api_key.as_deref().is_some_and(|k| !k.is_empty()) {
+    if file
+        .openai_api_key
+        .as_deref()
+        .is_some_and(|k| !k.is_empty())
+    {
         bail!("this clone is signed in to Codex with an API key, not a ChatGPT subscription");
     }
-    let tokens = file.tokens.context("~/.codex/auth.json has no tokens block (not signed in?)")?;
+    let tokens = file
+        .tokens
+        .context("~/.codex/auth.json has no tokens block (not signed in?)")?;
     let (Some(id_token), Some(access_token), Some(refresh_token)) =
         (tokens.id_token, tokens.access_token, tokens.refresh_token)
     else {
@@ -212,19 +235,28 @@ fn parse_codex_auth(raw: &str) -> Result<CodexAuth> {
                 .map(str::to_string)
         })
         .context("codex auth has no account_id (in tokens or id_token claim)")?;
-    Ok(CodexAuth { email, plan, account_id, id_token, access_token, refresh_token })
+    Ok(CodexAuth {
+        email,
+        plan,
+        account_id,
+        id_token,
+        access_token,
+        refresh_token,
+    })
 }
 
 /// Confirm clone `host` is signed in to Codex via ChatGPT and return its identity +
 /// tokens. Reads `~/.codex/auth.json` (codex has no clean JSON `login status`).
 pub async fn check_clone_auth(app: &App, host: &Host) -> Result<CodexAuth> {
     if !host.managed {
-        bail!("host '{}' is not a managed clone; only clones can be imported", host.id);
+        bail!(
+            "host '{}' is not a managed clone; only clones can be imported",
+            host.id
+        );
     }
     let raw = run_clone_op(app, &host.id, IMPORT_SCRIPT, "status", &[]).await?;
-    parse_codex_auth(&raw).map_err(|e| {
-        anyhow::anyhow!("{e} — is codex installed and signed in on '{}'?", host.id)
-    })
+    parse_codex_auth(&raw)
+        .map_err(|e| anyhow::anyhow!("{e} — is codex installed and signed in on '{}'?", host.id))
 }
 
 /// Import a Codex account from a signed-in clone: harvest the OAuth triple, upsert into
@@ -232,7 +264,10 @@ pub async fn check_clone_auth(app: &App, host: &Host) -> Result<CodexAuth> {
 /// refresh token the server now owns.
 pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult> {
     if !host.managed {
-        bail!("host '{}' is not a managed clone; only clones can be imported", host.id);
+        bail!(
+            "host '{}' is not a managed clone; only clones can be imported",
+            host.id
+        );
     }
     let auth = check_clone_auth(app, host).await?;
     let stored = StoredCodexAccount {
@@ -264,8 +299,15 @@ pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult
         }
     };
     app.codex.forget_pushed(&host.id);
-    tracing::info!("imported Codex account {} from '{}' (cleared={cleared})", auth.email, host.id);
-    Ok(ImportResult { email: auth.email, cleared })
+    tracing::info!(
+        "imported Codex account {} from '{}' (cleared={cleared})",
+        auth.email,
+        host.id
+    );
+    Ok(ImportResult {
+        email: auth.email,
+        cleared,
+    })
 }
 
 // --- token refresh + push -------------------------------------------------
@@ -278,8 +320,8 @@ fn is_expired(expires_at: i64) -> bool {
 /// decodable JWT, fall back to a conservative 55-minute lifetime so the account still
 /// refreshes before the CLI's 5-minute trigger.
 fn set_expiry_from_access(acct: &mut StoredCodexAccount) {
-    acct.expires_at =
-        crate::clone_ops::jwt_exp_ms(&acct.access_token).unwrap_or_else(|| now_ms() + 55 * 60 * 1000);
+    acct.expires_at = crate::clone_ops::jwt_exp_ms(&acct.access_token)
+        .unwrap_or_else(|| now_ms() + 55 * 60 * 1000);
 }
 
 #[derive(Deserialize)]
@@ -367,7 +409,10 @@ pub async fn apply_clone_token(app: &App, host_id: &str, acct: &StoredCodexAccou
     if out.contains("OK") {
         Ok(())
     } else {
-        bail!("codex token apply produced unexpected output: {}", out.trim());
+        bail!(
+            "codex token apply produced unexpected output: {}",
+            out.trim()
+        );
     }
 }
 
@@ -377,7 +422,10 @@ pub async fn clear_clone_token(app: &App, host_id: &str) -> Result<()> {
     if out.contains("CLEARED") {
         Ok(())
     } else {
-        bail!("codex token clear produced unexpected output: {}", out.trim());
+        bail!(
+            "codex token clear produced unexpected output: {}",
+            out.trim()
+        );
     }
 }
 
@@ -386,7 +434,11 @@ pub async fn clear_clone_token(app: &App, host_id: &str) -> Result<()> {
 pub async fn push_account_to_clone(app: &App, host_id: &str, email: &str) -> Result<()> {
     let (acct, rotated) = fresh_access_token(app, email).await?;
     apply_clone_token(app, host_id, &acct).await?;
-    app.codex.pushed.lock().unwrap().insert(host_id.to_string(), acct.access_token.clone());
+    app.codex
+        .pushed
+        .lock()
+        .unwrap()
+        .insert(host_id.to_string(), acct.access_token.clone());
     if rotated {
         let app = app.clone();
         tokio::spawn(async move { push_stale_tokens(&app).await });
@@ -400,11 +452,15 @@ pub async fn push_account_to_clone(app: &App, host_id: &str, email: &str) -> Res
 pub async fn push_stale_tokens(app: &App) {
     let mut first = true;
     for host in app.store.get().hosts {
-        let Some(email) = host.codex_account_email.as_deref() else { continue };
+        let Some(email) = host.codex_account_email.as_deref() else {
+            continue;
+        };
         if !host.managed {
             continue;
         }
-        let Some(acct) = app.codex.get_by_email(email) else { continue };
+        let Some(acct) = app.codex.get_by_email(email) else {
+            continue;
+        };
         let stale = app.codex.pushed.lock().unwrap().get(&host.id) != Some(&acct.access_token);
         if !stale {
             continue;
@@ -415,7 +471,11 @@ pub async fn push_stale_tokens(app: &App) {
         first = false;
         match apply_clone_token(app, &host.id, &acct).await {
             Ok(()) => {
-                app.codex.pushed.lock().unwrap().insert(host.id.clone(), acct.access_token.clone());
+                app.codex
+                    .pushed
+                    .lock()
+                    .unwrap()
+                    .insert(host.id.clone(), acct.access_token.clone());
                 tracing::info!("pushed fresh codex token ({email}) to {}", host.id);
             }
             Err(e) => tracing::warn!(
@@ -547,7 +607,10 @@ fn to_usage(acct: &StoredCodexAccount, raw: RawUsage) -> ClaudeUsage {
     let mut five_hour = None;
     let mut seven_day = None;
     if let Some(rl) = raw.rate_limit {
-        for w in [rl.primary_window, rl.secondary_window].into_iter().flatten() {
+        for w in [rl.primary_window, rl.secondary_window]
+            .into_iter()
+            .flatten()
+        {
             if let Some((is_five, win)) = window_of(w) {
                 if is_five {
                     five_hour = Some(win);
@@ -558,7 +621,10 @@ fn to_usage(acct: &StoredCodexAccount, raw: RawUsage) -> ClaudeUsage {
         }
     }
     let _ = raw.plan_type; // plan is stored on the account, not the usage view
-    let reset_credits = raw.rate_limit_reset_credits.as_ref().and_then(|c| c.available_count);
+    let reset_credits = raw
+        .rate_limit_reset_credits
+        .as_ref()
+        .and_then(|c| c.available_count);
     ClaudeUsage {
         id: acct.id.clone(),
         email: acct.email.clone(),
@@ -651,9 +717,9 @@ fn choose_reset_target(
         .iter()
         .filter(|f| {
             f.reset_credits > 0
-                && !marks.iter().any(|m| {
-                    m.account_id == f.account_id && m.window_resets_at == f.seven_reset_at
-                })
+                && !marks
+                    .iter()
+                    .any(|m| m.account_id == f.account_id && m.window_resets_at == f.seven_reset_at)
         })
         .collect();
     // Most credits first; tie-break by soonest reset.
@@ -677,7 +743,11 @@ const NONE: &str = "none";
 
 pub fn normalize_selection(requested: Option<&str>) -> String {
     let want = requested.unwrap_or("").trim();
-    if want.is_empty() { AUTO.to_string() } else { want.to_string() }
+    if want.is_empty() {
+        AUTO.to_string()
+    } else {
+        want.to_string()
+    }
 }
 
 struct Scored {
@@ -709,13 +779,23 @@ fn score_accounts(app: &App) -> Vec<Scored> {
         .into_iter()
         .map(|email| {
             let u = usage.get(email.as_str());
-            let five = u.and_then(|u| u.five_hour.as_ref()).map(|w| w.pct).unwrap_or(0.0);
-            let seven = u.and_then(|u| u.seven_day.as_ref()).map(|w| w.pct).unwrap_or(0.0);
+            let five = u
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.pct)
+                .unwrap_or(0.0);
+            let seven = u
+                .and_then(|u| u.seven_day.as_ref())
+                .map(|w| w.pct)
+                .unwrap_or(0.0);
             let headroom = clamp01((100.0 - five) / 100.0);
             let n = *clones.get(email.as_str()).unwrap_or(&0) as f64;
             let score = headroom - 0.5 * n;
             let eligible = (100.0 - five >= SESSION_HEADROOM_PCT) && seven < SEVEN_DAY_CAP_PCT;
-            Scored { email, score, eligible }
+            Scored {
+                email,
+                score,
+                eligible,
+            }
         })
         .collect()
 }
@@ -727,9 +807,14 @@ fn best_scored(app: &App) -> Option<String> {
     }
     let mut pool: Vec<&Scored> = scored.iter().filter(|s| s.eligible).collect();
     if pool.is_empty() {
-        pool = scored.iter().collect();
+        let members: Vec<String> = scored.iter().map(|s| s.email.clone()).collect();
+        return best_saturated_email(&rotation_candidates(app, &members), &clone_counts(app));
     }
-    pool.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    pool.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     pool.first().map(|s| s.email.clone())
 }
 
@@ -751,6 +836,7 @@ pub fn resolve_clone_account(app: &App, requested: Option<&str>) -> Option<Strin
 pub enum Assignment {
     Account(String),
     Group { name: String, initial: String },
+    AutoPending,
     None,
 }
 
@@ -762,9 +848,18 @@ pub fn resolve_assignment(app: &App, requested: Option<&str>) -> Option<Assignme
     if let Some(name) = want.strip_prefix("group:") {
         let name = name.trim();
         let initial = pick_group_account(app, name)?;
-        return Some(Assignment::Group { name: name.to_string(), initial });
+        return Some(Assignment::Group {
+            name: name.to_string(),
+            initial,
+        });
     }
-    resolve_clone_account(app, requested).map(Assignment::Account)
+    match resolve_clone_account(app, requested) {
+        Some(account) => Some(Assignment::Account(account)),
+        None if requested.is_some() && (want.is_empty() || want.eq_ignore_ascii_case(AUTO)) => {
+            Some(Assignment::AutoPending)
+        }
+        None => None,
+    }
 }
 
 fn clone_counts(app: &App) -> HashMap<String, u32> {
@@ -801,6 +896,83 @@ fn seven_day_pct(app: &App, email: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+#[derive(Debug, Clone)]
+struct RotationCandidate {
+    email: String,
+    five_pct: f64,
+    seven_pct: f64,
+    five_reset: Option<i64>,
+    seven_reset: Option<i64>,
+}
+
+fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
+    if s.len() != 20
+        || s.get(4..5)? != "-"
+        || s.get(7..8)? != "-"
+        || s.get(10..11)? != "T"
+        || s.get(13..14)? != ":"
+        || s.get(16..17)? != ":"
+        || s.get(19..20)? != "Z"
+    {
+        return None;
+    }
+    let year: i32 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    let minute: u32 = s.get(14..16)?.parse().ok()?;
+    let second: u32 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = year - i32::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month as i32 + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era * 146_097 + doe - 719_468)
+}
+
+fn rotation_candidates(app: &App, members: &[String]) -> Vec<RotationCandidate> {
+    let known = app.codex.emails();
+    let st = app.store.get();
+    members
+        .iter()
+        .filter(|email| known.iter().any(|k| &k == email))
+        .map(|email| {
+            let usage = st
+                .claude_accounts
+                .iter()
+                .filter(|u| u.provider == Some(wire::Provider::Codex))
+                .find(|u| u.email == *email);
+            let five = usage.and_then(|u| u.five_hour.as_ref());
+            let seven = usage.and_then(|u| u.seven_day.as_ref());
+            RotationCandidate {
+                email: email.clone(),
+                five_pct: five.map(|w| w.pct).unwrap_or(0.0),
+                seven_pct: seven.map(|w| w.pct).unwrap_or(0.0),
+                five_reset: five
+                    .and_then(|w| w.resets_at.as_deref())
+                    .and_then(parse_rfc3339_utc_secs),
+                seven_reset: seven
+                    .and_then(|w| w.resets_at.as_deref())
+                    .and_then(parse_rfc3339_utc_secs),
+            }
+        })
+        .collect()
+}
+
 fn is_exhausted(five: f64, seven: f64) -> bool {
     (100.0 - five) < SESSION_HEADROOM_PCT || seven >= SEVEN_DAY_CAP_PCT
 }
@@ -829,8 +1001,7 @@ fn pick_group_account(app: &App, group_name: &str) -> Option<String> {
     let counts = clone_counts(app);
     let mut pool = eligible_group_accounts(app, group);
     if pool.is_empty() {
-        let known = app.codex.emails();
-        pool = group.accounts.iter().filter(|e| known.iter().any(|k| &k == e)).cloned().collect();
+        return best_saturated_email(&rotation_candidates(app, &group.accounts), &counts);
     }
     shuffle(&mut pool);
     pool.into_iter().min_by_key(|email| {
@@ -874,15 +1045,139 @@ fn assign_rotation(
     out
 }
 
+fn pct_key(pct: f64) -> u32 {
+    if !pct.is_finite() {
+        return 0;
+    }
+    (pct.max(0.0) * 100.0).round() as u32
+}
+
+fn saturated_rank(
+    candidate: &RotationCandidate,
+    load: u32,
+) -> (u8, i64, u32, u8, i64, u32, u32, u32) {
+    let (five_missing, five_reset) = match candidate.five_reset {
+        Some(reset) => (0, reset),
+        None => (1, i64::MAX),
+    };
+    let (seven_missing, seven_reset) = match candidate.seven_reset {
+        Some(reset) => (0, reset),
+        None => (1, i64::MAX),
+    };
+    (
+        five_missing,
+        five_reset,
+        pct_key(candidate.five_pct),
+        seven_missing,
+        seven_reset,
+        pct_key(candidate.seven_pct),
+        load,
+        rand_u64() as u32,
+    )
+}
+
+fn best_saturated_candidate<'a>(
+    candidates: &'a [RotationCandidate],
+    used: &HashMap<String, u32>,
+) -> Option<&'a RotationCandidate> {
+    candidates.iter().min_by_key(|candidate| {
+        saturated_rank(candidate, *used.get(&candidate.email).unwrap_or(&0))
+    })
+}
+
+fn best_saturated_email(
+    candidates: &[RotationCandidate],
+    used: &HashMap<String, u32>,
+) -> Option<String> {
+    best_saturated_candidate(candidates, used).map(|candidate| candidate.email.clone())
+}
+
+fn keep_saturated_current(current: &RotationCandidate, best: &RotationCandidate) -> bool {
+    if current.email == best.email {
+        return true;
+    }
+    match (current.five_reset, best.five_reset) {
+        (Some(current_reset), Some(best_reset)) => {
+            current_reset <= best_reset + RESET_STICKY_MARGIN_SECS
+        }
+        (None, None) => current.five_pct <= best.five_pct + UTIL_STICKY_MARGIN_PCT,
+        _ => false,
+    }
+}
+
+fn assign_saturated_rotation(
+    clones: &[Host],
+    candidates: &[RotationCandidate],
+) -> Vec<(Host, String)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut used: HashMap<String, u32> = HashMap::new();
+    let mut out: Vec<(Host, String)> = Vec::with_capacity(clones.len());
+    let mut homeless: Vec<Host> = Vec::new();
+
+    for clone in clones {
+        let current = clone.codex_account_email.as_ref().and_then(|email| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.email == *email)
+        });
+        let best = best_saturated_candidate(candidates, &used).expect("candidates is non-empty");
+        if let Some(current) = current {
+            if keep_saturated_current(current, best) {
+                *used.entry(current.email.clone()).or_insert(0) += 1;
+                out.push((clone.clone(), current.email.clone()));
+                continue;
+            }
+        }
+        homeless.push(clone.clone());
+    }
+
+    shuffle(&mut homeless);
+    for host in homeless {
+        let pick = best_saturated_candidate(candidates, &used)
+            .expect("candidates is non-empty")
+            .email
+            .clone();
+        *used.entry(pick.clone()).or_insert(0) += 1;
+        out.push((host, pick));
+    }
+
+    out
+}
+
 async fn rotate_pool(app: &App, label: &str, members: &[String], clones: &[Host]) {
-    let eligible = eligible_members(app, members);
-    if eligible.is_empty() {
-        tracing::info!("codex rotate: pool '{label}' has no eligible account; leaving {} clone(s)", clones.len());
+    let candidates = rotation_candidates(app, members);
+    if candidates.is_empty() {
+        tracing::info!(
+            "codex rotate: pool '{label}' has no imported account; leaving {} clone(s)",
+            clones.len()
+        );
         return;
     }
-    let usage: HashMap<String, f64> =
-        eligible.iter().map(|e| (e.clone(), five_hour_pct(app, e))).collect();
-    for (host, email) in assign_rotation(clones, &eligible, &usage) {
+
+    let eligible: Vec<String> = candidates
+        .iter()
+        .filter(|candidate| !is_exhausted(candidate.five_pct, candidate.seven_pct))
+        .map(|candidate| candidate.email.clone())
+        .collect();
+    let assignments = if eligible.is_empty() {
+        tracing::info!(
+            "codex rotate: pool '{label}' has no under-cap account; using saturated fallback for {} clone(s)",
+            clones.len()
+        );
+        assign_saturated_rotation(clones, &candidates)
+    } else {
+        let usage: HashMap<String, f64> = candidates
+            .iter()
+            .filter(|candidate| eligible.contains(&candidate.email))
+            .map(|candidate| (candidate.email.clone(), candidate.five_pct))
+            .collect();
+        assign_rotation(clones, &eligible, &usage)
+    };
+
+    for (host, email) in assignments {
         if host.codex_account_email.as_deref() == Some(email.as_str()) {
             continue;
         }
@@ -901,7 +1196,10 @@ async fn rotate_pool(app: &App, label: &str, members: &[String], clones: &[Host]
                     }
                 });
             }
-            Err(e) => tracing::warn!("codex rotate[{label}]: applying {email} to {} failed: {e}", host.id),
+            Err(e) => tracing::warn!(
+                "codex rotate[{label}]: applying {email} to {} failed: {e}",
+                host.id
+            ),
         }
         tokio::time::sleep(STAGGER).await;
     }
@@ -993,7 +1291,11 @@ async fn poll_inner(app: &App) -> Result<bool> {
         .await;
         match outcome {
             Ok((u, facts)) => {
-                app.codex.last_good.lock().unwrap().insert(acct.id.clone(), u.clone());
+                app.codex
+                    .last_good
+                    .lock()
+                    .unwrap()
+                    .insert(acct.id.clone(), u.clone());
                 views.push(u);
                 if let Some(f) = facts {
                     fleet.push(f);
@@ -1070,7 +1372,11 @@ async fn poll_inner(app: &App) -> Result<bool> {
                                     u2.seven_day.as_ref().map(|w| w.pct),
                                     u2.reset_credits
                                 );
-                                app.codex.last_good.lock().unwrap().insert(acct.id.clone(), u2.clone());
+                                app.codex
+                                    .last_good
+                                    .lock()
+                                    .unwrap()
+                                    .insert(acct.id.clone(), u2.clone());
                                 if let Some(v) = views.iter_mut().find(|v| v.id == acct.id) {
                                     *v = u2;
                                     v.assignable = Some(true);
@@ -1129,7 +1435,10 @@ pub async fn run_poller(app: App) {
             base
         };
         if any429 {
-            tracing::warn!("codex usage rate-limited (429); next poll in {}s", delay.as_secs());
+            tracing::warn!(
+                "codex usage rate-limited (429); next poll in {}s",
+                delay.as_secs()
+            );
         }
         tokio::time::sleep(delay).await;
     }
@@ -1141,7 +1450,10 @@ mod tests {
 
     fn jwt_with(payload: &str) -> String {
         let b64 = crate::provision::b64_encode(payload.as_bytes());
-        let url = b64.trim_end_matches('=').replace('+', "-").replace('/', "_");
+        let url = b64
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_");
         format!("eyJhbGciOiJub25lIn0.{url}.sig")
     }
 
@@ -1193,7 +1505,10 @@ mod tests {
         // Second store loading the same file sees the account.
         let reloaded = CodexStore::load(dir.to_str().unwrap());
         assert_eq!(reloaded.emails(), vec!["z@openai.com".to_string()]);
-        assert_eq!(reloaded.get_by_email("z@openai.com").unwrap().account_id, "acc-1");
+        assert_eq!(
+            reloaded.get_by_email("z@openai.com").unwrap().account_id,
+            "acc-1"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1225,8 +1540,14 @@ mod tests {
         assert_eq!(u.five_hour.as_ref().unwrap().pct, 12.0);
         assert_eq!(u.seven_day.as_ref().unwrap().pct, 3.0);
         // Epoch seconds are converted to an ISO string so the frontend's Date.parse works.
-        assert_eq!(u.five_hour.as_ref().unwrap().resets_at.as_deref(), Some("2021-01-01T00:00:00Z"));
-        assert_eq!(u.seven_day.as_ref().unwrap().resets_at.as_deref(), Some("2021-02-01T00:00:00Z"));
+        assert_eq!(
+            u.five_hour.as_ref().unwrap().resets_at.as_deref(),
+            Some("2021-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            u.seven_day.as_ref().unwrap().resets_at.as_deref(),
+            Some("2021-02-01T00:00:00Z")
+        );
         assert_eq!(u.provider, Some(wire::Provider::Codex));
         assert!(u.spend.is_none());
         // Swapped field order: still classified by limit_window_seconds. `reset_at` absent
@@ -1251,14 +1572,22 @@ mod tests {
     }
 
     fn clone_host(id: &str, cur: Option<&str>) -> Host {
-        Host { id: id.into(), managed: true, codex_account_email: cur.map(str::to_string), ..Default::default() }
+        Host {
+            id: id.into(),
+            managed: true,
+            codex_account_email: cur.map(str::to_string),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn assignment_uses_codex_account_field() {
         // Sticky keep: a clone on an eligible account stays; a homeless clone lands in-set.
         let eligible = ["a@o".to_string(), "b@o".to_string()];
-        let clones = [clone_host("c1", Some("a@o")), clone_host("c2", Some("z@gone"))];
+        let clones = [
+            clone_host("c1", Some("a@o")),
+            clone_host("c2", Some("z@gone")),
+        ];
         for _ in 0..50 {
             let got = assign_rotation(&clones, &eligible, &HashMap::new());
             let by_id: HashMap<_, _> = got.iter().map(|(h, e)| (h.id.clone(), e.clone())).collect();
@@ -1270,7 +1599,11 @@ mod tests {
     #[test]
     fn assignment_distinct_when_enough_accounts() {
         let eligible = ["a@o".to_string(), "b@o".to_string(), "c@o".to_string()];
-        let clones = [clone_host("c1", None), clone_host("c2", None), clone_host("c3", None)];
+        let clones = [
+            clone_host("c1", None),
+            clone_host("c2", None),
+            clone_host("c3", None),
+        ];
         for _ in 0..50 {
             let got = assign_rotation(&clones, &eligible, &HashMap::new());
             let mut emails: Vec<_> = got.iter().map(|(_, e)| e.clone()).collect();
@@ -1278,6 +1611,74 @@ mod tests {
             emails.dedup();
             assert_eq!(emails.len(), 3);
         }
+    }
+
+    fn codex_rotation_candidate(
+        email: &str,
+        five_pct: f64,
+        seven_pct: f64,
+        five_reset: Option<i64>,
+        seven_reset: Option<i64>,
+    ) -> RotationCandidate {
+        RotationCandidate {
+            email: email.to_string(),
+            five_pct,
+            seven_pct,
+            five_reset,
+            seven_reset,
+        }
+    }
+
+    #[test]
+    fn codex_saturated_assignment_prefers_soonest_5h_reset() {
+        let candidates = [
+            codex_rotation_candidate("soon@o", 97.0, 96.0, Some(1_000), Some(10_000)),
+            codex_rotation_candidate("late@o", 90.0, 96.0, Some(2_000), Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("late@o"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "soon@o");
+    }
+
+    #[test]
+    fn codex_saturated_assignment_uses_lower_5h_when_resets_are_missing() {
+        let candidates = [
+            codex_rotation_candidate("hot@o", 98.0, 96.0, None, Some(10_000)),
+            codex_rotation_candidate("cool@o", 90.0, 96.0, None, Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("hot@o"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "cool@o");
+    }
+
+    #[test]
+    fn codex_saturated_assignment_keeps_current_within_reset_margin() {
+        let candidates = [
+            codex_rotation_candidate("current@o", 98.0, 96.0, Some(1_800), Some(10_000)),
+            codex_rotation_candidate("best@o", 99.0, 96.0, Some(1_000), Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("current@o"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "current@o");
+    }
+
+    #[test]
+    fn codex_saturated_assignment_moves_missing_reset_current_to_known_reset() {
+        let candidates = [
+            codex_rotation_candidate("unknown@o", 90.0, 96.0, None, Some(10_000)),
+            codex_rotation_candidate("known@o", 94.0, 96.0, Some(1_000), Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("unknown@o"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "known@o");
     }
 
     #[test]
@@ -1329,7 +1730,12 @@ mod tests {
     }
 
     fn facts(id: &str, pct: f64, reset_at: i64, credits: i64) -> FleetFacts {
-        FleetFacts { account_id: id.into(), seven_pct: pct, seven_reset_at: reset_at, reset_credits: credits }
+        FleetFacts {
+            account_id: id.into(),
+            seven_pct: pct,
+            seven_reset_at: reset_at,
+            reset_credits: credits,
+        }
     }
     const DAY: i64 = 24 * 3600;
 
@@ -1340,7 +1746,10 @@ mod tests {
             facts("codex:a", 96.0, now + 2 * DAY, 1),
             facts("codex:b", 99.0, now + 3 * DAY, 4),
         ];
-        assert_eq!(choose_reset_target(&f, 2, &[], now, true), Some("codex:b".into()));
+        assert_eq!(
+            choose_reset_target(&f, 2, &[], now, true),
+            Some("codex:b".into())
+        );
     }
 
     #[test]
@@ -1353,7 +1762,10 @@ mod tests {
     #[test]
     fn gate_blocked_when_any_account_below_cap() {
         let now = 1_000_000;
-        let f = vec![facts("codex:a", 96.0, now + 2 * DAY, 4), facts("codex:b", 90.0, now + 2 * DAY, 4)];
+        let f = vec![
+            facts("codex:a", 96.0, now + 2 * DAY, 4),
+            facts("codex:b", 90.0, now + 2 * DAY, 4),
+        ];
         assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
     }
 
@@ -1371,7 +1783,10 @@ mod tests {
     #[test]
     fn gate_blocked_when_any_resets_within_24h() {
         let now = 1_000_000;
-        let f = vec![facts("codex:a", 99.0, now + 2 * DAY, 4), facts("codex:b", 99.0, now + 3600, 4)];
+        let f = vec![
+            facts("codex:a", 99.0, now + 2 * DAY, 4),
+            facts("codex:b", 99.0, now + 3600, 4),
+        ];
         assert_eq!(choose_reset_target(&f, 2, &[], now, true), None);
     }
 
@@ -1383,7 +1798,10 @@ mod tests {
             facts("codex:a", 99.0, now + DAY, 4),
             facts("codex:b", 99.0, now + DAY, 2),
         ];
-        assert_eq!(choose_reset_target(&f, 2, &[], now, true), Some("codex:a".into()));
+        assert_eq!(
+            choose_reset_target(&f, 2, &[], now, true),
+            Some("codex:a".into())
+        );
     }
 
     #[test]
@@ -1420,15 +1838,28 @@ mod tests {
             consumed_at: 0,
             redeem_request_id: "x".into(),
         }];
-        assert_eq!(choose_reset_target(&f, 1, &marks, now, true), Some("codex:b".into()));
+        assert_eq!(
+            choose_reset_target(&f, 1, &marks, now, true),
+            Some("codex:b".into())
+        );
     }
 
     #[test]
     fn prune_drops_elapsed_windows() {
         let now = 1_000_000;
         let mut marks = vec![
-            wire::CodexResetMark { account_id: "a".into(), window_resets_at: now - 10, consumed_at: 0, redeem_request_id: "x".into() },
-            wire::CodexResetMark { account_id: "b".into(), window_resets_at: now + 10, consumed_at: 0, redeem_request_id: "y".into() },
+            wire::CodexResetMark {
+                account_id: "a".into(),
+                window_resets_at: now - 10,
+                consumed_at: 0,
+                redeem_request_id: "x".into(),
+            },
+            wire::CodexResetMark {
+                account_id: "b".into(),
+                window_resets_at: now + 10,
+                consumed_at: 0,
+                redeem_request_id: "y".into(),
+            },
         ];
         prune_marks(&mut marks, now);
         assert_eq!(marks.len(), 1);
@@ -1462,12 +1893,30 @@ mod tests {
 
     #[test]
     fn parse_consume_outcomes() {
-        assert_eq!(parse_consume_outcome(r#"{"code":"reset","windows_reset":2}"#), ConsumeOutcome::Reset);
-        assert_eq!(parse_consume_outcome(r#"{"code":"noCredit"}"#), ConsumeOutcome::NoCredit);
-        assert_eq!(parse_consume_outcome(r#"{"code":"alreadyRedeemed"}"#), ConsumeOutcome::AlreadyRedeemed);
-        assert_eq!(parse_consume_outcome(r#"{"code":"nothingToReset"}"#), ConsumeOutcome::NothingToReset);
-        assert_eq!(parse_consume_outcome(r#"{"code":"wat"}"#), ConsumeOutcome::Unknown("wat".into()));
-        assert_eq!(parse_consume_outcome("not json"), ConsumeOutcome::Unknown(String::new()));
+        assert_eq!(
+            parse_consume_outcome(r#"{"code":"reset","windows_reset":2}"#),
+            ConsumeOutcome::Reset
+        );
+        assert_eq!(
+            parse_consume_outcome(r#"{"code":"noCredit"}"#),
+            ConsumeOutcome::NoCredit
+        );
+        assert_eq!(
+            parse_consume_outcome(r#"{"code":"alreadyRedeemed"}"#),
+            ConsumeOutcome::AlreadyRedeemed
+        );
+        assert_eq!(
+            parse_consume_outcome(r#"{"code":"nothingToReset"}"#),
+            ConsumeOutcome::NothingToReset
+        );
+        assert_eq!(
+            parse_consume_outcome(r#"{"code":"wat"}"#),
+            ConsumeOutcome::Unknown("wat".into())
+        );
+        assert_eq!(
+            parse_consume_outcome("not json"),
+            ConsumeOutcome::Unknown(String::new())
+        );
     }
 
     #[test]

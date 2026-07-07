@@ -49,6 +49,8 @@ const STAGGER: Duration = Duration::from_millis(400);
 // scoring knobs (clone-accounts.server.ts)
 const SESSION_HEADROOM_PCT: f64 = 20.0;
 const SEVEN_DAY_CAP_PCT: f64 = 95.0;
+const RESET_STICKY_MARGIN_SECS: i64 = 15 * 60;
+const UTIL_STICKY_MARGIN_PCT: f64 = 5.0;
 /// How often group-bound clones are checked against their group's eligible accounts.
 /// Sticky: a pass moves a clone only if its account fell out of eligibility — an
 /// account switch always cold-starts the clone's Anthropic prompt cache, so staying
@@ -117,8 +119,12 @@ impl ClaudeStore {
         if let Some(d) = self.path.parent() {
             std::fs::create_dir_all(d).ok();
         }
-        let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
-        let body = serde_json::to_string_pretty(&AccountsFile { accounts: accounts.to_vec() })? + "\n";
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        let body = serde_json::to_string_pretty(&AccountsFile {
+            accounts: accounts.to_vec(),
+        })? + "\n";
         std::fs::write(&tmp, body)?;
         #[cfg(unix)]
         {
@@ -134,12 +140,22 @@ impl ClaudeStore {
     }
 
     fn get_by_email(&self, email: &str) -> Option<StoredClaudeAccount> {
-        self.accounts.lock().unwrap().iter().find(|a| a.email == email).cloned()
+        self.accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.email == email)
+            .cloned()
     }
 
     /// Emails of every imported account (the assignable universe).
     fn emails(&self) -> Vec<String> {
-        self.accounts.lock().unwrap().iter().map(|a| a.email.clone()).collect()
+        self.accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.email.clone())
+            .collect()
     }
 
     /// Upsert `acct` (by id) and persist the store.
@@ -213,7 +229,10 @@ pub struct ImportResult {
 /// can show the account before the operator mints a token) and inside import.
 pub async fn check_clone_auth(app: &App, host: &Host) -> Result<AuthStatus> {
     if !host.managed {
-        bail!("host '{}' is not a managed clone; only clones can be imported", host.id);
+        bail!(
+            "host '{}' is not a managed clone; only clones can be imported",
+            host.id
+        );
     }
     let raw = crate::provision::run_clone_op(app, &host.id, "status", &[]).await?;
     let status: AuthStatus = serde_json::from_str(extract_json(&raw)).map_err(|_| {
@@ -242,12 +261,18 @@ pub async fn check_clone_auth(app: &App, host: &Host) -> Result<AuthStatus> {
 /// invalidate the refresh token the server now owns.
 pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult> {
     if !host.managed {
-        bail!("host '{}' is not a managed clone; only clones can be imported", host.id);
+        bail!(
+            "host '{}' is not a managed clone; only clones can be imported",
+            host.id
+        );
     }
 
     // 1. Confirm the login + learn the account identity (email / org).
     let status = check_clone_auth(app, host).await?;
-    let email = status.email.clone().context("`claude auth status` returned no email")?;
+    let email = status
+        .email
+        .clone()
+        .context("`claude auth status` returned no email")?;
     let org_uuid = status.org_id.clone().unwrap_or_default();
 
     // 2. Read the OAuth pair straight off the clone's disk.
@@ -299,7 +324,10 @@ pub async fn import_clone_account(app: &App, host: &Host) -> Result<ImportResult
     };
     app.claude.forget_pushed(&host.id);
 
-    tracing::info!("imported Claude account {email} from '{}' (cleared={cleared})", host.id);
+    tracing::info!(
+        "imported Claude account {email} from '{}' (cleared={cleared})",
+        host.id
+    );
     Ok(ImportResult { email, cleared })
 }
 
@@ -423,17 +451,23 @@ async fn fetch_usage(http: &reqwest::Client, token: &str) -> Result<RawUsage> {
 }
 
 fn to_window(w: Option<RawWindow>) -> Option<ClaudeUsageWindow> {
-    w.map(|w| ClaudeUsageWindow { pct: w.utilization.unwrap_or(0.0).round(), resets_at: w.resets_at })
+    w.map(|w| ClaudeUsageWindow {
+        pct: w.utilization.unwrap_or(0.0).round(),
+        resets_at: w.resets_at,
+    })
 }
 
 fn to_usage(acct: &StoredClaudeAccount, raw: RawUsage) -> ClaudeUsage {
-    let spend = raw.extra_usage.filter(|e| e.is_enabled).map(|e| ClaudeSpend {
-        used_cents: e.used_credits.unwrap_or(0),
-        limit_cents: e.monthly_limit,
-        pct: e.utilization.unwrap_or(0.0).round(),
-        currency: e.currency.unwrap_or_else(|| "USD".into()),
-        resets_at: e.resets_at,
-    });
+    let spend = raw
+        .extra_usage
+        .filter(|e| e.is_enabled)
+        .map(|e| ClaudeSpend {
+            used_cents: e.used_credits.unwrap_or(0),
+            limit_cents: e.monthly_limit,
+            pct: e.utilization.unwrap_or(0.0).round(),
+            currency: e.currency.unwrap_or_else(|| "USD".into()),
+            resets_at: e.resets_at,
+        });
     ClaudeUsage {
         id: acct.id.clone(),
         email: acct.email.clone(),
@@ -504,7 +538,11 @@ async fn poll_inner(app: &App) -> Result<bool> {
         .await;
         match outcome {
             Ok(u) => {
-                app.claude.last_good.lock().unwrap().insert(acct.id.clone(), u.clone());
+                app.claude
+                    .last_good
+                    .lock()
+                    .unwrap()
+                    .insert(acct.id.clone(), u.clone());
                 views.push(u);
             }
             Err(e) => {
@@ -556,7 +594,11 @@ const NONE: &str = "none";
 /// `"none"`, `"group:<name>"`, or an account email. Missing/blank → `"auto"`.
 pub fn normalize_selection(requested: Option<&str>) -> String {
     let want = requested.unwrap_or("").trim();
-    if want.is_empty() { AUTO.to_string() } else { want.to_string() }
+    if want.is_empty() {
+        AUTO.to_string()
+    } else {
+        want.to_string()
+    }
 }
 
 struct Scored {
@@ -588,14 +630,24 @@ fn score_accounts(app: &App) -> Vec<Scored> {
         .into_iter()
         .map(|email| {
             let u = usage.get(email.as_str());
-            let five = u.and_then(|u| u.five_hour.as_ref()).map(|w| w.pct).unwrap_or(0.0);
-            let seven = u.and_then(|u| u.seven_day.as_ref()).map(|w| w.pct).unwrap_or(0.0);
+            let five = u
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.pct)
+                .unwrap_or(0.0);
+            let seven = u
+                .and_then(|u| u.seven_day.as_ref())
+                .map(|w| w.pct)
+                .unwrap_or(0.0);
             let headroom = clamp01((100.0 - five) / 100.0);
             // reset-soon term omitted (ISO reset parsing TODO) → 0.
             let n = *clones.get(email.as_str()).unwrap_or(&0) as f64;
             let score = headroom - 0.5 * n;
             let eligible = (100.0 - five >= SESSION_HEADROOM_PCT) && seven < SEVEN_DAY_CAP_PCT;
-            Scored { email, score, eligible }
+            Scored {
+                email,
+                score,
+                eligible,
+            }
         })
         .collect()
 }
@@ -607,9 +659,14 @@ fn best_scored(app: &App) -> Option<String> {
     }
     let mut pool: Vec<&Scored> = scored.iter().filter(|s| s.eligible).collect();
     if pool.is_empty() {
-        pool = scored.iter().collect();
+        let members: Vec<String> = scored.iter().map(|s| s.email.clone()).collect();
+        return best_saturated_email(&rotation_candidates(app, &members), &clone_counts(app));
     }
-    pool.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    pool.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     pool.first().map(|s| s.email.clone())
 }
 
@@ -632,17 +689,19 @@ pub fn resolve_clone_account(app: &App, requested: Option<&str>) -> Option<Strin
 // --- groups: selection + rotation -----------------------------------------
 
 /// What a clone is bound to (accounts by email). `Group` carries the initial pick to
-/// apply right away; `None` means the operator explicitly opted out of a token (leave
-/// the clone tokenless).
+/// apply right away; `AutoPending` records explicit auto intent before an imported
+/// account exists; `None` means the operator explicitly opted out of a token.
 pub enum Assignment {
     Account(String),
     Group { name: String, initial: String },
+    AutoPending,
     None,
 }
 
 /// Resolve a selection string to an [`Assignment`]: `none` → no token, `group:<name>` →
 /// a group (with an initial account picked from it), else an email / `auto` → a single
-/// account. Outer `None` if nothing usable is configured for an account/group pick.
+/// account. Explicit `auto` without imported accounts is kept as pending auto; outer
+/// `None` means no usable concrete assignment and no explicit pending-auto intent.
 pub fn resolve_assignment(app: &App, requested: Option<&str>) -> Option<Assignment> {
     let want = requested.unwrap_or("").trim();
     if want.eq_ignore_ascii_case(NONE) {
@@ -651,9 +710,18 @@ pub fn resolve_assignment(app: &App, requested: Option<&str>) -> Option<Assignme
     if let Some(name) = want.strip_prefix("group:") {
         let name = name.trim();
         let initial = pick_group_account(app, name)?;
-        return Some(Assignment::Group { name: name.to_string(), initial });
+        return Some(Assignment::Group {
+            name: name.to_string(),
+            initial,
+        });
     }
-    resolve_clone_account(app, requested).map(Assignment::Account)
+    match resolve_clone_account(app, requested) {
+        Some(account) => Some(Assignment::Account(account)),
+        None if requested.is_some() && (want.is_empty() || want.eq_ignore_ascii_case(AUTO)) => {
+            Some(Assignment::AutoPending)
+        }
+        None => None,
+    }
 }
 
 /// How many clones each account email is currently assigned to.
@@ -691,6 +759,83 @@ fn seven_day_pct(app: &App, email: &str) -> f64 {
         .and_then(|u| u.seven_day.as_ref())
         .map(|w| w.pct)
         .unwrap_or(0.0)
+}
+
+#[derive(Debug, Clone)]
+struct RotationCandidate {
+    email: String,
+    five_pct: f64,
+    seven_pct: f64,
+    five_reset: Option<i64>,
+    seven_reset: Option<i64>,
+}
+
+fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
+    if s.len() != 20
+        || s.get(4..5)? != "-"
+        || s.get(7..8)? != "-"
+        || s.get(10..11)? != "T"
+        || s.get(13..14)? != ":"
+        || s.get(16..17)? != ":"
+        || s.get(19..20)? != "Z"
+    {
+        return None;
+    }
+    let year: i32 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    let minute: u32 = s.get(14..16)?.parse().ok()?;
+    let second: u32 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = year - i32::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month as i32 + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era * 146_097 + doe - 719_468)
+}
+
+fn rotation_candidates(app: &App, members: &[String]) -> Vec<RotationCandidate> {
+    let known = app.claude.emails();
+    let st = app.store.get();
+    members
+        .iter()
+        .filter(|email| known.iter().any(|k| &k == email))
+        .map(|email| {
+            let usage = st
+                .claude_accounts
+                .iter()
+                .filter(|u| u.provider != Some(wire::Provider::Codex))
+                .find(|u| u.email == *email);
+            let five = usage.and_then(|u| u.five_hour.as_ref());
+            let seven = usage.and_then(|u| u.seven_day.as_ref());
+            RotationCandidate {
+                email: email.clone(),
+                five_pct: five.map(|w| w.pct).unwrap_or(0.0),
+                seven_pct: seven.map(|w| w.pct).unwrap_or(0.0),
+                five_reset: five
+                    .and_then(|w| w.resets_at.as_deref())
+                    .and_then(parse_rfc3339_utc_secs),
+                seven_reset: seven
+                    .and_then(|w| w.resets_at.as_deref())
+                    .and_then(parse_rfc3339_utc_secs),
+            }
+        })
+        .collect()
 }
 
 /// Whether an account is out of usable headroom: 5h over the session cap or 7d at the
@@ -733,8 +878,7 @@ fn pick_group_account(app: &App, group_name: &str) -> Option<String> {
     let mut pool = eligible_group_accounts(app, group);
     if pool.is_empty() {
         // All over the cap → still need a valid token; fall back to any imported member.
-        let known = app.claude.emails();
-        pool = group.accounts.iter().filter(|e| known.iter().any(|k| &k == e)).cloned().collect();
+        return best_saturated_email(&rotation_candidates(app, &group.accounts), &counts);
     }
     shuffle(&mut pool); // randomize ties
     pool.into_iter().min_by_key(|email| {
@@ -785,19 +929,143 @@ fn assign_rotation(
     out
 }
 
+fn pct_key(pct: f64) -> u32 {
+    if !pct.is_finite() {
+        return 0;
+    }
+    (pct.max(0.0) * 100.0).round() as u32
+}
+
+fn saturated_rank(
+    candidate: &RotationCandidate,
+    load: u32,
+) -> (u8, i64, u32, u8, i64, u32, u32, u32) {
+    let (five_missing, five_reset) = match candidate.five_reset {
+        Some(reset) => (0, reset),
+        None => (1, i64::MAX),
+    };
+    let (seven_missing, seven_reset) = match candidate.seven_reset {
+        Some(reset) => (0, reset),
+        None => (1, i64::MAX),
+    };
+    (
+        five_missing,
+        five_reset,
+        pct_key(candidate.five_pct),
+        seven_missing,
+        seven_reset,
+        pct_key(candidate.seven_pct),
+        load,
+        rand_u64() as u32,
+    )
+}
+
+fn best_saturated_candidate<'a>(
+    candidates: &'a [RotationCandidate],
+    used: &HashMap<String, u32>,
+) -> Option<&'a RotationCandidate> {
+    candidates.iter().min_by_key(|candidate| {
+        saturated_rank(candidate, *used.get(&candidate.email).unwrap_or(&0))
+    })
+}
+
+fn best_saturated_email(
+    candidates: &[RotationCandidate],
+    used: &HashMap<String, u32>,
+) -> Option<String> {
+    best_saturated_candidate(candidates, used).map(|candidate| candidate.email.clone())
+}
+
+fn keep_saturated_current(current: &RotationCandidate, best: &RotationCandidate) -> bool {
+    if current.email == best.email {
+        return true;
+    }
+    match (current.five_reset, best.five_reset) {
+        (Some(current_reset), Some(best_reset)) => {
+            current_reset <= best_reset + RESET_STICKY_MARGIN_SECS
+        }
+        (None, None) => current.five_pct <= best.five_pct + UTIL_STICKY_MARGIN_PCT,
+        _ => false,
+    }
+}
+
+fn assign_saturated_rotation(
+    clones: &[Host],
+    candidates: &[RotationCandidate],
+) -> Vec<(Host, String)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut used: HashMap<String, u32> = HashMap::new();
+    let mut out: Vec<(Host, String)> = Vec::with_capacity(clones.len());
+    let mut homeless: Vec<Host> = Vec::new();
+
+    for clone in clones {
+        let current = clone.claude_account_email.as_ref().and_then(|email| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.email == *email)
+        });
+        let best = best_saturated_candidate(candidates, &used).expect("candidates is non-empty");
+        if let Some(current) = current {
+            if keep_saturated_current(current, best) {
+                *used.entry(current.email.clone()).or_insert(0) += 1;
+                out.push((clone.clone(), current.email.clone()));
+                continue;
+            }
+        }
+        homeless.push(clone.clone());
+    }
+
+    shuffle(&mut homeless);
+    for host in homeless {
+        let pick = best_saturated_candidate(candidates, &used)
+            .expect("candidates is non-empty")
+            .email
+            .clone();
+        *used.entry(pick.clone()).or_insert(0) += 1;
+        out.push((host, pick));
+    }
+
+    out
+}
+
 /// Rotate one pool of clones over candidate account emails `members`. Drops members
-/// that aren't imported or are exhausted, sticky-assigns clones to the survivors
-/// ([`assign_rotation`]), and pushes any moves (no agent-wrapper restart). `label` names
-/// the pool in logs. Leaves clones untouched when no member is eligible.
+/// that aren't imported. When at least one account is under the hard limits, clones
+/// stick to eligible accounts exactly as before. When every imported candidate is over
+/// a limit, the saturated fallback picks the account closest to reset or least used.
 async fn rotate_pool(app: &App, label: &str, members: &[String], clones: &[Host]) {
-    let eligible = eligible_members(app, members);
-    if eligible.is_empty() {
-        tracing::info!("rotate: pool '{label}' has no eligible account; leaving {} clone(s)", clones.len());
+    let candidates = rotation_candidates(app, members);
+    if candidates.is_empty() {
+        tracing::info!(
+            "rotate: pool '{label}' has no imported account; leaving {} clone(s)",
+            clones.len()
+        );
         return;
     }
-    let usage: HashMap<String, f64> =
-        eligible.iter().map(|e| (e.clone(), five_hour_pct(app, e))).collect();
-    for (host, email) in assign_rotation(clones, &eligible, &usage) {
+
+    let eligible: Vec<String> = candidates
+        .iter()
+        .filter(|candidate| !is_exhausted(candidate.five_pct, candidate.seven_pct))
+        .map(|candidate| candidate.email.clone())
+        .collect();
+    let assignments = if eligible.is_empty() {
+        tracing::info!(
+            "rotate: pool '{label}' has no under-cap account; using saturated fallback for {} clone(s)",
+            clones.len()
+        );
+        assign_saturated_rotation(clones, &candidates)
+    } else {
+        let usage: HashMap<String, f64> = candidates
+            .iter()
+            .filter(|candidate| eligible.contains(&candidate.email))
+            .map(|candidate| (candidate.email.clone(), candidate.five_pct))
+            .collect();
+        assign_rotation(clones, &eligible, &usage)
+    };
+
+    for (host, email) in assignments {
         if host.claude_account_email.as_deref() == Some(email.as_str()) {
             continue; // unchanged (sticky keep) → no rewrite
         }
@@ -816,7 +1084,10 @@ async fn rotate_pool(app: &App, label: &str, members: &[String], clones: &[Host]
                     }
                 });
             }
-            Err(e) => tracing::warn!("rotate[{label}]: applying {email} to {} failed: {e}", host.id),
+            Err(e) => tracing::warn!(
+                "rotate[{label}]: applying {email} to {} failed: {e}",
+                host.id
+            ),
         }
         tokio::time::sleep(STAGGER).await; // gentle on the daemon
     }
@@ -919,7 +1190,11 @@ pub async fn clear_clone_token(app: &App, host_id: &str) -> Result<()> {
 pub async fn push_account_to_clone(app: &App, host_id: &str, email: &str) -> Result<()> {
     let (token, rotated) = fresh_access_token(app, email).await?;
     apply_clone_token(app, host_id, &token).await?;
-    app.claude.pushed.lock().unwrap().insert(host_id.to_string(), token);
+    app.claude
+        .pushed
+        .lock()
+        .unwrap()
+        .insert(host_id.to_string(), token);
     if rotated {
         let app = app.clone();
         tokio::spawn(async move { push_stale_tokens(&app).await });
@@ -936,11 +1211,15 @@ pub async fn push_account_to_clone(app: &App, host_id: &str, email: &str) -> Res
 pub async fn push_stale_tokens(app: &App) {
     let mut first = true;
     for host in app.store.get().hosts {
-        let Some(email) = host.claude_account_email.as_deref() else { continue };
+        let Some(email) = host.claude_account_email.as_deref() else {
+            continue;
+        };
         if !host.managed {
             continue;
         }
-        let Some(acct) = app.claude.get_by_email(email) else { continue };
+        let Some(acct) = app.claude.get_by_email(email) else {
+            continue;
+        };
         let stale = app.claude.pushed.lock().unwrap().get(&host.id) != Some(&acct.access_token);
         if !stale {
             continue;
@@ -951,11 +1230,18 @@ pub async fn push_stale_tokens(app: &App) {
         first = false;
         match apply_clone_token(app, &host.id, &acct.access_token).await {
             Ok(()) => {
-                app.claude.pushed.lock().unwrap().insert(host.id.clone(), acct.access_token);
+                app.claude
+                    .pushed
+                    .lock()
+                    .unwrap()
+                    .insert(host.id.clone(), acct.access_token);
                 tracing::info!("pushed fresh token ({email}) to {}", host.id);
             }
             Err(e) => {
-                tracing::warn!("pushing token ({email}) to {} failed (retried next pass): {e}", host.id)
+                tracing::warn!(
+                    "pushing token ({email}) to {} failed (retried next pass): {e}",
+                    host.id
+                )
             }
         }
     }
@@ -983,7 +1269,10 @@ pub async fn run_poller(app: App) {
             base
         };
         if any429 {
-            tracing::warn!("claude usage rate-limited (429); next poll in {}s", delay.as_secs());
+            tracing::warn!(
+                "claude usage rate-limited (429); next poll in {}s",
+                delay.as_secs()
+            );
         }
         tokio::time::sleep(delay).await;
     }
@@ -1016,7 +1305,10 @@ mod tests {
     #[test]
     fn parses_credentials_camelcase() {
         // Regression: `claudeAiOauth` (camelCase) must map onto `claude_ai_oauth`.
-        let oauth = serde_json::from_str::<ClaudeCreds>(CREDS).unwrap().claude_ai_oauth.unwrap();
+        let oauth = serde_json::from_str::<ClaudeCreds>(CREDS)
+            .unwrap()
+            .claude_ai_oauth
+            .unwrap();
         assert_eq!(oauth.access_token.as_deref(), Some("sk-ant-oat01-AAA"));
         assert_eq!(oauth.refresh_token.as_deref(), Some("sk-ant-ort01-BBB"));
         assert_eq!(oauth.expires_at, Some(1782865752191));
@@ -1035,9 +1327,15 @@ mod tests {
         }"#;
         let raw: RawUsage = serde_json::from_str(body).unwrap();
         let acct = StoredClaudeAccount {
-            id: "a@b|o".into(), email: "a@b".into(), org_uuid: "o".into(),
-            org_name: String::new(), active: false, access_token: String::new(),
-            refresh_token: String::new(), expires_at: 0, scopes: vec![],
+            id: "a@b|o".into(),
+            email: "a@b".into(),
+            org_uuid: "o".into(),
+            org_name: String::new(),
+            active: false,
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+            scopes: vec![],
         };
         let u = to_usage(&acct, raw);
         assert_eq!(u.five_hour.unwrap().pct, 7.0);
@@ -1052,7 +1350,10 @@ mod tests {
         let s: AuthStatus = serde_json::from_str(extract_json(&noisy)).unwrap();
         assert!(s.logged_in);
         // No JSON at all → falls back to the trimmed input (which then fails to parse).
-        assert_eq!(extract_json("  claude: command not found  "), "claude: command not found");
+        assert_eq!(
+            extract_json("  claude: command not found  "),
+            "claude: command not found"
+        );
     }
 
     // --- groups: rotation assignment ---------------------------------------
@@ -1061,7 +1362,12 @@ mod tests {
         email.to_string()
     }
     fn clone_host(id: &str, cur: Option<&str>) -> Host {
-        Host { id: id.into(), managed: true, claude_account_email: cur.map(str::to_string), ..Default::default() }
+        Host {
+            id: id.into(),
+            managed: true,
+            claude_account_email: cur.map(str::to_string),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1090,13 +1396,21 @@ mod tests {
         // |eligible| >= |unassigned clones| ⇒ they land on distinct accounts (run
         // repeatedly: randomized, but the load term forces distinctness here).
         let eligible = [acct("a@x"), acct("b@x"), acct("c@x")];
-        let clones = [clone_host("c1", None), clone_host("c2", None), clone_host("c3", None)];
+        let clones = [
+            clone_host("c1", None),
+            clone_host("c2", None),
+            clone_host("c3", None),
+        ];
         for _ in 0..50 {
             let got = assign_rotation(&clones, &eligible, &HashMap::new());
             let mut emails: Vec<_> = got.iter().map(|(_, e)| e.clone()).collect();
             emails.sort();
             emails.dedup();
-            assert_eq!(emails.len(), 3, "expected 3 distinct accounts, got {emails:?}");
+            assert_eq!(
+                emails.len(),
+                3,
+                "expected 3 distinct accounts, got {emails:?}"
+            );
         }
     }
 
@@ -1117,7 +1431,10 @@ mod tests {
         // c1 keeps its eligible account A; c2 (account dropped from the group) must
         // move, and lands on B — the keeper on A counts toward A's load.
         let eligible = [acct("a@x"), acct("b@x")];
-        let clones = [clone_host("c1", Some("a@x")), clone_host("c2", Some("z@gone"))];
+        let clones = [
+            clone_host("c1", Some("a@x")),
+            clone_host("c2", Some("z@gone")),
+        ];
         for _ in 0..50 {
             let got = assign_rotation(&clones, &eligible, &HashMap::new());
             let by_id: HashMap<_, _> = got.iter().map(|(h, e)| (h.id.clone(), e.clone())).collect();
@@ -1142,9 +1459,80 @@ mod tests {
     fn assignment_degrades_with_single_eligible() {
         // Only one usable account ⇒ all clones get it even though spread can't hold.
         let eligible = [acct("only@x")];
-        let clones = [clone_host("c1", Some("only@x")), clone_host("c2", Some("old@x"))];
+        let clones = [
+            clone_host("c1", Some("only@x")),
+            clone_host("c2", Some("old@x")),
+        ];
         let got = assign_rotation(&clones, &eligible, &HashMap::new());
         assert!(got.iter().all(|(_, e)| e == "only@x"));
+    }
+
+    fn rotation_candidate(
+        email: &str,
+        five_pct: f64,
+        seven_pct: f64,
+        five_reset: Option<i64>,
+        seven_reset: Option<i64>,
+    ) -> RotationCandidate {
+        RotationCandidate {
+            email: email.to_string(),
+            five_pct,
+            seven_pct,
+            five_reset,
+            seven_reset,
+        }
+    }
+
+    #[test]
+    fn saturated_assignment_prefers_soonest_5h_reset() {
+        let candidates = [
+            rotation_candidate("soon@x", 97.0, 96.0, Some(1_000), Some(10_000)),
+            rotation_candidate("late@x", 90.0, 96.0, Some(2_000), Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("late@x"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "soon@x");
+    }
+
+    #[test]
+    fn saturated_assignment_uses_lower_5h_when_resets_are_missing() {
+        let candidates = [
+            rotation_candidate("hot@x", 98.0, 96.0, None, Some(10_000)),
+            rotation_candidate("cool@x", 90.0, 96.0, None, Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("hot@x"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "cool@x");
+    }
+
+    #[test]
+    fn saturated_assignment_keeps_current_within_reset_margin() {
+        let candidates = [
+            rotation_candidate("current@x", 98.0, 96.0, Some(1_800), Some(10_000)),
+            rotation_candidate("best@x", 99.0, 96.0, Some(1_000), Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("current@x"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "current@x");
+    }
+
+    #[test]
+    fn saturated_assignment_moves_missing_reset_current_to_known_reset() {
+        let candidates = [
+            rotation_candidate("unknown@x", 90.0, 96.0, None, Some(10_000)),
+            rotation_candidate("known@x", 94.0, 96.0, Some(1_000), Some(10_000)),
+        ];
+        let clones = [clone_host("c1", Some("unknown@x"))];
+
+        let got = assign_saturated_rotation(&clones, &candidates);
+
+        assert_eq!(got[0].1, "known@x");
     }
 
     #[test]

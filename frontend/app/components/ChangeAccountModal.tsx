@@ -10,17 +10,19 @@ import type { ClaudeUsage, Host } from "~/lib/types";
 import type { CloneGroup } from "~/lib/wire/CloneGroup";
 
 /** Current selection for a host: the verbatim selection when recorded ("auto", "none",
- *  `group:<name>`, or an email), else derived from its group/account for legacy hosts. */
+ *  `group:<name>`, or an email), else derived from its group/account for legacy hosts.
+ *  A legacy host with no account is effectively tokenless, so showing "none" lets
+ *  choosing "auto" submit the swap that enrolls it in rotation. */
 export function currentValue(host: Host): string {
   if (host.claudeSelection) return host.claudeSelection;
   if (host.claudeGroup) return `group:${host.claudeGroup}`;
-  return host.claudeAccountEmail ?? "auto";
+  return host.claudeAccountEmail ?? "none";
 }
 
 export function currentCodexValue(host: Host): string {
   if (host.codexSelection) return host.codexSelection;
   if (host.codexGroup) return `group:${host.codexGroup}`;
-  return host.codexAccountEmail ?? "auto";
+  return host.codexAccountEmail ?? "none";
 }
 
 export function ChangeAccountModal({

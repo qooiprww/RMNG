@@ -15,8 +15,8 @@ use wire::{Host, Operation, OperationKind, OperationStatus};
 
 use crate::app::App;
 use crate::provision::{
-    self, clone_container, commit_clone_image, control_env_vars, delete_clone, is_dns_label,
-    pull_template, PullProgress,
+    self, PullProgress, clone_container, commit_clone_image, control_env_vars, delete_clone,
+    is_dns_label, pull_template,
 };
 
 const LOG_LIMIT: usize = 200;
@@ -69,14 +69,23 @@ pub struct CloneSpec {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn new_op_id() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("op_{:08x}", (t as u64).wrapping_add(n.wrapping_mul(0x9E3779B97F4A7C15)) & 0xFFFF_FFFF)
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "op_{:08x}",
+        (t as u64).wrapping_add(n.wrapping_mul(0x9E3779B97F4A7C15)) & 0xFFFF_FFFF
+    )
 }
 
 fn make_op(kind: OperationKind, target: &str, source: Option<&str>) -> Operation {
@@ -217,7 +226,11 @@ pub fn fail_stale_ops(app: &App) {
         return;
     }
     app.store.mutate(|s| {
-        for op in s.operations.iter_mut().filter(|o| o.status == OperationStatus::Running) {
+        for op in s
+            .operations
+            .iter_mut()
+            .filter(|o| o.status == OperationStatus::Running)
+        {
             op.status = OperationStatus::Error;
             op.message = "interrupted by server restart".into();
             op.log.push("error: interrupted by server restart".into());
@@ -225,7 +238,10 @@ pub fn fail_stale_ops(app: &App) {
         }
     });
     for id in stale {
-        tracing::warn!(op = id.as_str(), "marking stale Running op as Error (interrupted by server restart)");
+        tracing::warn!(
+            op = id.as_str(),
+            "marking stale Running op as Error (interrupted by server restart)"
+        );
         schedule_prune(app.clone(), id, PRUNE_ERROR_MS);
     }
 }
@@ -234,7 +250,8 @@ pub fn fail_stale_ops(app: &App) {
 /// when called immediately before `start_clone` (single state snapshot).
 pub fn next_free_hostname(app: &App, base: &str) -> String {
     let st = app.store.get();
-    let mut taken: std::collections::HashSet<String> = st.hosts.iter().map(|h| h.id.clone()).collect();
+    let mut taken: std::collections::HashSet<String> =
+        st.hosts.iter().map(|h| h.id.clone()).collect();
     for o in &st.operations {
         if o.status == OperationStatus::Running {
             taken.insert(o.target.clone());
@@ -266,13 +283,27 @@ pub fn start_clone(app: &App, spec: CloneSpec) -> Result<Operation, JobError> {
     }
     let st = app.store.get();
     if st.hosts.iter().any(|h| h.id == spec.new_hostname) {
-        return Err(JobError(format!("a host named '{}' already exists", spec.new_hostname)));
+        return Err(JobError(format!(
+            "a host named '{}' already exists",
+            spec.new_hostname
+        )));
     }
-    if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == spec.new_hostname) {
-        return Err(JobError(format!("'{}' is already being created", spec.new_hostname)));
+    if st
+        .operations
+        .iter()
+        .any(|o| o.status == OperationStatus::Running && o.target == spec.new_hostname)
+    {
+        return Err(JobError(format!(
+            "'{}' is already being created",
+            spec.new_hostname
+        )));
     }
 
-    let op = make_op(OperationKind::Clone, &spec.new_hostname, Some(&spec.source_image));
+    let op = make_op(
+        OperationKind::Clone,
+        &spec.new_hostname,
+        Some(&spec.source_image),
+    );
     let op_for_return = op.clone();
     let op_id = op.id.clone();
     app.store.mutate(|s| s.operations.push(op));
@@ -293,11 +324,19 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // passed an id form — MCP/raw API); `Host.source` must record the reference so the
     // commit flow can stamp lineage. The backing container's name is the host id — that's
     // how every later call (dials, redeploy, credential ops, delete) addresses it.
-    let image_ref =
-        match clone_container(&app, &spec.source_image, &spec.new_hostname, &env, &spec.agent_playbook, progress).await {
-            Ok(v) => v,
-            Err(e) => return fail_op(&app, &op_id, e.to_string()),
-        };
+    let image_ref = match clone_container(
+        &app,
+        &spec.source_image,
+        &spec.new_hostname,
+        &env,
+        &spec.agent_playbook,
+        progress,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return fail_op(&app, &op_id, e.to_string()),
+    };
 
     // The container is up and its daemon has registered (or timed out still-booting) — the op
     // now sits at the `ready` step (~80%). The clone is NOT connectable yet: the account tokens
@@ -324,17 +363,28 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     let mut claude_selection: Option<String> = None;
     let mut claude_account_email: Option<String> = None;
     let mut claude_group: Option<String> = None;
-    if let Some(assignment) = crate::claude::resolve_assignment(&app, spec.claude_account.as_deref()) {
+    if let Some(assignment) =
+        crate::claude::resolve_assignment(&app, spec.claude_account.as_deref())
+    {
         let selection = crate::claude::normalize_selection(spec.claude_account.as_deref());
-        let (group, account) = match assignment {
-            crate::claude::Assignment::Group { name, initial } => (Some(name), Some(initial)),
-            crate::claude::Assignment::Account(a) => (None, Some(a)),
-            crate::claude::Assignment::None => (None, None),
+        let (group, account, pending_auto) = match assignment {
+            crate::claude::Assignment::Group { name, initial } => {
+                (Some(name), Some(initial), false)
+            }
+            crate::claude::Assignment::Account(a) => (None, Some(a), false),
+            crate::claude::Assignment::AutoPending => (None, None, true),
+            crate::claude::Assignment::None => (None, None, false),
         };
         claude_selection = Some(selection);
         claude_account_email = account.clone();
         claude_group = group.clone();
         match account {
+            None if pending_auto => {
+                patch_op(&app, &op_id, |op| {
+                    op.log
+                        .push("account: auto (pending imported account)".into())
+                });
+            }
             None => {
                 // Explicit "none": strip any credentials the image carried so the clone
                 // boots tokenless, instead of trusting the template to be clean. Idempotent
@@ -347,7 +397,8 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
                     Err(e) => {
                         tracing::warn!("clear_clone_token({}) failed: {e}", spec.new_hostname);
                         patch_op(&app, &op_id, |op| {
-                            op.log.push(format!("account: none — failed to clear credentials: {e}"))
+                            op.log
+                                .push(format!("account: none — failed to clear credentials: {e}"))
                         });
                     }
                 }
@@ -359,11 +410,14 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
                     None => email.clone(),
                 };
                 match crate::claude::push_account_to_clone(&app, &spec.new_hostname, &email).await {
-                    Ok(()) => patch_op(&app, &op_id, |op| op.log.push(format!("account: assigned {label}"))),
+                    Ok(()) => patch_op(&app, &op_id, |op| {
+                        op.log.push(format!("account: assigned {label}"))
+                    }),
                     Err(e) => {
                         tracing::warn!("push_account_to_clone({}) failed: {e}", spec.new_hostname);
                         patch_op(&app, &op_id, |op| {
-                            op.log.push(format!("account: failed to assign {label}: {e}"))
+                            op.log
+                                .push(format!("account: failed to assign {label}: {e}"))
                         });
                     }
                 }
@@ -377,27 +431,41 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     let mut codex_selection: Option<String> = None;
     let mut codex_account_email: Option<String> = None;
     let mut codex_group: Option<String> = None;
-    if let Some(assignment) = crate::codex::resolve_assignment(&app, spec.codex_account.as_deref()) {
+    if let Some(assignment) = crate::codex::resolve_assignment(&app, spec.codex_account.as_deref())
+    {
         let selection = crate::codex::normalize_selection(spec.codex_account.as_deref());
-        let (group, account) = match assignment {
-            crate::codex::Assignment::Group { name, initial } => (Some(name), Some(initial)),
-            crate::codex::Assignment::Account(a) => (None, Some(a)),
-            crate::codex::Assignment::None => (None, None),
+        let (group, account, pending_auto) = match assignment {
+            crate::codex::Assignment::Group { name, initial } => (Some(name), Some(initial), false),
+            crate::codex::Assignment::Account(a) => (None, Some(a), false),
+            crate::codex::Assignment::AutoPending => (None, None, true),
+            crate::codex::Assignment::None => (None, None, false),
         };
         codex_selection = Some(selection);
         codex_account_email = account.clone();
         codex_group = group.clone();
         match account {
+            None if pending_auto => {
+                patch_op(&app, &op_id, |op| {
+                    op.log
+                        .push("codex account: auto (pending imported account)".into())
+                });
+            }
             None => {
                 // Explicit "none": strip any codex auth the image carried (see the Claude block).
                 match crate::codex::clear_clone_token(&app, &spec.new_hostname).await {
                     Ok(()) => patch_op(&app, &op_id, |op| {
-                        op.log.push("codex account: none (credentials cleared)".into())
+                        op.log
+                            .push("codex account: none (credentials cleared)".into())
                     }),
                     Err(e) => {
-                        tracing::warn!("codex clear_clone_token({}) failed: {e}", spec.new_hostname);
+                        tracing::warn!(
+                            "codex clear_clone_token({}) failed: {e}",
+                            spec.new_hostname
+                        );
                         patch_op(&app, &op_id, |op| {
-                            op.log.push(format!("codex account: none — failed to clear credentials: {e}"))
+                            op.log.push(format!(
+                                "codex account: none — failed to clear credentials: {e}"
+                            ))
                         });
                     }
                 }
@@ -413,9 +481,13 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
                         op.log.push(format!("codex account: assigned {label}"))
                     }),
                     Err(e) => {
-                        tracing::warn!("codex push_account_to_clone({}) failed: {e}", spec.new_hostname);
+                        tracing::warn!(
+                            "codex push_account_to_clone({}) failed: {e}",
+                            spec.new_hostname
+                        );
                         patch_op(&app, &op_id, |op| {
-                            op.log.push(format!("codex account: failed to assign {label}: {e}"))
+                            op.log
+                                .push(format!("codex account: failed to assign {label}: {e}"))
                         });
                     }
                 }
@@ -482,9 +554,19 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
     // first message, plus any instruction overrides. Detached; it waits for the
     // wrapper to come up.
     let ticket_url = spec.linear.as_ref().and_then(|m| m.ticket_url.clone());
-    let has_msg = spec.first_message.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+    let has_msg = spec
+        .first_message
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
     if ticket_url.is_some() || has_msg {
-        if let Some(host) = app.store.get().hosts.into_iter().find(|h| h.id == spec.new_hostname) {
+        if let Some(host) = app
+            .store
+            .get()
+            .hosts
+            .into_iter()
+            .find(|h| h.id == spec.new_hostname)
+        {
             tokio::spawn(crate::chat::kickoff_agent(
                 app.clone(),
                 host,
@@ -505,7 +587,11 @@ async fn run_clone(app: App, op_id: String, spec: CloneSpec) {
 /// is not a host). Guard: no op is already in flight for the same reference.
 pub fn start_pull(app: &App, reference: &str) -> Result<Operation, JobError> {
     let st = app.store.get();
-    if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == reference) {
+    if st
+        .operations
+        .iter()
+        .any(|o| o.status == OperationStatus::Running && o.target == reference)
+    {
         return Err(JobError(format!("'{reference}' is already being pulled")));
     }
     let op = make_op(OperationKind::Pull, reference, None);
@@ -540,7 +626,11 @@ async fn run_pull(app: App, op_id: String, reference: String) {
 /// every in-flight clone/pull/commit. `reference` is `config.docker.serverImage`.
 pub fn start_update(app: &App, reference: &str) -> Result<Operation, JobError> {
     let st = app.store.get();
-    if st.operations.iter().any(|o| o.status == OperationStatus::Running) {
+    if st
+        .operations
+        .iter()
+        .any(|o| o.status == OperationStatus::Running)
+    {
         return Err(JobError(
             "another operation is in flight; wait for it to finish before updating".into(),
         ));
@@ -558,7 +648,11 @@ async fn run_update(app: App, op_id: String, reference: String) {
     let self_id = match app.docker.env().await.self_container {
         Some(id) => id,
         None => {
-            return fail_op(&app, &op_id, "not running as a container (dev mode) — nothing to update".into());
+            return fail_op(
+                &app,
+                &op_id,
+                "not running as a container (dev mode) — nothing to update".into(),
+            );
         }
     };
 
@@ -623,12 +717,20 @@ async fn run_update(app: App, op_id: String, reference: String) {
         op.step = "handoff".into();
         op.message = "handing off to the updater".into();
     });
-    let handoff = crate::update::Handoff { spec, op_id: op_id.clone(), target_digest };
+    let handoff = crate::update::Handoff {
+        spec,
+        op_id: op_id.clone(),
+        target_digest,
+    };
     if let Err(e) = crate::update::write_handoff(&handoff) {
         return fail_op(&app, &op_id, format!("writing handoff: {e:#}"));
     }
     let socket = app.config().docker.socket;
-    if let Err(e) = app.docker.launch_upgrade_helper(&reference, &self_id, &socket).await {
+    if let Err(e) = app
+        .docker
+        .launch_upgrade_helper(&reference, &self_id, &socket)
+        .await
+    {
         crate::update::clear_handoff();
         return fail_op(&app, &op_id, format!("launching updater: {e:#}"));
     }
@@ -657,7 +759,9 @@ pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, J
         .cloned()
         .ok_or_else(|| JobError(format!("unknown host '{host_id}'")))?;
     if !host.managed {
-        return Err(JobError(format!("'{host_id}' is not a managed clone — only clones can be committed")));
+        return Err(JobError(format!(
+            "'{host_id}' is not a managed clone — only clones can be committed"
+        )));
     }
     let reference = format!("{name}:latest");
     // Reject a tag already targeted by another running commit/pull (a race the pure
@@ -668,10 +772,18 @@ pub fn start_commit(app: &App, host_id: &str, name: &str) -> Result<Operation, J
             && matches!(o.kind, OperationKind::Commit | OperationKind::Pull)
             && o.target == name
     }) {
-        return Err(JobError(format!("an image named '{name}' is already being built")));
+        return Err(JobError(format!(
+            "an image named '{name}' is already being built"
+        )));
     }
-    if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == host_id) {
-        return Err(JobError(format!("'{host_id}' already has an operation in flight")));
+    if st
+        .operations
+        .iter()
+        .any(|o| o.status == OperationStatus::Running && o.target == host_id)
+    {
+        return Err(JobError(format!(
+            "'{host_id}' already has an operation in flight"
+        )));
     }
 
     // Target = the image name (what's being produced); source = the host it's committed from.
@@ -717,8 +829,14 @@ pub fn start_delete(app: &App, host_id: &str) -> Result<Operation, JobError> {
     let Some(host) = host else {
         return Err(JobError(format!("unknown host '{host_id}'")));
     };
-    if st.operations.iter().any(|o| o.status == OperationStatus::Running && o.target == host_id) {
-        return Err(JobError(format!("'{host_id}' already has an operation in flight")));
+    if st
+        .operations
+        .iter()
+        .any(|o| o.status == OperationStatus::Running && o.target == host_id)
+    {
+        return Err(JobError(format!(
+            "'{host_id}' already has an operation in flight"
+        )));
     }
 
     let op = make_op(OperationKind::Delete, host_id, None);
@@ -787,7 +905,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
-        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        let cfg = wire::AppConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         App::new(store, cfg)
     }
 
@@ -809,7 +930,10 @@ mod tests {
 
     #[test]
     fn clonespec_default_has_no_codex_account() {
-        let spec = CloneSpec { new_hostname: "x".into(), ..Default::default() };
+        let spec = CloneSpec {
+            new_hostname: "x".into(),
+            ..Default::default()
+        };
         assert!(spec.codex_account.is_none());
     }
 
@@ -827,7 +951,10 @@ mod tests {
         app.store.mutate(|s| {
             s.operations.push(running_op("op_a", "tpl-a"));
             // A finished op must be left untouched.
-            s.operations.push(Operation { status: OperationStatus::Done, ..running_op("op_b", "tpl-b") });
+            s.operations.push(Operation {
+                status: OperationStatus::Done,
+                ..running_op("op_b", "tpl-b")
+            });
         });
 
         fail_stale_ops(&app);
@@ -837,11 +964,19 @@ mod tests {
         assert_eq!(a.status, OperationStatus::Error);
         assert_eq!(a.message, "interrupted by server restart");
         assert!(a.finished_at.is_some());
-        assert!(a.log.iter().any(|l| l.contains("interrupted by server restart")));
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.contains("interrupted by server restart"))
+        );
         let b = st.operations.iter().find(|o| o.id == "op_b").unwrap();
         assert_eq!(b.status, OperationStatus::Done); // untouched
         // No Running op remains, so a same-target op is no longer blocked forever.
-        assert!(!st.operations.iter().any(|o| o.status == OperationStatus::Running));
+        assert!(
+            !st.operations
+                .iter()
+                .any(|o| o.status == OperationStatus::Running)
+        );
     }
 
     /// Per-layer pull `Status` events (surfaced to `pull_op_progress` as [`PullProgress::Log`])
@@ -851,22 +986,32 @@ mod tests {
     #[tokio::test]
     async fn pull_log_event_reaches_op_log_without_moving_pct_or_step() {
         let app = test_app();
-        app.store.mutate(|s| s.operations.push(running_op("op_a", "tpl-a")));
+        app.store
+            .mutate(|s| s.operations.push(running_op("op_a", "tpl-a")));
         let mut progress = pull_op_progress(&app, "op_a");
 
-        progress(PullProgress::Log { msg: "aaaaaaaaaaaa: Downloading".into() });
+        progress(PullProgress::Log {
+            msg: "aaaaaaaaaaaa: Downloading".into(),
+        });
 
         let st = app.store.get();
         let op = st.operations.iter().find(|o| o.id == "op_a").unwrap();
         assert_eq!(op.step, "pull"); // unmoved
         assert_eq!(op.pct, 40.0); // unmoved — pct stays byte-driven
         assert_eq!(op.message, "aaaaaaaaaaaa: Downloading");
-        assert!(op.log.iter().any(|l| l == "pull: aaaaaaaaaaaa: Downloading"));
+        assert!(
+            op.log
+                .iter()
+                .any(|l| l == "pull: aaaaaaaaaaaa: Downloading")
+        );
 
         // A subsequent `Pct` (Bytes) tick updates pct + message but must NOT add a log line —
         // the log stays exactly as the `Log` event left it.
         let log_len_before = op.log.len();
-        progress(PullProgress::Pct { pct: 50.0, msg: "pulling docker.io/x:y: 55%".into() });
+        progress(PullProgress::Pct {
+            pct: 50.0,
+            msg: "pulling docker.io/x:y: 55%".into(),
+        });
         let st = app.store.get();
         let op = st.operations.iter().find(|o| o.id == "op_a").unwrap();
         assert_eq!(op.pct, 50.0);
@@ -879,8 +1024,13 @@ mod tests {
     #[tokio::test]
     async fn start_update_rejects_when_an_op_is_running() {
         let app = test_app();
-        app.store.mutate(|s| s.operations.push(running_op("op_x", "some-clone")));
+        app.store
+            .mutate(|s| s.operations.push(running_op("op_x", "some-clone")));
         let err = start_update(&app, "pegasis0/rmng:latest").unwrap_err();
-        assert!(err.0.contains("in flight") || err.0.contains("already"), "got: {}", err.0);
+        assert!(
+            err.0.contains("in flight") || err.0.contains("already"),
+            "got: {}",
+            err.0
+        );
     }
 }

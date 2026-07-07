@@ -3,6 +3,7 @@
 //! are ported.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -93,7 +94,9 @@ pub fn router(app: App) -> Router {
         Some(std::path::PathBuf::from(&cfg_dir))
     } else {
         if !cfg_dir.is_empty() {
-            tracing::warn!("static_dir '{cfg_dir}' is not a directory; using the installed frontend");
+            tracing::warn!(
+                "static_dir '{cfg_dir}' is not a directory; using the installed frontend"
+            );
         }
         crate::assets::static_dir()
     };
@@ -154,7 +157,9 @@ async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
 
     let (stats_snapshot, stats_rx) = app.stats.subscribe();
     let stats_initial =
-        futures::stream::once(async move { Ok(Event::default().event("stats").data(stats_snapshot)) });
+        futures::stream::once(
+            async move { Ok(Event::default().event("stats").data(stats_snapshot)) },
+        );
     let stats_updates = BroadcastStream::new(stats_rx).filter_map(|r| async move {
         match r {
             Ok(json) => Some(Ok(Event::default().event("stats").data(json))),
@@ -164,9 +169,10 @@ async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
     let stats_stream = stats_initial.chain(stats_updates);
 
     let (fwd_snapshot, fwd_rx) = app.forwards.subscribe();
-    let fwd_initial = futures::stream::once(
-        async move { Ok(Event::default().event("forwards").data(fwd_snapshot)) },
-    );
+    let fwd_initial =
+        futures::stream::once(
+            async move { Ok(Event::default().event("forwards").data(fwd_snapshot)) },
+        );
     let fwd_updates = BroadcastStream::new(fwd_rx).filter_map(|r| async move {
         match r {
             Ok(json) => Some(Ok(Event::default().event("forwards").data(json))),
@@ -179,7 +185,11 @@ async fn events(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
         state_stream,
         futures::stream::select(stats_stream, fwd_stream),
     ))
-    .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)).text("ping"))
+    .keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(20))
+            .text("ping"),
+    )
 }
 
 /// `GET /api/state` — the current [`ControlState`] as a single-shot snapshot (the same
@@ -270,7 +280,10 @@ fn validate_forwards(
             return Err(bad("ports must be 1–65535".into()));
         }
         if !taken.insert(inp.local_port) {
-            return Err(bad(format!("local port {} is already in use", inp.local_port)));
+            return Err(bad(format!(
+                "local port {} is already in use",
+                inp.local_port
+            )));
         }
         out.push(wire::PortForward {
             id: inp.id.unwrap_or_else(|| format!("f{}", inp.local_port)),
@@ -342,8 +355,10 @@ async fn proxy_to_daemon(
         .send()
         .await
         .map_err(|e| format!("clone-daemon MCP unreachable at {url}: {e}"))?;
-    let body: serde_json::Value =
-        resp.json().await.map_err(|e| format!("decoding clone-daemon MCP reply: {e}"))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("decoding clone-daemon MCP reply: {e}"))?;
     if let Some(err) = body.get("error") {
         return Err(format!("clone-daemon MCP error: {err}"));
     }
@@ -369,14 +384,22 @@ async fn host_exec(
     let host = host_by_id(&app, &id).ok_or((StatusCode::NOT_FOUND, format!("no host '{id}'")))?;
     let stdin = match &req.stdin_b64 {
         Some(b64) => Some(
-            B64.decode(b64).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid stdinB64: {e}")))?,
+            B64.decode(b64)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid stdinB64: {e}")))?,
         ),
         None => None,
     };
     let user = req.user.clone().unwrap_or_else(|| "1000".to_string());
     let result = app
         .docker
-        .exec_capture(&host.id, &req.cmd, &user, req.workdir.as_deref(), &req.env, stdin.as_deref())
+        .exec_capture(
+            &host.id,
+            &req.cmd,
+            &user,
+            req.workdir.as_deref(),
+            &req.env,
+            stdin.as_deref(),
+        )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     Ok(Json(result))
@@ -400,7 +423,9 @@ async fn clone(
     let bad = |m: String| (StatusCode::BAD_REQUEST, m);
     let str_field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 
-    let image = str_field("image").filter(|s| !s.is_empty()).ok_or_else(|| bad("body must include { image }".into()))?;
+    let image = str_field("image")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("body must include { image }".into()))?;
     let claude_account = str_field("claudeAccount");
     let codex_account = str_field("codexAccount");
     let agent_instructions = str_field("agentInstructions");
@@ -410,7 +435,10 @@ async fn clone(
 
     // An explicitly chosen preset (by name); absent/"auto" means auto-select in
     // ticket mode and "required, so error" in plain/create mode (checked per mode).
-    let explicit = match str_field("preset").map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "auto") {
+    let explicit = match str_field("preset")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "auto")
+    {
         Some(name) => Some(
             cfg.presets
                 .iter()
@@ -424,7 +452,11 @@ async fn clone(
     let derive = |app: &App, base: &str, title: &str| -> (String, String) {
         let hostname = jobs::next_free_hostname(app, base);
         let suffix = hostname.strip_prefix(base).unwrap_or("").to_string();
-        let display = if suffix.is_empty() { title.to_string() } else { format!("{title} ({suffix})") };
+        let display = if suffix.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} ({suffix})")
+        };
         (hostname, display)
     };
 
@@ -432,8 +464,9 @@ async fn clone(
     // derived display name. A preset is optional — fleet workers usually need none; an
     // explicitly chosen one still applies its env + playbook append. Hostname validity +
     // uniqueness are gated by `start_clone`.
-    if let Some(hostname) =
-        str_field("hostname").map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    if let Some(hostname) = str_field("hostname")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
     {
         let spec = CloneSpec {
             source_image: image,
@@ -445,7 +478,9 @@ async fn clone(
             agent_instructions,
             claude_instructions,
             preset_name: explicit.map(|p| p.name.clone()),
-            env: explicit.map(crate::provision::preset_env_vars).unwrap_or_default(),
+            env: explicit
+                .map(crate::provision::preset_env_vars)
+                .unwrap_or_default(),
             agent_playbook: compose_playbook(&cfg, explicit),
         };
         let op = jobs::start_clone(&app, spec).map_err(|e| bad(e.to_string()))?;
@@ -454,21 +489,40 @@ async fn clone(
 
     // Plain (no-ticket) clone: a preset must be picked whenever any are configured.
     if let Some(plain) = body.get("plain").filter(|v| v.is_object()) {
-        let title = plain.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let message = plain.get("message").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let title = plain
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let message = plain
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if title.is_empty() {
             return Err(bad("plain.title is required".into()));
         }
         let env = match explicit {
             Some(p) => crate::provision::preset_env_vars(p),
             None if cfg.presets.is_empty() => Vec::new(),
-            None => return Err(bad(format!("a preset is required (configured: {})", preset_names(&cfg)))),
+            None => {
+                return Err(bad(format!(
+                    "a preset is required (configured: {})",
+                    preset_names(&cfg)
+                )));
+            }
         };
-        let (hostname, display) = derive(&app, &linear::plain_hostname_base(&prefix, &title), &title);
+        let (hostname, display) =
+            derive(&app, &linear::plain_hostname_base(&prefix, &title), &title);
         let spec = CloneSpec {
             source_image: image,
             new_hostname: hostname,
-            linear: Some(LinearMeta { display_name: Some(display), ..Default::default() }),
+            linear: Some(LinearMeta {
+                display_name: Some(display),
+                ..Default::default()
+            }),
             claude_account,
             codex_account,
             first_message: Some(message).filter(|m| !m.is_empty()),
@@ -484,7 +538,9 @@ async fn clone(
 
     // Ticket / create mode. `op_key` is the API key proven to reach the issue (used
     // for the state mutation); the preset drives the clone's env + LINEAR_API_KEY.
-    let (issue, op_key, preset) = resolve_issue(&app, &cfg, explicit, &body).await.map_err(bad)?;
+    let (issue, op_key, preset) = resolve_issue(&app, &cfg, explicit, &body)
+        .await
+        .map_err(bad)?;
     if let Err(e) = linear::ensure_in_progress(&app.http, &op_key, &issue).await {
         tracing::warn!("ensure_in_progress({}) failed: {e}", issue.identifier);
     }
@@ -516,7 +572,11 @@ async fn clone(
 }
 
 fn preset_names(cfg: &wire::AppConfig) -> String {
-    cfg.presets.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+    cfg.presets
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The effective agent playbook for a clone: the global `agentPlaybook` plus the preset's
@@ -524,7 +584,10 @@ fn preset_names(cfg: &wire::AppConfig) -> String {
 /// the wrapper's `[notes, procedure].filter(Boolean).join("\n\n")`.
 pub(crate) fn compose_playbook(cfg: &wire::AppConfig, preset: Option<&wire::Preset>) -> String {
     let base = cfg.agent_playbook.trim();
-    match preset.map(|p| p.agent_playbook.trim()).filter(|s| !s.is_empty()) {
+    match preset
+        .map(|p| p.agent_playbook.trim())
+        .filter(|s| !s.is_empty())
+    {
         Some(extra) => format!("{base}\n\n{extra}"),
         None => base.to_string(),
     }
@@ -540,13 +603,25 @@ async fn resolve_issue(
 ) -> Result<(linear::IssueInfo, String, wire::Preset), String> {
     if let Some(create) = body.get("create").filter(|v| v.is_object()) {
         let team = create.get("team").and_then(|v| v.as_str()).unwrap_or("");
-        let title = create.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let description = create.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let title = create
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let description = create
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let Some(preset) = explicit else {
-            return Err("creating a ticket requires a preset (its Linear key creates the issue)".into());
+            return Err(
+                "creating a ticket requires a preset (its Linear key creates the issue)".into(),
+            );
         };
         if preset.linear_key.is_empty() {
-            return Err(format!("preset '{}' has no Linear API key — required to create a ticket", preset.name));
+            return Err(format!(
+                "preset '{}' has no Linear API key — required to create a ticket",
+                preset.name
+            ));
         }
         let prefix = team.trim().to_ascii_lowercase();
         if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -555,9 +630,10 @@ async fn resolve_issue(
         if title.is_empty() {
             return Err("create.title is required".into());
         }
-        let issue = linear::create_issue(&app.http, &preset.linear_key, &prefix, title, description)
-            .await
-            .map_err(|e| e.to_string())?;
+        let issue =
+            linear::create_issue(&app.http, &preset.linear_key, &prefix, title, description)
+                .await
+                .map_err(|e| e.to_string())?;
         return Ok((issue, preset.linear_key.clone(), preset.clone()));
     }
     let ticket = body.get("ticket").and_then(|v| v.as_str()).unwrap_or("");
@@ -572,8 +648,9 @@ async fn resolve_issue(
         keys.push(p.linear_key.as_str());
     }
     keys.extend(cfg.presets.iter().map(|p| p.linear_key.as_str()));
-    let (issue, op_key) =
-        linear::fetch_issue_any(&app.http, &keys, &r).await.map_err(|e| e.to_string())?;
+    let (issue, op_key) = linear::fetch_issue_any(&app.http, &keys, &r)
+        .await
+        .map_err(|e| e.to_string())?;
     let preset = match explicit {
         Some(p) => p.clone(),
         None => linear::pick_preset_by_prefix(&cfg.presets, &issue.prefix).cloned().ok_or_else(|| {
@@ -594,7 +671,9 @@ async fn resolve_issue(
 /// the managed containers created from it (`in_use_by`; container name == host id for
 /// clones). Both halves come from the daemon — Docker, not `state.json`, knows which
 /// containers reference which image. A daemon error surfaces as 502.
-async fn images_list(State(app): State<App>) -> Result<Json<Vec<wire::ImageInfo>>, (StatusCode, String)> {
+async fn images_list(
+    State(app): State<App>,
+) -> Result<Json<Vec<wire::ImageInfo>>, (StatusCode, String)> {
     let mut images = app
         .docker
         .list_rmng_images()
@@ -691,12 +770,19 @@ async fn images_delete(
         .list_managed_containers()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let users: Vec<String> =
-        containers.iter().filter(|c| c.image == reference).map(|c| c.name.clone()).collect();
+    let users: Vec<String> = containers
+        .iter()
+        .filter(|c| c.image == reference)
+        .map(|c| c.name.clone())
+        .collect();
     if !users.is_empty() {
         return Err((
             StatusCode::CONFLICT,
-            format!("image is in use by {} clone(s): {}", users.len(), users.join(", ")),
+            format!(
+                "image is in use by {} clone(s): {}",
+                users.len(),
+                users.join(", ")
+            ),
         ));
     }
     // A running clone-from-this-image or commit-to-this-reference also blocks removal.
@@ -705,7 +791,10 @@ async fn images_delete(
             && (o.source.as_deref() == Some(reference) || o.target == reference)
     });
     if busy {
-        return Err((StatusCode::CONFLICT, "image is in use by a running operation".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "image is in use by a running operation".into(),
+        ));
     }
     app.docker
         .remove_image(reference)
@@ -746,7 +835,10 @@ async fn layout_activate(
     // 1. Validate + persist the active_layout.
     let mut cfg = app.config();
     if !cfg.layout_presets.iter().any(|p| p.name == req.name) {
-        return Err((StatusCode::BAD_REQUEST, format!("unknown layout preset '{}'", req.name)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown layout preset '{}'", req.name),
+        ));
     }
     cfg.active_layout = req.name.clone();
     crate::config::save(&cfg).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -766,12 +858,17 @@ async fn layout_activate(
             Err(e) => errors.push(format!("{id}: {e}")),
         }
     }
-    Ok(Json(serde_json::json!({ "ok": true, "applied": applied, "errors": errors })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "applied": applied, "errors": errors }),
+    ))
 }
 
 // --- notes + uploads (side stores, not in ControlState) --------------------
 
-async fn notes_get(State(app): State<App>, AxPath(id): AxPath<String>) -> Json<Vec<serde_json::Value>> {
+async fn notes_get(
+    State(app): State<App>,
+    AxPath(id): AxPath<String>,
+) -> Json<Vec<serde_json::Value>> {
     Json(files::load_notes(&app.config().data_dir, &id).unwrap_or_default())
 }
 
@@ -790,10 +887,17 @@ async fn upload(
     State(app): State<App>,
     mut mp: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    while let Some(field) = mp.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
+    while let Some(field) = mp
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
         if field.name() == Some("file") {
             let ct = field.content_type().unwrap_or("").to_string();
-            let bytes = field.bytes().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             let url = files::save_upload(&app.config().data_dir, &ct, &bytes)
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             return Ok(Json(json!({ "url": url })));
@@ -831,7 +935,11 @@ async fn detector_feedback(
     };
     let mut screenshot: Option<Vec<u8>> = None;
     let mut capture: Option<String> = None;
-    while let Some(field) = mp.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
+    while let Some(field) = mp
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
         match field.name().unwrap_or("") {
             "clone" => clone_field = field.text().await.ok().map(|s| s.trim().to_string()),
             "kind" => fb.kind = field.text().await.unwrap_or_default(),
@@ -859,11 +967,15 @@ async fn detector_feedback(
         fb.mode = "screen".into();
     }
     if fb.kind != "false-positive" && fb.kind != "false-negative" {
-        return Err((StatusCode::BAD_REQUEST, "kind must be false-positive|false-negative".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "kind must be false-positive|false-negative".into(),
+        ));
     }
-    let clone = clone_field
-        .filter(|c| !c.is_empty())
-        .ok_or((StatusCode::BAD_REQUEST, "missing 'clone' field (the caller's clone id)".into()))?;
+    let clone = clone_field.filter(|c| !c.is_empty()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "missing 'clone' field (the caller's clone id)".into(),
+    ))?;
     let host_id = app
         .store
         .get()
@@ -872,10 +984,19 @@ async fn detector_feedback(
         .find(|h| h.id == clone)
         .map(|h| h.id)
         .ok_or((StatusCode::NOT_FOUND, format!("no host named '{clone}'")))?;
-    let id =
-        files::save_detector_feedback(&app.config().data_dir, &host_id, &fb, screenshot.as_deref(), capture.as_deref())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tracing::info!("detector-feedback from {host_id}: {} [{}] (id {id})", fb.kind, fb.mode);
+    let id = files::save_detector_feedback(
+        &app.config().data_dir,
+        &host_id,
+        &fb,
+        screenshot.as_deref(),
+        capture.as_deref(),
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(
+        "detector-feedback from {host_id}: {} [{}] (id {id})",
+        fb.kind,
+        fb.mode
+    );
     Ok(Json(json!({ "ok": true, "id": id, "host": host_id })))
 }
 
@@ -930,12 +1051,17 @@ async fn config_put(
     if !old.setup_complete && merged.setup_complete {
         // Bounded: the shared bollard client tolerates 1 h requests (commits); a wedged
         // daemon must not hang this PUT for that long.
-        match tokio::time::timeout(std::time::Duration::from_secs(60), app.docker.self_setup(true))
-            .await
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            app.docker.self_setup(true),
+        )
+        .await
         {
             Ok(report) => {
                 if let Some(detail) = report.network_detail {
-                    tracing::warn!("self_setup network/self-attach at wizard finish failed: {detail}");
+                    tracing::warn!(
+                        "self_setup network/self-attach at wizard finish failed: {detail}"
+                    );
                     network_warning = Some(detail);
                 }
             }
@@ -965,8 +1091,12 @@ async fn config_put(
     }
     // Keep the sidebar's live layout list/active marker in sync with the just-saved presets.
     mirror_layout_to_state(&app);
-    let resp = ConfigPutResponse { restart_required, config: merged.redacted() };
-    let mut body = serde_json::to_value(&resp).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let resp = ConfigPutResponse {
+        restart_required,
+        config: merged.redacted(),
+    };
+    let mut body = serde_json::to_value(&resp)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if let (Some(obj), Some(w)) = (body.as_object_mut(), network_warning) {
         obj.insert("networkWarning".into(), json!(w));
     }
@@ -1024,7 +1154,11 @@ async fn setup_env(State(app): State<App>) -> Json<wire::SetupEnv> {
 async fn server_version(State(app): State<App>) -> Json<wire::UpdateStatus> {
     let reference = app.config().docker.server_image;
     let self_id = app.docker.env().await.self_container;
-    Json(app.docker.check_update(&reference, self_id.as_deref()).await)
+    Json(
+        app.docker
+            .check_update(&reference, self_id.as_deref())
+            .await,
+    )
 }
 
 /// `POST /api/server/update` — pull `config.docker.serverImage` and swap the running
@@ -1040,13 +1174,15 @@ async fn server_update(State(app): State<App>) -> Result<Json<Operation>, (Statu
 /// `POST /api/server/restart` — restart the control-server in place to apply restart-required
 /// settings (ports / sockets / static dir / chroma), re-read from config.json on boot. The
 /// response is sent before the daemon tears us down; the UI reconnects when we're back.
-async fn server_restart(State(app): State<App>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let self_id = app
-        .docker
-        .env()
-        .await
-        .self_container
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "not running as a container (dev mode) — restart manually".to_string()))?;
+async fn server_restart(
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let self_id = app.docker.env().await.self_container.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "not running as a container (dev mode) — restart manually".to_string(),
+        )
+    })?;
     let docker = app.docker.clone();
     // Spawn the restart so the HTTP response flushes to the client BEFORE the daemon stops us
     // (otherwise the browser sees a dropped connection instead of {ok:true}).
@@ -1077,9 +1213,16 @@ struct ImportCheckReq {
 /// `POST /api/claude/import/check` — confirm a clone is signed in to Claude Code via
 /// claude.ai and report the account identity (so the UI can show it before the
 /// operator mints + pastes a long-lived token).
-async fn claude_import_check(State(app): State<App>, Json(req): Json<ImportCheckReq>) -> JsonResult {
-    let host = host_by_id(&app, &req.host)
-        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+async fn claude_import_check(
+    State(app): State<App>,
+    Json(req): Json<ImportCheckReq>,
+) -> JsonResult {
+    let host = host_by_id(&app, &req.host).ok_or_else(|| {
+        err_json(
+            StatusCode::BAD_REQUEST,
+            format!("unknown host '{}'", req.host),
+        )
+    })?;
     let st = crate::claude::check_clone_auth(&app, &host)
         .await
         .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
@@ -1100,19 +1243,43 @@ struct ImportReq {
 /// the clone's OAuth pair (the server owns its refresh lifecycle from here on), then
 /// clear the clone's credentials file. Kicks an immediate usage poll so it shows at once.
 async fn claude_import(State(app): State<App>, Json(req): Json<ImportReq>) -> JsonResult {
-    let host = host_by_id(&app, &req.host)
-        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let host = host_by_id(&app, &req.host).ok_or_else(|| {
+        err_json(
+            StatusCode::BAD_REQUEST,
+            format!("unknown host '{}'", req.host),
+        )
+    })?;
     let res = crate::claude::import_clone_account(&app, &host)
         .await
         .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
     let _ = crate::claude::poll_once(&app).await;
-    Ok(Json(json!({ "ok": true, "email": res.email, "cleared": res.cleared })))
+    Ok(Json(
+        json!({ "ok": true, "email": res.email, "cleared": res.cleared }),
+    ))
 }
 
 /// `POST /api/claude/refresh` — force one usage poll now.
 async fn claude_refresh(State(app): State<App>) -> Json<serde_json::Value> {
-    let any429 = crate::claude::poll_once(&app).await.unwrap_or(false);
-    Json(json!({ "ok": true, "rateLimited": any429 }))
+    Json(
+        refresh_response(
+            crate::claude::poll_once(&app),
+            crate::claude::rotate_once(&app),
+        )
+        .await,
+    )
+}
+
+async fn refresh_response(
+    poll: impl Future<Output = anyhow::Result<bool>>,
+    rotate: impl Future<Output = ()>,
+) -> serde_json::Value {
+    match poll.await {
+        Ok(any429) => {
+            rotate.await;
+            json!({ "ok": true, "rateLimited": any429, "rotated": true })
+        }
+        Err(_) => json!({ "ok": true, "rateLimited": false, "rotated": false }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1135,12 +1302,25 @@ async fn claude_swap(
         .hosts
         .into_iter()
         .find(|h| h.id == req.host)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("unknown host '{}'", req.host),
+            )
+        })?;
     if !host.managed {
-        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", host.id)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not a managed clone", host.id),
+        ));
     }
-    let assignment = crate::claude::resolve_assignment(&app, Some(&req.account))
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "no imported Claude accounts".into()))?;
+    let assignment =
+        crate::claude::resolve_assignment(&app, Some(&req.account)).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "no imported Claude accounts".into(),
+            )
+        })?;
     let selection = crate::claude::normalize_selection(Some(&req.account));
     let (group, email) = match assignment {
         crate::claude::Assignment::None => {
@@ -1162,9 +1342,14 @@ async fn claude_swap(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             (None, Some(a))
         }
+        crate::claude::Assignment::AutoPending => (None, None),
     };
-    let (id, email_set, group_set, sel_set) =
-        (host.id.clone(), email.clone(), group.clone(), selection.clone());
+    let (id, email_set, group_set, sel_set) = (
+        host.id.clone(),
+        email.clone(),
+        group.clone(),
+        selection.clone(),
+    );
     app.store.mutate(|s| {
         if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
             h.claude_account_email = email_set;
@@ -1172,7 +1357,9 @@ async fn claude_swap(
             h.claude_selection = Some(sel_set);
         }
     });
-    Ok(Json(json!({ "ok": true, "account": email, "group": group, "selection": selection })))
+    Ok(Json(
+        json!({ "ok": true, "account": email, "group": group, "selection": selection }),
+    ))
 }
 
 /// `POST /api/claude/rotate` — run one group-rotation pass immediately (the rotator
@@ -1192,8 +1379,12 @@ struct CodexImportReq {
 /// `POST /api/codex/import/check` — confirm a clone is signed in to Codex via ChatGPT and
 /// report its identity so the UI can show it before importing.
 async fn codex_import_check(State(app): State<App>, Json(req): Json<CodexImportReq>) -> JsonResult {
-    let host = host_by_id(&app, &req.host)
-        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let host = host_by_id(&app, &req.host).ok_or_else(|| {
+        err_json(
+            StatusCode::BAD_REQUEST,
+            format!("unknown host '{}'", req.host),
+        )
+    })?;
     let auth = crate::codex::check_clone_auth(&app, &host)
         .await
         .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
@@ -1207,19 +1398,30 @@ async fn codex_import_check(State(app): State<App>, Json(req): Json<CodexImportR
 
 /// `POST /api/codex/import` — import a Codex account from a signed-in clone.
 async fn codex_import(State(app): State<App>, Json(req): Json<CodexImportReq>) -> JsonResult {
-    let host = host_by_id(&app, &req.host)
-        .ok_or_else(|| err_json(StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+    let host = host_by_id(&app, &req.host).ok_or_else(|| {
+        err_json(
+            StatusCode::BAD_REQUEST,
+            format!("unknown host '{}'", req.host),
+        )
+    })?;
     let res = crate::codex::import_clone_account(&app, &host)
         .await
         .map_err(|e| err_json(StatusCode::BAD_GATEWAY, e))?;
     let _ = crate::codex::poll_once(&app).await;
-    Ok(Json(json!({ "ok": true, "email": res.email, "cleared": res.cleared })))
+    Ok(Json(
+        json!({ "ok": true, "email": res.email, "cleared": res.cleared }),
+    ))
 }
 
 /// `POST /api/codex/refresh` — force one usage poll now.
 async fn codex_refresh(State(app): State<App>) -> Json<serde_json::Value> {
-    let any429 = crate::codex::poll_once(&app).await.unwrap_or(false);
-    Json(json!({ "ok": true, "rateLimited": any429 }))
+    Json(
+        refresh_response(
+            crate::codex::poll_once(&app),
+            crate::codex::rotate_once(&app),
+        )
+        .await,
+    )
 }
 
 #[derive(Deserialize)]
@@ -1240,9 +1442,17 @@ async fn codex_swap(
         .hosts
         .into_iter()
         .find(|h| h.id == req.host)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{}'", req.host)))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("unknown host '{}'", req.host),
+            )
+        })?;
     if !host.managed {
-        return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a managed clone", host.id)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not a managed clone", host.id),
+        ));
     }
     let assignment = crate::codex::resolve_assignment(&app, Some(&req.account))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "no imported Codex accounts".into()))?;
@@ -1267,9 +1477,14 @@ async fn codex_swap(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             (None, Some(a))
         }
+        crate::codex::Assignment::AutoPending => (None, None),
     };
-    let (id, email_set, group_set, sel_set) =
-        (host.id.clone(), email.clone(), group.clone(), selection.clone());
+    let (id, email_set, group_set, sel_set) = (
+        host.id.clone(),
+        email.clone(),
+        group.clone(),
+        selection.clone(),
+    );
     app.store.mutate(|s| {
         if let Some(h) = s.hosts.iter_mut().find(|h| h.id == id) {
             h.codex_account_email = email_set;
@@ -1277,7 +1492,9 @@ async fn codex_swap(
             h.codex_selection = Some(sel_set);
         }
     });
-    Ok(Json(json!({ "ok": true, "account": email, "group": group, "selection": selection })))
+    Ok(Json(
+        json!({ "ok": true, "account": email, "group": group, "selection": selection }),
+    ))
 }
 
 /// `POST /api/codex/rotate` — run one Codex group-rotation pass immediately.
@@ -1309,7 +1526,8 @@ async fn chat_send(
     AxPath(id): AxPath<String>,
     Json(req): Json<ChatSendReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let host = host_by_id(&app, &id).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{id}'")))?;
+    let host = host_by_id(&app, &id)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown host '{id}'")))?;
     crate::chat::send_chat(&app, &host, &req.text).map_err(|e| (StatusCode::CONFLICT, e))?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1321,11 +1539,13 @@ async fn chat_events(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (snapshot, rx) = crate::chat::subscribe(&app, &id);
     let initial = futures::stream::once(async move { Ok(Event::default().data(snapshot)) });
-    let updates = BroadcastStream::new(rx).filter_map(|r| async move {
-        r.ok().map(|json| Ok(Event::default().data(json)))
-    });
-    Sse::new(initial.chain(updates))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)).text("ping"))
+    let updates = BroadcastStream::new(rx)
+        .filter_map(|r| async move { r.ok().map(|json| Ok(Event::default().data(json))) });
+    Sse::new(initial.chain(updates)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(20))
+            .text("ping"),
+    )
 }
 
 /// `POST /api/chat/:id/abort` — interrupt the in-flight turn.
@@ -1354,7 +1574,11 @@ mod tests {
         }
     }
     fn container_on(name: &str, image: &str) -> ManagedContainer {
-        ManagedContainer { name: name.into(), image: image.into(), running: true }
+        ManagedContainer {
+            name: name.into(),
+            image: image.into(),
+            running: true,
+        }
     }
 
     #[test]
@@ -1397,7 +1621,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(crate::state::StateStore::load(dir.join("state.json")).unwrap());
-        let cfg = wire::AppConfig { data_dir: dir.to_string_lossy().into_owned(), ..Default::default() };
+        let cfg = wire::AppConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         App::new(store, cfg)
     }
 
@@ -1422,14 +1649,20 @@ mod tests {
         let app = test_app();
         // A blank reference defaults to config.docker.template_reference; the first pull
         // registers a Running op targeting that reference.
-        let _first =
-            images_pull(State(app.clone()), Json(PullReq { reference: Some("   ".into()) }))
-                .await
-                .unwrap();
+        let _first = images_pull(
+            State(app.clone()),
+            Json(PullReq {
+                reference: Some("   ".into()),
+            }),
+        )
+        .await
+        .unwrap();
         // A second pull for the same reference is rejected while the first is in flight.
         let err = images_pull(
             State(app.clone()),
-            Json(PullReq { reference: Some("pegasis0/rmng-template:latest".into()) }),
+            Json(PullReq {
+                reference: Some("pegasis0/rmng-template:latest".into()),
+            }),
         )
         .await
         .unwrap_err();
@@ -1443,7 +1676,12 @@ mod tests {
     async fn api_state_returns_current_snapshot() {
         let app = test_app();
         app.store.mutate(|s| {
-            s.hosts.push(wire::Host { id: "w1".into(), host: "w1".into(), managed: true, ..Default::default() });
+            s.hosts.push(wire::Host {
+                id: "w1".into(),
+                host: "w1".into(),
+                managed: true,
+                ..Default::default()
+            });
             s.selected = Some("w1".into());
         });
         let st = state_get(State(app.clone())).await.0;
@@ -1451,12 +1689,136 @@ mod tests {
         assert_eq!(st.selected.as_deref(), Some("w1"));
     }
 
+    #[tokio::test]
+    async fn refresh_response_runs_rotation_after_successful_poll() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let state = Arc::new(AtomicU8::new(0));
+        let poll_state = state.clone();
+        let rotate_state = state.clone();
+
+        let body = refresh_response(
+            async move {
+                poll_state.store(1, Ordering::SeqCst);
+                Ok::<bool, anyhow::Error>(false)
+            },
+            async move {
+                assert_eq!(rotate_state.load(Ordering::SeqCst), 1);
+                rotate_state.store(2, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["rateLimited"], false);
+        assert_eq!(body["rotated"], true);
+        assert_eq!(state.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_response_skips_rotation_when_poll_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rotated = Arc::new(AtomicBool::new(false));
+        let rotate_flag = rotated.clone();
+
+        let body = refresh_response(
+            async { Err::<bool, anyhow::Error>(anyhow::anyhow!("poll failed")) },
+            async move {
+                rotate_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["rateLimited"], false);
+        assert_eq!(body["rotated"], false);
+        assert!(!rotated.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn claude_swap_auto_without_accounts_records_pending_auto() {
+        let app = test_app();
+        app.store.mutate(|s| {
+            s.hosts.push(wire::Host {
+                id: "w1".into(),
+                host: "w1".into(),
+                managed: true,
+                ..Default::default()
+            });
+        });
+
+        let resp = claude_swap(
+            State(app.clone()),
+            Json(SwapReq {
+                host: "w1".into(),
+                account: "auto".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["selection"], "auto");
+        assert!(resp["account"].is_null());
+        let host = app
+            .store
+            .get()
+            .hosts
+            .into_iter()
+            .find(|h| h.id == "w1")
+            .unwrap();
+        assert_eq!(host.claude_selection.as_deref(), Some("auto"));
+        assert!(host.claude_account_email.is_none());
+        assert!(host.claude_group.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_swap_auto_without_accounts_records_pending_auto() {
+        let app = test_app();
+        app.store.mutate(|s| {
+            s.hosts.push(wire::Host {
+                id: "w1".into(),
+                host: "w1".into(),
+                managed: true,
+                ..Default::default()
+            });
+        });
+
+        let resp = codex_swap(
+            State(app.clone()),
+            Json(CodexSwapReq {
+                host: "w1".into(),
+                account: "auto".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["selection"], "auto");
+        assert!(resp["account"].is_null());
+        let host = app
+            .store
+            .get()
+            .hosts
+            .into_iter()
+            .find(|h| h.id == "w1")
+            .unwrap();
+        assert_eq!(host.codex_selection.as_deref(), Some("auto"));
+        assert!(host.codex_account_email.is_none());
+        assert!(host.codex_group.is_none());
+    }
+
     // --- POST /api/clone `hostname` mode (raw clone, fleet CLI) ---
 
     #[tokio::test]
     async fn clone_hostname_mode_registers_clone_op() {
         let app = test_app();
-        let body = json!({ "image": "tmpl:latest", "hostname": "w-mod-claude", "claudeAccount": "auto" });
+        let body =
+            json!({ "image": "tmpl:latest", "hostname": "w-mod-claude", "claudeAccount": "auto" });
         let resp = clone(State(app.clone()), Json(body)).await.unwrap().0;
         assert_eq!(resp["ok"], true);
         let op: Operation = serde_json::from_value(resp["op"].clone()).unwrap();
@@ -1492,7 +1854,10 @@ mod tests {
         let err = host_mcp(
             State(app.clone()),
             AxPath("ghost".into()),
-            Json(wire::McpCallRequest { tool: "screenshot".into(), args: json!({}) }),
+            Json(wire::McpCallRequest {
+                tool: "screenshot".into(),
+                args: json!({}),
+            }),
         )
         .await
         .unwrap_err();
@@ -1506,7 +1871,10 @@ mod tests {
         let err = host_exec(
             State(app.clone()),
             AxPath("ghost".into()),
-            Json(wire::ExecRequest { cmd: vec!["echo".into(), "hi".into()], ..Default::default() }),
+            Json(wire::ExecRequest {
+                cmd: vec!["echo".into(), "hi".into()],
+                ..Default::default()
+            }),
         )
         .await
         .unwrap_err();
@@ -1556,15 +1924,28 @@ mod forwards_validation_tests {
     use wire::{ControlState, Host};
 
     fn state_with(hosts: Vec<Host>) -> ControlState {
-        ControlState { hosts, ..Default::default() }
+        ControlState {
+            hosts,
+            ..Default::default()
+        }
     }
 
     fn host(id: &str) -> Host {
-        Host { id: id.into(), host: id.into(), ..Default::default() }
+        Host {
+            id: id.into(),
+            host: id.into(),
+            ..Default::default()
+        }
     }
 
     fn input(remote: u16, local: u16) -> ForwardInput {
-        ForwardInput { id: None, remote_port: remote, local_port: local, enabled: true, label: None }
+        ForwardInput {
+            id: None,
+            remote_port: remote,
+            local_port: local,
+            enabled: true,
+            label: None,
+        }
     }
 
     #[test]
@@ -1594,7 +1975,11 @@ mod forwards_validation_tests {
     fn rejects_local_port_used_by_another_host() {
         let mut other = host("b");
         other.forwards = vec![wire::PortForward {
-            id: "f8080".into(), remote_port: 9, local_port: 8080, enabled: true, label: None,
+            id: "f8080".into(),
+            remote_port: 9,
+            local_port: 8080,
+            enabled: true,
+            label: None,
         }];
         let st = state_with(vec![host("a"), other]);
         let err = validate_forwards(&st, "a", vec![input(3000, 8080)]).unwrap_err();
@@ -1607,10 +1992,17 @@ mod playbook_tests {
     use super::*;
 
     fn cfg_with(global: &str) -> wire::AppConfig {
-        wire::AppConfig { agent_playbook: global.into(), ..Default::default() }
+        wire::AppConfig {
+            agent_playbook: global.into(),
+            ..Default::default()
+        }
     }
     fn preset_with(pb: &str) -> wire::Preset {
-        wire::Preset { name: "p".into(), agent_playbook: pb.into(), ..Default::default() }
+        wire::Preset {
+            name: "p".into(),
+            agent_playbook: pb.into(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1620,7 +2012,10 @@ mod playbook_tests {
 
     #[test]
     fn global_only_when_preset_field_empty() {
-        assert_eq!(compose_playbook(&cfg_with("BASE"), Some(&preset_with("  "))), "BASE");
+        assert_eq!(
+            compose_playbook(&cfg_with("BASE"), Some(&preset_with("  "))),
+            "BASE"
+        );
     }
 
     #[test]
