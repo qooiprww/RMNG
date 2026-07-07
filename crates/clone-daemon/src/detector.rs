@@ -1,4 +1,4 @@
-//! The needs-human detector — `clone-daemon wait-for-stuck` + `report-detection`,
+//! The needs-human detector — `rmng-clone-daemon wait-for-stuck` + `report-detection`,
 //! ported from the old `computer-use` crate (`wait_for_stuck.rs` + `detection.rs` +
 //! `report.rs`). These run as short-lived **subcommands** (the agent arms
 //! `wait-for-stuck` as a background task while it's working; on a needs-human verdict

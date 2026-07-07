@@ -12,6 +12,8 @@ use nix::sys::socket::{
 };
 use wire::socket::{DaemonMsg, ServerMsg};
 
+const MAX_PACKET_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct Transport {
     fd: OwnedFd,
 }
@@ -39,7 +41,8 @@ impl Transport {
 
     /// Receive one `ServerMsg` (server → daemon carries no fds). Blocking.
     pub fn recv(&self) -> Result<ServerMsg> {
-        let mut buf = vec![0u8; 65536];
+        let packet_len = recv_packet_len(self.fd.as_raw_fd())?;
+        let mut buf = vec![0u8; packet_len];
         let mut iov = [IoSliceMut::new(&mut buf)];
         let mut cmsg = nix::cmsg_space!([RawFd; 8]);
         let msg: nix::sys::socket::RecvMsg<()> =
@@ -61,4 +64,20 @@ impl Transport {
         }
         serde_json::from_slice(&buf[..n]).context("decode ServerMsg")
     }
+}
+
+fn recv_packet_len(fd: RawFd) -> Result<usize> {
+    let mut one = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut one)];
+    let msg: nix::sys::socket::RecvMsg<()> =
+        recvmsg(fd, &mut iov, None, MsgFlags::MSG_PEEK | MsgFlags::MSG_TRUNC)
+            .context("recvmsg peek")?;
+    let n = msg.bytes;
+    if n == 0 {
+        return Err(anyhow!("peer closed the media socket"));
+    }
+    if n > MAX_PACKET_BYTES {
+        return Err(anyhow!("packet too large: {n} bytes > {MAX_PACKET_BYTES}"));
+    }
+    Ok(n)
 }

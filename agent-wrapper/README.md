@@ -24,7 +24,7 @@ autonomous turns ride `/events` as `{ reply, solicited:false }`.
 | `POST /prompt`    | Body `{ text }`. Queues a user turn in the session. Returns `202 { ok }` immediately — the reply + live progress arrive over `/events`, so the turn outlives this request. `409` if a turn is already running. |
 | `GET  /events`    | SSE. `{ busy }` snapshot on connect, then `{ activity }` lines while the model works, then `{ reply, solicited }` / `{ error }` per turn. `solicited:false` = an autonomous (monitoring) message, not the answer to a `/prompt`. |
 | `POST /abort`     | Interrupt the in-flight turn (`query.interrupt()`); the session stays alive. |
-| `GET  /status`    | `{ busy, monitoring, sessionId }` for the dashboard poller. `monitoring` = a `computer-use wait-for-stuck` process is alive. |
+| `GET  /status`    | `{ busy, monitoring, sessionId }` for the dashboard poller. `monitoring` = an `rmng-clone-daemon wait-for-stuck` process is alive. |
 | `GET  /health`    | `ok`. |
 
 The session id is kept **in memory only**: a CoW clone boots a fresh wrapper, so
@@ -45,8 +45,6 @@ Code CLI under `node` (`AGENT_EXECUTABLE`).
 | `AGENT_MODEL` | `claude-opus-4-8` | Claude model id |
 | `AGENT_EXECUTABLE` | `node` | JS runtime for the bundled CLI |
 | `AGENT_CONTROL_MCP_URL` | `http://10.60.0.1:9000/mcp` | control-server MCP (`set_state`) |
-| `COMPUTER_USE_BIN` | `/usr/local/bin/computer-use` | desktop MCP binary |
-| `COMPUTER_USE_MAX_WIDTH` / `_HEIGHT` | unset | override the desktop MCP's screenshot cap; unset ⇒ its built-in 1080p default |
 | `LINEAR_API_KEY` | unset | Linear hosted MCP (registered as `linear`); injected per-clone from the chosen preset; empty ⇒ skipped |
 | `AGENT_INSTRUCTIONS_PATH` | `~/.config/rmng/agent-instructions.md` | the editable agent playbook the control-server injects at clone creation; present + non-empty ⇒ wins over the baked-in default. Read once at startup |
 

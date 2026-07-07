@@ -11,6 +11,8 @@ use nix::sys::socket::{
 };
 use wire::socket::{DaemonMsg, ServerMsg};
 
+const MAX_PACKET_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct Listener {
     fd: OwnedFd,
 }
@@ -46,7 +48,8 @@ pub struct Conn {
 impl Conn {
     /// Receive one `DaemonMsg` + any dmabuf fds (as owned fds).
     pub fn recv(&self) -> Result<(DaemonMsg, Vec<OwnedFd>)> {
-        let mut buf = vec![0u8; 65536];
+        let packet_len = recv_packet_len(self.fd.as_raw_fd())?;
+        let mut buf = vec![0u8; packet_len];
         let mut iov = [IoSliceMut::new(&mut buf)];
         let mut cmsg = nix::cmsg_space!([RawFd; 8]);
         let msg: nix::sys::socket::RecvMsg<()> =
@@ -75,5 +78,71 @@ impl Conn {
         let cmsgs: &[ControlMessage] = &[];
         sendmsg::<()>(self.fd.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None).context("sendmsg")?;
         Ok(())
+    }
+}
+
+fn recv_packet_len(fd: RawFd) -> Result<usize> {
+    let mut one = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut one)];
+    let msg: nix::sys::socket::RecvMsg<()> =
+        recvmsg(fd, &mut iov, None, MsgFlags::MSG_PEEK | MsgFlags::MSG_TRUNC)
+            .context("recvmsg peek")?;
+    let n = msg.bytes;
+    if n == 0 {
+        return Err(anyhow!("peer closed"));
+    }
+    if n > MAX_PACKET_BYTES {
+        return Err(anyhow!("packet too large: {n} bytes > {MAX_PACKET_BYTES}"));
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::connect;
+    use wire::socket::{ClipboardData, DaemonMsg};
+
+    fn tmp_sock_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("rmng-{name}-{}-{}.sock", std::process::id(), rand_suffix()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn send_daemon_msg(path: &str, msg: &DaemonMsg) -> Result<()> {
+        let fd = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::empty(), None)
+            .context("socket")?;
+        connect(fd.as_raw_fd(), &UnixAddr::new(path).unwrap()).context("connect")?;
+        let json = serde_json::to_vec(msg)?;
+        let iov = [IoSlice::new(&json)];
+        sendmsg::<()>(fd.as_raw_fd(), &iov, &[], MsgFlags::empty(), None).context("sendmsg")?;
+        Ok(())
+    }
+
+    #[test]
+    fn recv_accepts_large_clipboard_data_messages() {
+        let path = tmp_sock_path("large-clip");
+        let listener = Listener::bind(&path).unwrap();
+        let payload = vec![0x42; 128 * 1024];
+        let sent = DaemonMsg::ClipboardData(ClipboardData {
+            serial: 7,
+            mime_type: "image/png".into(),
+            bytes: payload.clone(),
+        });
+
+        send_daemon_msg(&path, &sent).unwrap();
+        let conn = listener.accept().unwrap();
+        let (got, fds) = conn.recv().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(fds.is_empty());
+        assert_eq!(got, sent);
     }
 }

@@ -207,7 +207,8 @@ re-arm.** A new task arrives as a fresh message (which you act on directly), not
 something the detector can see, so there is nothing to poll for once it's idle.
 
 1. **While the host is working, arm the detector** in the background: run, via the
-   **Bash** tool with **`run_in_background: true`**, `clone-daemon wait-for-stuck`.
+   **Bash** tool with **`run_in_background: true`**,
+   `/opt/rmng/bin/rmng-clone-daemon wait-for-stuck`.
    Append `--ignore-reason "<situation>"` for known false alarms (e.g. "the Linear
    ticket text shown in the Firefox window"). It screenshots ~once a minute, asks a
    cheap local vision model whether the desktop needs a human, and exits printing
@@ -228,7 +229,7 @@ something the detector can see, so there is nothing to poll for once it's idle.
      stops firing on it.
 4. **Report every detector mistake.** Whenever your own screenshot disagrees with
    what the detector just said, tell the control server so the model can be tuned —
-   run, via the **Bash** tool, `clone-daemon report-detection --kind
+   run, via the **Bash** tool, `/opt/rmng/bin/rmng-clone-daemon report-detection --kind
    <false-positive|false-negative> --note "<what was actually true>"`:
    - **`false-positive`** — the detector said **needs-human** but work was actually
      still in progress (e.g. it fired on the Linear ticket text, or mid-build).

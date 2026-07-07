@@ -295,7 +295,7 @@ subsequent `POST /api/layout/activate` pushes a fresh `SetMonitors` the same way
   Far more reliable than vision for terminal agents. `--criteria` requires `--text-cmd`;
   `--ignore-reason` works in both modes.
 
-**`clone-daemon report-detection`** — POST a wrong-verdict record to the control-server's
+**`rmng-clone-daemon report-detection`** — POST a wrong-verdict record to the control-server's
 `/api/detector-feedback`. Flags: `--kind false-positive|false-negative` (required), `--note
 <str>`, `--control <url>`. Uploads the artifact the verdict was made on: the screenshot
 composite (screen mode) or the exact pane capture + criteria (text mode), plus a `mode`

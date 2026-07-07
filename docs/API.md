@@ -274,7 +274,7 @@ Serve an uploaded image by its generated `<16-hex>.<ext>` name, with the right C
 ## Detector feedback
 
 ### `POST /api/detector-feedback` (multipart)
-A clone's `clone-daemon report-detection` posts here when the needs-human detector's verdict
+A clone's `rmng-clone-daemon report-detection` posts here when the needs-human detector's verdict
 was wrong. The caller **self-identifies** with a `clone` field (its hostname == host id —
 clone IPs are dynamic Docker IPAM, so there is no source-IP mapping). Fields: `clone`
 (required), `kind` (`false-positive`|`false-negative`, required), `mode`

@@ -328,7 +328,7 @@ After=gnome-headless.service
 [Service]
 Type=simple
 # Self-contained Bun binary; the SDK drives the standalone claude CLI (~/.local/bin).
-Environment=PATH=/home/$USERNAME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/$USERNAME/.local/bin:$BINDIR:/usr/local/bin:/usr/bin:/bin
 Environment=AGENT_PORT=4096
 ExecStart=$BINDIR/agent-wrapper
 Restart=on-failure

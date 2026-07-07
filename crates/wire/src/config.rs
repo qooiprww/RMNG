@@ -399,7 +399,7 @@ pub struct AppConfig {
     /// through [`AppConfigRedacted`] intact.
     #[serde(default)]
     pub ssh: SshConfig,
-    /// Vision-LLM inference server the needs-human detector (`clone-daemon wait-for-stuck`)
+    /// Vision-LLM inference server the needs-human detector (`rmng-clone-daemon wait-for-stuck`)
     /// polls — OpenAI-compatible `/v1/chat/completions`. Injected into each clone as
     /// `RMNG_INFERENCE_URL` at clone time. External infra the control-server can't
     /// auto-detect, so it's configured here (the old compiled-in default pointed at the
