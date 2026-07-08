@@ -108,6 +108,47 @@ fn device_flag_bit(kvk: u32) -> Option<usize> {
     })
 }
 
+/// Device-*independent* `NSEventModifierFlags` class bit for a modifier kVK. These high
+/// bits (`Control` = 0x40000, etc.) are always present in `NSEvent.modifierFlags` — the
+/// local-shortcut detection in `install` already relies on them — so they are the
+/// reliable "is a key of this class down" signal. `keyCode` (kVK) already identifies the
+/// specific left/right key, so the class flag is all we need for state.
+fn modifier_class_flag(kvk: u32) -> Option<usize> {
+    Some(match kvk {
+        0x3B | 0x3E => NSEventModifierFlags::Control.0, // Control / RightControl
+        0x38 | 0x3C => NSEventModifierFlags::Shift.0,   // Shift / RightShift
+        0x37 | 0x36 => NSEventModifierFlags::Command.0, // Command / RightCommand
+        0x3A | 0x3D => NSEventModifierFlags::Option.0,  // Option / RightOption
+        _ => return None,
+    })
+}
+
+/// The physical up/down state of modifier `kvk`, read from a `FlagsChanged` event's
+/// `modifierFlags` (`mf`). `None` for non-modifier kVKs (fn/Globe, letters).
+///
+/// Primary signal is the device-independent class flag (guaranteed present). The
+/// device-dependent per-key bit is used *only* to refine when the event actually carries
+/// device bits (low word non-zero) — that disambiguates holding both the left and right
+/// key of one modifier. This is robust whether or not the OS populates the device bits:
+///   - class flag clear            → key is up (definitive)
+///   - class set, no device bits   → this key is down (single-key case)
+///   - class set, device bits set  → precise per-key bit
+///
+/// The old logic read `mf & device_bit` *alone*; when the device bits were not delivered
+/// that was always 0, so every transition looked like a release and nothing was ever
+/// forwarded — the remote's modifiers (e.g. a Control left stuck by a prior session)
+/// never got their release and stayed down, so Tab/Space/Enter resolved as Ctrl+Tab etc.
+fn modifier_now_down(mf: usize, kvk: u32) -> Option<bool> {
+    let class_flag = modifier_class_flag(kvk)?;
+    if mf & class_flag == 0 {
+        return Some(false);
+    }
+    Some(match device_flag_bit(kvk) {
+        Some(bit) if mf & 0xffff != 0 => mf & bit != 0,
+        _ => true,
+    })
+}
+
 /// Decide what to send for a modifier transition: `Some(pressed)` to forward, `None` to
 /// drop. `now_down` is the key's real state from the event's device flag bit; the
 /// held-set mirrors what the remote believes, so a transition that wouldn't change the
@@ -192,20 +233,25 @@ pub fn install(writer: Writer) {
                     // remote toggles its own lock. Best-effort (verify on-device).
                     send_key(&writer, keycode, true);
                     send_key(&writer, keycode, false);
-                } else if let Some(bit) = device_flag_bit(kc) {
-                    // Press vs release comes from the key's device flag bit in THIS event —
-                    // never from history, which goes stale across focus transitions (a
-                    // modifier held during Cmd+Tab has its press delivered to the previous
-                    // app; only its release reaches us).
-                    let now_down = mf & bit != 0;
+                } else if let Some(now_down) = modifier_now_down(mf, kc) {
+                    // Press vs release comes from THIS event's flags (device-independent
+                    // class flag, refined by the per-key device bit when present) — never
+                    // from history, which goes stale across focus transitions (a modifier
+                    // held during Cmd+Tab has its press delivered to the previous app; only
+                    // its release reaches us, and it must read as an up, not a phantom down).
                     let decision = flags_transition(&mut pressed.lock().unwrap(), keycode, now_down);
+                    tracing::debug!(
+                        "flags: kVK={:#04x} evdev={} mf={:#010x} class_on={} low={:#06x} down={} -> {:?}",
+                        kc, keycode, mf,
+                        mf & modifier_class_flag(kc).unwrap_or(0) != 0,
+                        mf & 0xffff, now_down, decision
+                    );
                     if let Some(p) = decision {
                         send_key(&writer, keycode, p);
                     }
                 }
-                // kVKs with no device bit (fn/Globe — already sentineled to 0 by
-                // `translate`) are dropped: their state can't be read, and a blind
-                // toggle is exactly what used to stick modifiers.
+                // kVKs with no modifier class (fn/Globe) are dropped: they carry no
+                // remote-mappable state, and a blind toggle is what used to stick modifiers.
                 event.as_ptr()
             } else {
                 event.as_ptr()
@@ -266,8 +312,15 @@ mod tests {
     use super::*;
 
     // evdev codes used below.
+    const KEY_LEFTCTRL: u32 = 29;
     const KEY_LEFTMETA: u32 = 125;
     const KEY_LEFTSHIFT: u32 = 42;
+
+    // Carbon kVK codes (the input to modifier_now_down / modifier_class_flag).
+    const KVK_CONTROL: u32 = 0x3B;
+    const KVK_SHIFT: u32 = 0x38;
+    const KVK_RIGHT_SHIFT: u32 = 0x3C;
+    const KVK_COMMAND: u32 = 0x37;
 
     /// THE bug (Cmd+Tab into the viewer): ⌘'s press went to the previous app, so the
     /// first event we see is its release. That must be dropped — the old toggle logic
@@ -323,5 +376,76 @@ mod tests {
         assert_eq!(device_flag_bit(0x3E), Some(0x2000), "kVK_RightControl");
         assert_eq!(device_flag_bit(0x3F), None, "fn/Globe has no device bit");
         assert_eq!(device_flag_bit(0x00), None, "non-modifier kVK has no device bit");
+    }
+
+    #[test]
+    fn modifier_class_flags() {
+        assert_eq!(modifier_class_flag(0x3B), Some(NSEventModifierFlags::Control.0));
+        assert_eq!(modifier_class_flag(0x3E), Some(NSEventModifierFlags::Control.0));
+        assert_eq!(modifier_class_flag(0x38), Some(NSEventModifierFlags::Shift.0));
+        assert_eq!(modifier_class_flag(0x3C), Some(NSEventModifierFlags::Shift.0));
+        assert_eq!(modifier_class_flag(0x37), Some(NSEventModifierFlags::Command.0));
+        assert_eq!(modifier_class_flag(0x36), Some(NSEventModifierFlags::Command.0));
+        assert_eq!(modifier_class_flag(0x3A), Some(NSEventModifierFlags::Option.0));
+        assert_eq!(modifier_class_flag(0x3D), Some(NSEventModifierFlags::Option.0));
+        assert_eq!(modifier_class_flag(0x3F), None, "fn/Globe");
+        assert_eq!(modifier_class_flag(0x00), None, "non-modifier");
+    }
+
+    /// THE regression this fix targets: when macOS omits the device-dependent low bits,
+    /// press/release must still be read from the device-independent class flag. The old
+    /// `mf & device_bit` logic saw 0 here, read every transition as a release, and
+    /// forwarded nothing — so a Control stuck on the remote never got its release.
+    #[test]
+    fn now_down_from_class_flag_when_device_bits_absent() {
+        let ctrl = NSEventModifierFlags::Control.0; // class flag only, low word == 0
+        assert_eq!(modifier_now_down(ctrl, KVK_CONTROL), Some(true), "press");
+        assert_eq!(modifier_now_down(0, KVK_CONTROL), Some(false), "release");
+    }
+
+    /// When the OS reports device-dependent bits, use them to distinguish left from right
+    /// so both-of-a-pair holds track independently.
+    #[test]
+    fn now_down_uses_device_bit_when_present() {
+        let shift = NSEventModifierFlags::Shift.0;
+        let l = 0x0002usize; // NX_DEVICELSHIFTKEYMASK
+        let r = 0x0004usize; // NX_DEVICERSHIFTKEYMASK
+        // Both shifts down.
+        assert_eq!(modifier_now_down(shift | l | r, KVK_SHIFT), Some(true));
+        assert_eq!(modifier_now_down(shift | l | r, KVK_RIGHT_SHIFT), Some(true));
+        // Release right while left held: class still on, only left bit remains.
+        assert_eq!(modifier_now_down(shift | l, KVK_RIGHT_SHIFT), Some(false));
+        assert_eq!(modifier_now_down(shift | l, KVK_SHIFT), Some(true));
+    }
+
+    #[test]
+    fn now_down_none_for_non_modifier() {
+        assert_eq!(modifier_now_down(0, 0x00), None);
+        assert_eq!(modifier_now_down(0, 0x3F), None, "fn/Globe");
+    }
+
+    /// End-to-end on the device-bits-absent path: a normal Control press then release
+    /// forwards down then up (the bug: both were dropped, leaving Control stuck).
+    #[test]
+    fn device_bits_absent_forwards_full_cycle() {
+        let ctrl = NSEventModifierFlags::Control.0;
+        let mut held = HashSet::new();
+        let down = modifier_now_down(ctrl, KVK_CONTROL).unwrap();
+        assert_eq!(flags_transition(&mut held, KEY_LEFTCTRL, down), Some(true));
+        let up = modifier_now_down(0, KVK_CONTROL).unwrap();
+        assert_eq!(flags_transition(&mut held, KEY_LEFTCTRL, up), Some(false));
+        assert!(held.is_empty());
+    }
+
+    /// Cmd+Tab INTO the viewer: ⌘'s press went to the previous app, so the first event we
+    /// see is its release — class flag already clear → reads as up → dropped, not inverted
+    /// into a phantom press.
+    #[test]
+    fn cmd_tab_spurious_release_reads_as_up_and_drops() {
+        let mut held = HashSet::new();
+        let up = modifier_now_down(0, KVK_COMMAND).unwrap();
+        assert!(!up);
+        assert_eq!(flags_transition(&mut held, KEY_LEFTMETA, up), None);
+        assert!(held.is_empty());
     }
 }
