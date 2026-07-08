@@ -1322,6 +1322,20 @@ fn release_all_input(writer: &Writer, state: &WinInput) {
     }
 }
 
+/// macOS only: Carbon kVKs whose `keyDown` GDK consumes via `interpretKeyEvents:`
+/// (Tab → key-view loop, Space → button "click", Return/Enter → default-button key
+/// equivalent) so they NEVER reach the raw NSEvent monitor in `keyboard_macos` — only
+/// their `keyUp` does. GTK's `EventControllerKey` *does* see them, with `code` == the
+/// kVK, so these specific keys are forwarded from the GTK handler instead. Every other
+/// physical key is owned by the NSEvent monitor; forwarding it here too would double-send.
+/// Returns the evdev keycode to send, or `None` if the monitor already owns this key.
+#[cfg(target_os = "macos")]
+fn macos_gdk_swallowed_key(code: u32) -> Option<u32> {
+    // `code` == Carbon kVK on macOS (verified in-log: Space=0x31, Tab=0x30, Return=0x24).
+    // 0x4C = keypad Enter, swallowed as a default-button equivalent just like Return.
+    matches!(code, 0x24 | 0x30 | 0x31 | 0x4C).then(|| kvk_evdev::translate(code))
+}
+
 fn install_keyboard(
     window: &gtk4::ApplicationWindow,
     writer: &Writer,
@@ -1380,10 +1394,19 @@ fn install_keyboard(
             }
             // macOS: physical keys are forwarded by the raw NSEvent monitor (keyboard_macos),
             // NOT from here — GTK's key events on macOS come through the Cocoa text-input
-            // machinery, which synthesizes phantom keycode-0 presses. This handler keeps only
-            // the local shortcuts above; the monitor passes those keys through so they reach it.
+            // machinery, which synthesizes phantom keycode-0 presses. The ONE exception is the
+            // handful of keys GDK swallows before the monitor sees them (Tab/Space/Return/Enter,
+            // see `macos_gdk_swallowed_key`): those genuinely arrive here with a valid `code`,
+            // so forward them from here. Dedup via `state.pressed` so held-key autorepeat isn't
+            // stacked on top of the remote's own repeat.
             #[cfg(target_os = "macos")]
-            let _ = code;
+            if let Some(keycode) = macos_gdk_swallowed_key(code) {
+                if state.pressed.borrow_mut().insert(keycode) {
+                    send(&w, format!(r#"{{"kind":"key_code","keycode":{keycode},"pressed":true}}"#));
+                    tracing::debug!("gtk forward (monitor-missed): code={code:#04x} evdev={keycode} pressed=true");
+                }
+                return glib::Propagation::Stop;
+            }
             glib::Propagation::Proceed
         });
     }
@@ -1397,9 +1420,16 @@ fn install_keyboard(
                 state.pressed.borrow_mut().remove(&keycode);
                 release_keycode(&w, keycode);
             }
-            // macOS: releases come from the keyboard_macos NSEvent monitor (see key_pressed).
+            // macOS: releases come from the keyboard_macos NSEvent monitor (see key_pressed),
+            // EXCEPT for the GDK-swallowed keys forwarded from key_pressed above — release
+            // those here to stay symmetric.
             #[cfg(target_os = "macos")]
-            let _ = (&w, &state, code);
+            if let Some(keycode) = macos_gdk_swallowed_key(code) {
+                if state.pressed.borrow_mut().remove(&keycode) {
+                    release_keycode(&w, keycode);
+                    tracing::debug!("gtk forward (monitor-missed): code={code:#04x} evdev={keycode} pressed=false");
+                }
+            }
         });
     }
     window.add_controller(key);

@@ -53,7 +53,7 @@ RUST_LOG="info,rmng_viewer=debug,viewer=debug" "$BIN" "$@" >"$LOG" 2>&1 || true
 echo
 echo "Viewer exited. Modifier events captured:"
 echo "------------------------------------------------------------"
-grep -nE "flags:|key down:|key up:" "$LOG" \
+grep -nE "flags:|key down:|key up:|monitor-missed" "$LOG" \
   || echo "(none — the remote window may not have been focused, or the monitor did not install)"
 echo "------------------------------------------------------------"
 echo "Full log: $LOG"
