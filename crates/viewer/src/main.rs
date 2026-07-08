@@ -1322,18 +1322,31 @@ fn release_all_input(writer: &Writer, state: &WinInput) {
     }
 }
 
-/// macOS only: Carbon kVKs whose `keyDown` GDK consumes via `interpretKeyEvents:`
-/// (Tab → key-view loop, Space → button "click", Return/Enter → default-button key
-/// equivalent) so they NEVER reach the raw NSEvent monitor in `keyboard_macos` — only
-/// their `keyUp` does. GTK's `EventControllerKey` *does* see them, with `code` == the
-/// kVK, so these specific keys are forwarded from the GTK handler instead. Every other
-/// physical key is owned by the NSEvent monitor; forwarding it here too would double-send.
-/// Returns the evdev keycode to send, or `None` if the monitor already owns this key.
+/// macOS only: Carbon kVKs whose `keyDown` GDK consumes via `interpretKeyEvents:` — turned
+/// into Cocoa commands (key-view loop, button "click", default button, cursor movement) —
+/// so they NEVER reach the raw NSEvent monitor in `keyboard_macos`; only their `keyUp`
+/// does. GTK's `EventControllerKey` *does* see them, with `code` == the kVK, so these keys
+/// are forwarded from the GTK handler instead. Returns the evdev keycode to send, or `None`
+/// if the monitor already owns this key (forwarding those here too would double-send).
+///
+/// Two families are swallowed:
+///   - activation / focus: Tab 0x30, Space 0x31, Return 0x24, KeypadEnter 0x4C
+///   - cursor movement:    arrows 0x7B–0x7E, Home 0x73, PageUp 0x74, End 0x77, PageDown 0x79
+///
+/// Verified in-log: Tab/Space/Return reach the GTK handler, not the monitor; arrows are the
+/// same movement-command class (a correct kVK→evdev entry exists, yet they did nothing on
+/// the remote — i.e. the monitor never saw them). *Text* keys (letters, Backspace 0x33,
+/// punctuation) DO reach the monitor, so they are deliberately excluded here.
 #[cfg(target_os = "macos")]
 fn macos_gdk_swallowed_key(code: u32) -> Option<u32> {
-    // `code` == Carbon kVK on macOS (verified in-log: Space=0x31, Tab=0x30, Return=0x24).
-    // 0x4C = keypad Enter, swallowed as a default-button equivalent just like Return.
-    matches!(code, 0x24 | 0x30 | 0x31 | 0x4C).then(|| kvk_evdev::translate(code))
+    // `code` == Carbon kVK on macOS.
+    matches!(
+        code,
+        0x24 | 0x30 | 0x31 | 0x4C           // Return, Tab, Space, KeypadEnter
+        | 0x73 | 0x74 | 0x77 | 0x79         // Home, PageUp, End, PageDown
+        | 0x7B..=0x7E                        // Left, Right, Down, Up arrows
+    )
+    .then(|| kvk_evdev::translate(code))
 }
 
 fn install_keyboard(

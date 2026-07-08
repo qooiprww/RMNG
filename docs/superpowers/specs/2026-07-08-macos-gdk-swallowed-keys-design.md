@@ -69,11 +69,23 @@ Capture `/tmp/rmng-kb-20260708-015511.log`:
 `cargo test -p viewer` (24 pass), `cargo build --release -p viewer`, clippy clean on the
 new code.
 
+## Follow-up: cursor-navigation keys (arrows, Home/End/PageUp/PageDown)
+
+Arrow keys were reported dead on the remote too. Same mechanism: in Cocoa they are
+`moveLeft:`/`moveUp:`/etc. commands consumed by `interpretKeyEvents:` before the monitor
+sees their `keyDown`. Confirmed by elimination — the kVK→evdev table maps all four arrows
+correctly (`0x7B`→`KEY_LEFT` … `0x7E`→`KEY_UP`), yet they did nothing, so the monitor
+never received them. The allowlist was extended to the full cursor-movement family:
+arrows `0x7B–0x7E`, Home `0x73`, PageUp `0x74`, End `0x77`, PageDown `0x79`. These are the
+same `interpretKeyEvents:` movement class as the arrows; the monitor owns only *text* keys
+(letters, Backspace, punctuation), which is why extending the list can't double-send.
+
 ## Out of scope / follow-ups
 
-- Other keys GDK might route as commands (Escape, arrows, Home/End/PageUp/Down) were not
-  observed to be swallowed in testing; if any surface as dead, add their kVK to the
-  allowlist. The `monitor-missed` debug log makes that easy to spot.
+- Escape (`cancelOperation:`) and Forward-Delete (`deleteForward:`) were not reported; if
+  they surface as dead, they're one kVK each to add. The `monitor-missed` debug log and a
+  duplicate `key down` (would indicate a monitor-owned key wrongly listed) make it easy to
+  spot from a capture.
 - The verbose per-keystroke GTK diagnostic logging was removed (it logged typed text);
   only the modifier `flags:` log and the 4-key `monitor-missed` log (non-sensitive)
   remain, plus the pre-existing `key down/up` logs.
