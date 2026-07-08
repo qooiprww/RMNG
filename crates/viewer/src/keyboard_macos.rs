@@ -90,6 +90,42 @@ fn send_key(writer: &Writer, keycode: u32, pressed: bool) {
     }
 }
 
+/// IOKit `NX_DEVICE*` device-dependent modifier bits (the low 16 bits of
+/// `NSEvent.modifierFlags`), keyed by the modifier's Carbon kVK. This is how the key's
+/// actual up/down state is read from a `FlagsChanged` event itself (Chromium does the
+/// same in `ui/events/cocoa`), rather than inferred from history.
+fn device_flag_bit(kvk: u32) -> Option<usize> {
+    Some(match kvk {
+        0x3B => 0x0001, // kVK_Control       NX_DEVICELCTLKEYMASK
+        0x38 => 0x0002, // kVK_Shift         NX_DEVICELSHIFTKEYMASK
+        0x3C => 0x0004, // kVK_RightShift    NX_DEVICERSHIFTKEYMASK
+        0x37 => 0x0008, // kVK_Command       NX_DEVICELCMDKEYMASK
+        0x36 => 0x0010, // kVK_RightCommand  NX_DEVICERCMDKEYMASK
+        0x3A => 0x0020, // kVK_Option        NX_DEVICELALTKEYMASK
+        0x3D => 0x0040, // kVK_RightOption   NX_DEVICERALTKEYMASK
+        0x3E => 0x2000, // kVK_RightControl  NX_DEVICERCTLKEYMASK
+        _ => return None,
+    })
+}
+
+/// Decide what to send for a modifier transition: `Some(pressed)` to forward, `None` to
+/// drop. `now_down` is the key's real state from the event's device flag bit; the
+/// held-set mirrors what the remote believes, so a transition that wouldn't change the
+/// remote's view (a release we never sent a press for, a redundant press) is dropped.
+///
+/// Deriving press/release by *toggling* the held-set instead (the previous logic)
+/// inverted the meaning whenever a modifier's press was never tracked — e.g. ⌘ held
+/// across a Cmd+Tab INTO the viewer: its release after focus-gain became a phantom
+/// press, leaving Super stuck down on the remote (Space → Super+Space input-source
+/// switch, Enter → Super+Enter: neither types anything).
+fn flags_transition(held: &mut HashSet<u32>, keycode: u32, now_down: bool) -> Option<bool> {
+    if now_down {
+        held.insert(keycode).then_some(true)
+    } else {
+        held.remove(&keycode).then_some(false)
+    }
+}
+
 /// Install the app-global keyboard monitor. Call once, from `build_ui`, on the main thread.
 pub fn install(writer: Writer) {
     let active_windows = Arc::new(AtomicUsize::new(0));
@@ -156,19 +192,20 @@ pub fn install(writer: Writer) {
                     // remote toggles its own lock. Best-effort (verify on-device).
                     send_key(&writer, keycode, true);
                     send_key(&writer, keycode, false);
-                } else if keycode != 0 {
-                    // Derive press vs release from our own held-set (robust to the left/right
-                    // device-flag ambiguity in `modifierFlags`).
-                    let mut held = pressed.lock().unwrap();
-                    if held.remove(&keycode) {
-                        drop(held);
-                        send_key(&writer, keycode, false);
-                    } else {
-                        held.insert(keycode);
-                        drop(held);
-                        send_key(&writer, keycode, true);
+                } else if let Some(bit) = device_flag_bit(kc) {
+                    // Press vs release comes from the key's device flag bit in THIS event —
+                    // never from history, which goes stale across focus transitions (a
+                    // modifier held during Cmd+Tab has its press delivered to the previous
+                    // app; only its release reaches us).
+                    let now_down = mf & bit != 0;
+                    let decision = flags_transition(&mut pressed.lock().unwrap(), keycode, now_down);
+                    if let Some(p) = decision {
+                        send_key(&writer, keycode, p);
                     }
                 }
+                // kVKs with no device bit (fn/Globe — already sentineled to 0 by
+                // `translate`) are dropped: their state can't be read, and a blind
+                // toggle is exactly what used to stick modifiers.
                 event.as_ptr()
             } else {
                 event.as_ptr()
@@ -222,4 +259,69 @@ pub fn release_all() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // evdev codes used below.
+    const KEY_LEFTMETA: u32 = 125;
+    const KEY_LEFTSHIFT: u32 = 42;
+
+    /// THE bug (Cmd+Tab into the viewer): ⌘'s press went to the previous app, so the
+    /// first event we see is its release. That must be dropped — the old toggle logic
+    /// turned it into a phantom press, sticking Super down on the remote (Space/Enter
+    /// then resolve as Super+Space / Super+Enter and type nothing).
+    #[test]
+    fn spurious_release_is_dropped_not_inverted() {
+        let mut held = HashSet::new();
+        assert_eq!(flags_transition(&mut held, KEY_LEFTMETA, false), None);
+        assert!(held.is_empty(), "an untracked release must not enter the held-set");
+    }
+
+    /// A modifier already physically down when the window gains focus: its eventual
+    /// release is dropped (press was never forwarded), and the NEXT full press/release
+    /// cycle forwards normally — the state self-corrects instead of staying inverted.
+    #[test]
+    fn state_self_corrects_after_focus_gain_with_modifier_held() {
+        let mut held = HashSet::new();
+        assert_eq!(flags_transition(&mut held, KEY_LEFTSHIFT, false), None);
+        assert_eq!(flags_transition(&mut held, KEY_LEFTSHIFT, true), Some(true));
+        assert_eq!(flags_transition(&mut held, KEY_LEFTSHIFT, false), Some(false));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn normal_press_release_cycle_forwards_both() {
+        let mut held = HashSet::new();
+        assert_eq!(flags_transition(&mut held, KEY_LEFTMETA, true), Some(true));
+        assert!(held.contains(&KEY_LEFTMETA));
+        assert_eq!(flags_transition(&mut held, KEY_LEFTMETA, false), Some(false));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn redundant_press_is_dropped() {
+        let mut held = HashSet::new();
+        assert_eq!(flags_transition(&mut held, KEY_LEFTMETA, true), Some(true));
+        assert_eq!(flags_transition(&mut held, KEY_LEFTMETA, true), None);
+        assert!(held.contains(&KEY_LEFTMETA));
+    }
+
+    /// The NX_DEVICE* bits for all eight modifier kVKs, per IOKit's IOLLEvent.h (same
+    /// values Chromium's dom_code_data path uses). fn/Globe (0x3F) has no device bit.
+    #[test]
+    fn device_flag_bits() {
+        assert_eq!(device_flag_bit(0x3B), Some(0x0001), "kVK_Control");
+        assert_eq!(device_flag_bit(0x38), Some(0x0002), "kVK_Shift");
+        assert_eq!(device_flag_bit(0x3C), Some(0x0004), "kVK_RightShift");
+        assert_eq!(device_flag_bit(0x37), Some(0x0008), "kVK_Command");
+        assert_eq!(device_flag_bit(0x36), Some(0x0010), "kVK_RightCommand");
+        assert_eq!(device_flag_bit(0x3A), Some(0x0020), "kVK_Option");
+        assert_eq!(device_flag_bit(0x3D), Some(0x0040), "kVK_RightOption");
+        assert_eq!(device_flag_bit(0x3E), Some(0x2000), "kVK_RightControl");
+        assert_eq!(device_flag_bit(0x3F), None, "fn/Globe has no device bit");
+        assert_eq!(device_flag_bit(0x00), None, "non-modifier kVK has no device bit");
+    }
 }
